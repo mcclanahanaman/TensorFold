@@ -91,7 +91,8 @@ class TensorFoldPath:
     def kernels(self, x, picks):
         m = x.shape[0]
         plan, act, y = self._buf(m)
-        self.grouped.route(picks, plan)
+        # the engine's prompt plan (0.6.0: decode windows too, ``moe_prefill``): items of the NVFP4 kernel's tile
+        self.grouped.route(picks, plan, getattr(self.nvx, "PREFILL_TILE", self.grouped.PREFILL_TILE))
         self.nvx.gate_up(x, self.ex, plan, act, m, skip=mc.E)
         self.nvx.down(act, self.ex, plan, y.view(-1, mc.D), m, skip=mc.E)
         return y

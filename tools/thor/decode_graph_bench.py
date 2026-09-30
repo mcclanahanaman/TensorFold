@@ -88,8 +88,9 @@ def main() -> None:
     ap.add_argument("--layer", type=int, default=23)
     ap.add_argument("--ms", default="1,2,4,8,16,32,64,512,2048,4096,8192")
     ap.add_argument("--reps", type=int, default=50)
+    ap.add_argument("--tf-decode-plan", action="store_true", help="0.3.x decode plan + fp32 slots at <= 64 rows")
     args = ap.parse_args()
-    rep = {"rows": {}, "errors": {}}
+    rep = {"rows": {}, "errors": {}, "args": vars(args)}
 
     from tensorfold.cuda import experts as grouped
     from tensorfold.cuda.nvfp4 import experts as nvx
@@ -105,13 +106,16 @@ def main() -> None:
         ids, w = mc.route(x, layer.router)
         row = {}
         picks = torch.cat([ids, torch.full((m, 1), mc.E, dtype=torch.int32, device="cuda")], 1).contiguous()
-        prefill = m > 64                    # the engine's prompt buffers (bf16 slots) above decode sizes
+        # 0.6.0: decode windows run the prompt arithmetic too (Buffers(moe_prefill=True)): prompt plan, bf16 slots;
+        # --tf-decode-plan keeps 0.3.x's decode plan and fp32 slots at <= 64 rows
+        prefill = m > 64 or not args.tf_decode_plan
         plan = grouped.Plan(m, mc.TOP + 1, mc.E + 1, "cuda", prefill=prefill)
+        tile = getattr(nvx, "PREFILL_TILE", grouped.PREFILL_TILE)
         act = torch.zeros(m * (mc.TOP + 1), mc.NI, dtype=torch.bfloat16, device="cuda")
         y = torch.zeros(m * (mc.TOP + 1), mc.D, dtype=torch.bfloat16 if prefill else torch.float32, device="cuda")
 
         def tf_call():
-            grouped.route(picks, plan)
+            grouped.route(picks, plan, tile)
             nvx.gate_up(x, ex, plan, act, m, skip=mc.E)
             nvx.down(act, ex, plan, y, m, skip=mc.E)
 
