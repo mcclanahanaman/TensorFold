@@ -361,6 +361,7 @@ def main() -> None:
         if do_acc:
             res: dict = {}
             for m in acc_ms:
+                tf_out = None
                 x = mc.activations(m, seed=1000 + m)
                 ids, w = mc.route(x, layer.router)
                 t0 = time.time()
@@ -379,11 +380,15 @@ def main() -> None:
                     elif p.startswith("emu"):
                         got = attempt(f"L{li}.M{m}.{p}", lambda: emulate(x, ids, w, ref, int(p[3:])))
                     elif p == "fiw4a16" and cands.get(p) is not None:
+                        import fi_w4a16_moe as fw
+
                         c = cands[p]
-                        c.tactic = c.fw.DEFAULT_W4A16_MOE_TACTIC
-                        got = attempt(f"L{li}.M{m}.{p}", lambda: c(x, ids, w))
+                        r = attempt(f"L{li}.M{m}.{p}", lambda: fw.first_working(c, x, ids, w))
+                        got = None if r is None else r[0]
                         entry["fiw4a16_mode"] = c.used
                         entry["fiw4a16_tactic"] = str(c.tactic)
+                        if r is not None and r[2]:
+                            entry["fiw4a16_tactic_errors"] = r[2]
                         if getattr(c, "launch_error", None):
                             entry["fiw4a16_launch_error"] = c.launch_error
                     elif p == "fiw4a4" and cands.get(p) is not None:
@@ -406,9 +411,19 @@ def main() -> None:
                         continue
                     torch.cuda.synchronize()
                     met = mc.metrics(got.float(), refo)
+                    if p == "tf":
+                        tf_out = got.to(torch.bfloat16)
+                    elif "tf_out" in locals() and tf_out is not None and tf_out.shape == got.shape:
+                        gb = got.to(torch.bfloat16)
+                        met["vs_tf_bitwise_equal"] = float((gb.view(torch.int16) == tf_out.view(torch.int16))
+                                                           .float().mean())
+                        met["vs_tf_max_abs"] = float((gb.float() - tf_out.float()).abs().max())
                     entry[p] = met
                     res[(p, m)] = met
-                    log(f"    {p:8s} rel {met['rel_fro']:.4e}  max|d| {met['max_abs']:.4e}  cos {met['cosine']:.8f}")
+                    extra = (f"  vs TF: bitwise {met['vs_tf_bitwise_equal']:.4f}, max|d| {met['vs_tf_max_abs']:.3e}"
+                             if "vs_tf_bitwise_equal" in met else "")
+                    log(f"    {p:8s} rel {met['rel_fro']:.4e}  max|d| {met['max_abs']:.4e}  cos {met['cosine']:.8f}"
+                        + extra)
                 report["accuracy"][f"layer{li}"][f"M{m}"] = entry
                 save()
                 del refo
@@ -438,7 +453,9 @@ def main() -> None:
                         import fi_w4a16_moe as fw
 
                         t = attempt(f"S.M{m}.{p}", lambda: fw.best_time(c, x, ids, w, args.reps))
-                    elif p.startswith("fi"):
+                    elif p == "fiw4a4":
+                        t = attempt(f"S.M{m}.{p}", lambda: mc.time_cuda(lambda: c(x, ids, w), args.reps))
+                    elif p in ("fi", "fi-ckpt"):
                         c.set_scales(nq.global_scale(float(x.abs().max())), nq.global_scale(64.0))
 
                         def tuned():
@@ -456,6 +473,11 @@ def main() -> None:
                         t = attempt(f"S.M{m}.{p}", lambda: mc.time_cuda(lambda: c(x, ids, w), args.reps))
                     if t is not None:
                         t["tflops"] = mc.flops(m) / (t["median_ms"] * 1e-3) / 1e12
+                        if isinstance(t.get("gemms_only"), dict):
+                            g = t["gemms_only"]
+                            g["tflops"] = mc.flops(m) / (g["median_ms"] * 1e-3) / 1e12
+                            log(f"  speed M={m} {p:6s} GEMMs only {g['median_ms']:9.3f} ms {g['tflops']:7.2f} TFLOPS "
+                                f"tactic {t.get('tactic')}")
                         row[p] = t
                         log(f"  speed M={m} {p:6s} {t['median_ms']:9.3f} ms  {t['tflops']:7.2f} TFLOPS")
                 if "tf_kernels" in row:

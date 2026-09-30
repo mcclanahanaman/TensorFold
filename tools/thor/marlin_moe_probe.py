@@ -11,12 +11,14 @@ It prints the vLLM API it finds, prepares one layer's experts the way vLLM's Mod
 from __future__ import annotations
 
 import argparse
+import importlib
 import inspect
 import json
 import sys
 import time
 import traceback
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -43,6 +45,18 @@ class FakeLayer(torch.nn.Module):
     pass
 
 
+def marlin_module():
+    """vLLM's fused Marlin MoE module (0.28 moved it under fused_moe/experts)."""
+
+    for name in ("vllm.model_executor.layers.fused_moe.experts.marlin_moe",
+                 "vllm.model_executor.layers.fused_moe.fused_marlin_moe"):
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    raise ImportError("no fused_marlin_moe module in this vLLM")
+
+
 def build(layer: mc.Layer, dtype=torch.bfloat16):
     from vllm.model_executor.layers.quantization.utils import marlin_utils_fp4 as mu
 
@@ -53,7 +67,8 @@ def build(layer: mc.Layer, dtype=torch.bfloat16):
     lay.hidden_size = mc.D
     lay.intermediate_size_per_partition = mc.NI
     lay.params_dtype = dtype
-    lay.moe_config = None
+    lay.moe_config = SimpleNamespace(num_local_experts=mc.E, num_experts=mc.E, hidden_dim=mc.D,
+                                     intermediate_size_per_partition=mc.NI, is_act_and_mul=True)
     p = torch.nn.Parameter
     # vLLM's w13 = [w1 (gate); w3 (up)] rows, one weight_scale_2 an expert (it takes gate's: [:, 0])
     lay.w13_weight = p(torch.cat([layer.gate.w, layer.up.w], 1).contiguous(), requires_grad=False)
@@ -71,8 +86,9 @@ def build(layer: mc.Layer, dtype=torch.bfloat16):
 
 
 def run_marlin(lay, x, ids, w):
-    from vllm.model_executor.layers.fused_moe.fused_marlin_moe import fused_marlin_moe
     from vllm.scalar_type import scalar_types
+
+    fused_marlin_moe = marlin_module().fused_marlin_moe
 
     params = inspect.signature(fused_marlin_moe).parameters
     kw = dict(hidden_states=x, w1=lay.w13_weight, w2=lay.w2_weight, w1_scale=lay.w13_weight_scale,
@@ -109,7 +125,7 @@ def main():
     rep["vllm"] = vllm.__version__
     rep["torch"] = torch.__version__
     try:
-        from vllm.model_executor.layers.fused_moe import fused_marlin_moe as fmm
+        fmm = marlin_module()
         from vllm.model_executor.layers.quantization.utils import marlin_utils_fp4 as mu
 
         rep["api"] = {"fused_marlin_moe": sig(fmm.fused_marlin_moe),

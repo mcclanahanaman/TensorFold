@@ -8,7 +8,8 @@ from __future__ import annotations
 import json
 import sys
 
-SKIP = {"load", "h_amax", "x_amax", "ref_fp32_vs_fp64", "fiw4a16_mode", "fiw4a16_tactic", "fiw4a16_launch_error"}
+SKIP = {"load", "h_amax", "x_amax", "ref_fp32_vs_fp64", "fiw4a16_mode", "fiw4a16_tactic", "fiw4a16_launch_error",
+        "fiw4a16_tactic_errors"}
 
 
 def main() -> None:
@@ -38,6 +39,14 @@ def main() -> None:
                     tag = "" if p == "tf" else (" PASS" if r <= 1.5 else " FAIL")
                     cells.append(f"{a['rel_fro']:.3e} x{r:5.2f}{tag:5s}")
                 print(f"   {p:9s} " + " ".join(f"{c:>22s}" for c in cells))
+            for p in paths:
+                cells = []
+                for k in ms:
+                    a = lv[k].get(p) or {}
+                    if "vs_tf_bitwise_equal" in a:
+                        cells.append(f"{a['vs_tf_bitwise_equal']:.4f}/{a['vs_tf_max_abs']:.1e}")
+                if cells:
+                    print(f"   {p:9s} bitwise-equal fraction / max|d| vs TensorFold's output: " + "  ".join(cells))
             for k in ms:
                 if "ref_fp32_vs_fp64" in lv[k]:
                     print(f"   fp32 reference vs fp64 at {k}: rel {lv[k]['ref_fp32_vs_fp64']['rel_fro']:.2e}")
@@ -56,6 +65,12 @@ def main() -> None:
                     v = row.get(p)
                     cells.append(f"{v['median_ms']:9.3f}/{v['tflops']:7.2f}" if v else f"{'-':>17s}")
                 print(f"   {mk:>6s} " + " ".join(f"{c:>20s}" for c in cells))
+            for mk, row in sp.items():
+                for p, v in row.items():
+                    if isinstance(v, dict) and "gemms_only" in v:
+                        g = v["gemms_only"]
+                        print(f"   {mk:>6s} {p} GEMMs only {g['median_ms']:.3f} ms / {g.get('tflops', 0):.2f} TFLOPS, "
+                              f"tactic {v.get('tactic')}, mode {v.get('mode')}")
         if rep.get("errors"):
             print("-- errors:")
             for k, v in rep["errors"].items():

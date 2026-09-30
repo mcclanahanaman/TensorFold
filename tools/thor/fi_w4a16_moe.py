@@ -48,6 +48,39 @@ def patch_smem() -> dict:
     return info
 
 
+def combine_rows(y: torch.Tensor, e2p: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """out[t] = sum_k w[t, k] * y[e2p[t, k]] in fp32, slot order, one rounding to bf16 (a Triton kernel)."""
+
+    import triton
+
+    m, top = e2p.shape
+    out = torch.empty(m, y.shape[1], dtype=torch.bfloat16, device=y.device)
+    _combine_rows[(m, triton.cdiv(y.shape[1], 512))](y, e2p, w, out, D=y.shape[1], TOP=top, BLOCK=512,
+                                                        num_warps=4)
+    return out
+
+
+def _make_combine():
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(Y, IDX, W, OUT, D: tl.constexpr, TOP: tl.constexpr, BLOCK: tl.constexpr):
+        r = tl.program_id(0)
+        d = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        ok = d < D
+        acc = tl.zeros((BLOCK,), tl.float32)
+        for k in tl.static_range(TOP):
+            row = tl.load(IDX + r * TOP + k).to(tl.int64)
+            acc += tl.load(W + r * TOP + k) * tl.load(Y + row * D + d, mask=ok, other=0.0).to(tl.float32)
+        tl.store(OUT + r * D + d, acc.to(tl.bfloat16), mask=ok)
+
+    return kernel
+
+
+_combine_rows = _make_combine()
+
+
 def interleave_rows(t: torch.Tensor, group: int = 64) -> torch.Tensor:
     """[E, 2I, ...] with rows [up; gate] -> [E, 2I, ...] rows [up g0; gate g0; up g1; gate g1; ...], ``group`` rows each."""
 
@@ -101,24 +134,38 @@ class FlashInferW4A16:
         used = cum_tiles[-1].to(torch.int32).reshape(1)
         return te.to(torch.int32), limit.to(torch.int32), e2p.view(ids.shape), p2e, used, pos, order, slots
 
-    def _torch_path(self, x, ids, w):
-        g1, g2 = self.tactic
-        tile = g1[0][1]
-        te, limit, e2p, p2e, used, pos, order, slots = self.sort(ids, tile)
+    def prepare(self, x, ids):
+        """Routing metadata (torch, moe_sort's semantics), the permuted rows and the scratch for this tactic."""
+
+        g1, _ = self.tactic
+        te, limit, e2p, p2e, used, pos, order, slots = self.sort(ids, g1[0][1])
         hidden = torch.empty(slots, mc.D, dtype=torch.bfloat16, device=x.device)
         hidden[pos] = x[order // ids.shape[1]]
         inter = torch.empty(slots, mc.NI, dtype=torch.bfloat16, device=x.device)
-        common = dict(tile_idx_to_expert_idx=te, tile_idx_to_mn_limit=limit, num_non_exiting_tiles=used,
-                      num_local_experts=mc.E, swiglu_alpha=self._d("DEFAULT_SWIGLU_ALPHA"),
-                      swiglu_beta=self._d("DEFAULT_SWIGLU_BETA"), swiglu_limit=self._d("DEFAULT_SWIGLU_LIMIT"),
-                      situ_beta=None, situ_linear_beta=None, use_fused_finalize=False,
-                      permuted_idx_to_expanded_idx=None, token_final_scales=None, enable_pdl=False)
-        self.fw._run_grouped_gemm(weight=self.w1, weight_sf=self.w1_sf, activations=hidden, alpha=self.w1_alpha,
-                                  output=inter, activation_type=self.act, tactic=g1, **common)
         y = torch.empty(slots, mc.D, dtype=torch.bfloat16, device=x.device)
-        self.fw._run_grouped_gemm(weight=self.w2, weight_sf=self.w2_sf, activations=inter, alpha=self.w2_alpha,
-                                  output=y, activation_type=None, tactic=g2, **common)
-        return (y[e2p.long()].float() * w[..., None]).sum(1).to(torch.bfloat16)
+        return dict(te=te, limit=limit, used=used, hidden=hidden, inter=inter, y=y, e2p=e2p)
+
+    def gemms(self, prep) -> torch.Tensor:
+        """The two grouped GEMMs alone (gemm1 with its fused SwiGLU, then gemm2) on prepared metadata."""
+
+        g1, g2 = self.tactic
+        common = dict(tile_idx_to_expert_idx=prep["te"], tile_idx_to_mn_limit=prep["limit"],
+                      num_non_exiting_tiles=prep["used"], num_local_experts=mc.E,
+                      swiglu_alpha=self._d("DEFAULT_SWIGLU_ALPHA"), swiglu_beta=self._d("DEFAULT_SWIGLU_BETA"),
+                      swiglu_limit=self._d("DEFAULT_SWIGLU_LIMIT"), situ_beta=None, situ_linear_beta=None,
+                      use_fused_finalize=False, permuted_idx_to_expanded_idx=None, token_final_scales=None,
+                      enable_pdl=False)
+        self.fw._run_grouped_gemm(weight=self.w1, weight_sf=self.w1_sf, activations=prep["hidden"],
+                                  alpha=self.w1_alpha, output=prep["inter"], activation_type=self.act, tactic=g1,
+                                  **common)
+        self.fw._run_grouped_gemm(weight=self.w2, weight_sf=self.w2_sf, activations=prep["inter"],
+                                  alpha=self.w2_alpha, output=prep["y"], activation_type=None, tactic=g2, **common)
+        return prep["y"]
+
+    def _torch_path(self, x, ids, w):
+        prep = self.prepare(x, ids)
+        y = self.gemms(prep)
+        return combine_rows(y, prep["e2p"], w)
 
     def _d(self, name):
         from flashinfer import tllm_enums
@@ -162,25 +209,46 @@ def sweep_tactics(m: int = 2048) -> list:
 
 
 def best_time(path: FlashInferW4A16, x, ids, w, reps: int) -> dict:
-    """Each tactic of ``sweep_tactics`` timed (3 reps after 1 warm-up), the best one again with ``reps`` reps."""
+    """Each tactic of ``sweep_tactics`` timed on the two grouped GEMMs alone (prepared metadata, 3 reps after 1
+    warm-up); the best one again with ``reps`` reps as GEMMs only and as the full block (torch routing metadata with
+    a host sync, the permute gather, both GEMMs, the Triton combine)."""
 
     tried = []
     best = None
     for tac in sweep_tactics(x.shape[0]):
         path.tactic = tac
         try:
-            t = mc.time_cuda(lambda: path(x, ids, w), reps=3, warmup=1)
+            prep = path.prepare(x, ids)
+            t = mc.time_cuda(lambda: path.gemms(prep), reps=3, warmup=1)
         except Exception as exc:  # noqa: BLE001
             tried.append({"tactic": tac, "error": repr(exc)[:300]})
             continue
-        tried.append({"tactic": tac, "median_ms": t["median_ms"]})
+        tried.append({"tactic": tac, "gemms_ms": t["median_ms"]})
         if best is None or t["median_ms"] < best[1]:
             best = (tac, t["median_ms"])
     if best is None:
         raise RuntimeError(f"no W4A16 tactic ran: {tried[:3]}")
     path.tactic = best[0]
+    prep = path.prepare(x, ids)
+    g = mc.time_cuda(lambda: path.gemms(prep), reps=reps)
     t = mc.time_cuda(lambda: path(x, ids, w), reps=reps)
+    t["gemms_only"] = g
     t["tactic"] = best[0]
     t["tried"] = tried
     t["mode"] = path.used
     return t
+
+
+def first_working(path: FlashInferW4A16, x, ids, w):
+    """Run with the default tactic, else the first of ``sweep_tactics`` that runs; returns (output, tactic)."""
+
+    errors = []
+    for tac in [path.fw.DEFAULT_W4A16_MOE_TACTIC] + sweep_tactics(x.shape[0]):
+        path.tactic = tac
+        try:
+            out = path(x, ids, w)
+            torch.cuda.synchronize()
+            return out, tac, errors
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{tac}: {exc!r}"[:400])
+    raise RuntimeError("no W4A16 tactic ran: " + " | ".join(errors[:4]))

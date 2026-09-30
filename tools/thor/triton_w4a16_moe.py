@@ -143,24 +143,42 @@ class TritonW4A16:
         start = (first_pair[be] + local * bt).to(torch.int32)
         return pairs, be.to(torch.int32), start, cnt.to(torch.int32), bmax
 
-    @torch.no_grad()
-    def __call__(self, x, ids, w, act=None, y=None):
+    def prepare(self, x, ids):
+        """The block plan and scratch for this config (torch; one host sync in bincount)."""
+
         m = x.shape[0]
+        pairs, be, start, cnt, bmax = self.plan(ids, self.cfg["BT"])
+        act = torch.empty(m * mc.TOP, mc.NI, dtype=torch.bfloat16, device=x.device)
+        y = torch.empty(m * mc.TOP, mc.D, dtype=torch.bfloat16, device=x.device)
+        return dict(pairs=pairs, be=be, start=start, cnt=cnt, bmax=bmax, act=act, y=y)
+
+    def kernels(self, x, prep):
+        """gate/up + SwiGLU, then down: y [M * top, D] bf16 in (token, slot) order."""
+
         c = self.cfg
-        pairs, be, start, cnt, bmax = self.plan(ids, c["BT"])
-        act = torch.empty(m * mc.TOP, mc.NI, dtype=torch.bfloat16, device=x.device) if act is None else act
-        y = torch.empty(m * mc.TOP, mc.D, dtype=torch.bfloat16, device=x.device) if y is None else y
-        _gate_up[(bmax, mc.NI // c["BW"])](x, self.codes1, self.sc1, self.s21, pairs, be, start, cnt, act,
-                                           K=mc.D, NI=mc.NI, SLOTS=mc.TOP, BW=c["BW"], BT=c["BT"], BK=c["BK"],
-                                           num_warps=c["w1"], num_stages=c["s1"])
-        _down[(bmax, mc.D // c["BW"])](act, self.codes2, self.sc2, self.s22, pairs, be, start, cnt, y,
-                                       K=mc.NI, N=mc.D, BW=c["BW"], BT=c["BT"], BK=c["BK"],
-                                       num_warps=c["w2"], num_stages=c["s2"])
-        return (y.view(m, mc.TOP, mc.D).float() * w[..., None]).sum(1).to(torch.bfloat16)
+        _gate_up[(prep["bmax"], mc.NI // c["BW"])](
+            x, self.codes1, self.sc1, self.s21, prep["pairs"], prep["be"], prep["start"], prep["cnt"], prep["act"],
+            K=mc.D, NI=mc.NI, SLOTS=mc.TOP, BW=c["BW"], BT=c["BT"], BK=c["BK"], num_warps=c["w1"],
+            num_stages=c["s1"])
+        _down[(prep["bmax"], mc.D // c["BW"])](
+            prep["act"], self.codes2, self.sc2, self.s22, prep["pairs"], prep["be"], prep["start"], prep["cnt"],
+            prep["y"], K=mc.NI, N=mc.D, BW=c["BW"], BT=c["BT"], BK=c["BK"], num_warps=c["w2"], num_stages=c["s2"])
+        return prep["y"]
+
+    @torch.no_grad()
+    def __call__(self, x, ids, w):
+        m = x.shape[0]
+        y = self.kernels(x, self.prepare(x, ids)).view(m, mc.TOP, mc.D)
+        try:
+            from tensorfold.cuda import moe as moe_mod          # TensorFold's combine: fp32, slot order, one rounding
+
+            return moe_mod.combine(y, w)
+        except ImportError:
+            return (y.float() * w[..., None]).sum(1).to(torch.bfloat16)
 
 
 CONFIGS = [dict(BT=bt, BK=bk, BW=128, w1=wp, s1=st, w2=wp, s2=st)
-           for bt in (32, 64, 128) for bk in (64, 128) for wp in (4, 8) for st in (2, 3)]
+           for bt in (16, 32, 64, 128) for bk in (64, 128) for wp in (4, 8) for st in (2, 3)]
 
 
 def main():
@@ -194,7 +212,8 @@ def main():
                 for cfg in CONFIGS:
                     path.cfg = cfg
                     try:
-                        t = mc.time_cuda(lambda: path(x, ids, w), reps=5, warmup=2)
+                        prep = path.prepare(x, ids)
+                        t = mc.time_cuda(lambda: path.kernels(x, prep), reps=5, warmup=2)
                     except Exception as exc:  # noqa: BLE001
                         rep["errors"][f"S.M{m}.{cfg}"] = repr(exc)[:500]
                         continue
@@ -203,12 +222,16 @@ def main():
                 if best is None:
                     continue
                 path.cfg = best[1]
+                prep = path.prepare(x, ids)
+                k = mc.time_cuda(lambda: path.kernels(x, prep), reps=args.reps)
                 t = mc.time_cuda(lambda: path(x, ids, w), reps=args.reps)
-                t["tflops"] = mc.flops(m) / (t["median_ms"] * 1e-3) / 1e12
+                for v in (k, t):
+                    v["tflops"] = mc.flops(m) / (v["median_ms"] * 1e-3) / 1e12
+                t["kernels_only"] = k
                 t["cfg"] = best[1]
                 rep["speed"][f"M{m}"] = t
-                print(f"[{mc.stamp()}] speed M={m} triton-w4a16 {t['median_ms']:.3f} ms {t['tflops']:.2f} TFLOPS "
-                      f"cfg {best[1]}", flush=True)
+                print(f"[{mc.stamp()}] speed M={m} triton-w4a16 kernels {k['median_ms']:.3f} ms {k['tflops']:.2f} "
+                      f"TFLOPS; full {t['median_ms']:.3f} ms; cfg {best[1]}", flush=True)
                 save()
             try:
                 k = _gate_up.cache[torch.cuda.current_device()]
