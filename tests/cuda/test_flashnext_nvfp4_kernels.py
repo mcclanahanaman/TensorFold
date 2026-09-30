@@ -14,6 +14,18 @@ triton = pytest.importorskip("triton")
 from tensorfold.families.qwen4_exp.cuda import bf16, nvfp4, nvfp4_moe  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def portable_experts(monkeypatch):
+    """These tests pin the portable NVFP4 expert kernel on every GPU; Thor's own path is test_thor_experts.py's."""
+
+    from tensorfold.cuda.nvfp4 import thor_experts
+
+    monkeypatch.setenv(thor_experts.ENV, "0")
+    thor_experts.available.cache_clear()
+    yield
+    thor_experts.available.cache_clear()
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 def test_b16_matmul_is_row_invariant():
     """A BF16 row's bits depend only on its own input: the same row in a 1-row window and a 16-row window

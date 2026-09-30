@@ -1,4 +1,9 @@
-"""Flash Next's NVFP4 MoE: routed experts on the grouped NVFP4 kernel, the bf16 shared expert on the FP4 tables."""
+"""Flash Next's NVFP4 MoE: routed experts on the grouped NVFP4 kernel, the bf16 shared expert on the FP4 tables.
+
+On Jetson Thor (sm_110) the routed experts run FlashInfer's W4A16 grouped GEMM instead (``thor_experts``): laid out
+once at load, for prompt chunks and decode windows alike (both keep bf16 slots); TENSORFOLD_THOR_FI_MOE=0 keeps the
+portable kernel.
+"""
 
 from __future__ import annotations
 
@@ -7,6 +12,7 @@ from dataclasses import dataclass
 import torch
 
 from tensorfold.cuda.nvfp4 import experts as nvx
+from tensorfold.cuda.nvfp4 import thor_experts as thor
 
 from . import nvfp4
 
@@ -23,7 +29,7 @@ class Expert4:
 class MoE4:
     """One layer's experts: the routed ones as grouped NVFP4 blocks, the shared one as bf16 tables."""
 
-    routed_experts: nvx.Experts4
+    routed_experts: nvx.Experts4 | thor.ThorExperts
     shared: Expert4
     kernel: str = "nvfp4"
 
@@ -71,11 +77,22 @@ def expert4_from_bf16(gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor) 
     return Expert4(gu, nvfp4.fp4_from_bf16(down.contiguous()))
 
 
+_NOTED: set = set()
+
+
 def moe4_from_checkpoint(gate: tuple, up: tuple, down: tuple,
                          shared: tuple[torch.Tensor, torch.Tensor, torch.Tensor]) -> MoE4:
     """A layer from stacked checkpoint arrays (words, e4m3 scales, per-expert scales) and the bf16 shared expert."""
 
-    return MoE4(nvx.make(gate, up, down), shared if isinstance(shared, Expert4) else expert4_from_bf16(*shared))
+    shared = shared if isinstance(shared, Expert4) else expert4_from_bf16(*shared)
+    if thor.available(torch.cuda.current_device()):
+        try:
+            return MoE4(thor.make(gate, up, down), shared)
+        except ValueError as exc:                  # a layer the Thor layout cannot hold exactly keeps the portable one
+            if str(exc) not in _NOTED:
+                _NOTED.add(str(exc))
+                print(f"[tensorfold] Thor NVFP4 experts: a layer keeps the portable kernel: {exc}", flush=True)
+    return MoE4(nvx.make(gate, up, down), shared)
 
 
 def moe4_from_bf16(gate_up: torch.Tensor, down: torch.Tensor,
@@ -105,11 +122,40 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, 
     from tensorfold.cuda import moe as moe_mod
 
     rows, top_k = x.shape[0], int(cfg.num_experts_per_tok)
+    routed = ex.routed_experts
+    on_thor = isinstance(routed, thor.ThorExperts)
     moe_mod.router(x, router_rows, buf.logits[:rows])
-    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, nvx.PREFILL_TILE)
+    moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, thor.tactic(rows)[0] if on_thor else nvx.PREFILL_TILE)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
-    nvx.gate_up(x, ex.routed_experts, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed)
+    if on_thor:
+        scratch = getattr(buf, "thor", None)
+        if scratch is None:
+            raise RuntimeError("these buffers were built without the Thor experts' scratch (attach_thor at load)")
+        thor.run(x, routed, buf.plan, buf.y, rows, top_k, scratch)
+    else:
+        nvx.gate_up(x, routed, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed)
     buf.act[:rows, top_k] = ex.shared_act(x, prompt)
-    nvx.down(buf.act.view(-1, ex.width), ex.routed_experts, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed)
+    if not on_thor:
+        nvx.down(buf.act.view(-1, ex.width), routed, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed)
     buf.y[:rows, top_k] = _shared(ex.shared.down, buf.act[:rows, top_k], prompt, not prompt)
     return buf
+
+
+def thor_layers(w) -> list:
+    """The layers whose routed experts run on the Thor path."""
+
+    return [layer for layer in w.layers
+            if isinstance(getattr(getattr(getattr(layer, "moe", None), "experts", None), "routed_experts", None),
+                          thor.ThorExperts)]
+
+
+def attach_thor(w, buf, rows: int) -> None:
+    """A buffer set with bf16 slots gets the Thor experts' scratch and warms their kernels, at load, not on a request."""
+
+    layers = thor_layers(w)
+    if not layers or buf.y.dtype != torch.bfloat16:
+        return
+    ex = layers[0].moe.experts.routed_experts
+    top_k = buf.slots - 1
+    buf.thor = thor.Scratch(rows, top_k, ex.count, ex.width, ex.dims, buf.y.device)
+    thor.warm(ex, buf.thor, top_k)

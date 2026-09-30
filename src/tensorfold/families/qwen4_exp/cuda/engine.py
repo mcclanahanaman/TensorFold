@@ -96,6 +96,11 @@ class FlashNextEngine:
                                                kept=KEEP_SERIAL + 1, prefill_rows=rows0)))
         if exl3:
             geometry = admission(geometry)
+        elif quant_method(read_config(model_dir)) == "modelopt":
+            from tensorfold.cuda.nvfp4 import thor_experts
+
+            if thor_experts.available():             # Thor (sm_110) experts: their scratch counts before the caches
+                geometry = thor_experts.admission(geometry, streams * each if streams > 1 else max(8, each))
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
 
         workspace = vision_workspace() if vision else 0

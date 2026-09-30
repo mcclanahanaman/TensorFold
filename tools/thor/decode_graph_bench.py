@@ -101,6 +101,9 @@ def main() -> None:
     p = lambda q: (q.w, q.s, q.s2)  # noqa: E731
     ex = nvx.make(p(layer.gate), p(layer.up), p(layer.down))
     fi = fw.FlashInferW4A16(layer)
+    from tensorfold.cuda.nvfp4 import thor_experts as thor
+
+    thor_ex = thor.make(p(layer.gate), p(layer.up), p(layer.down)) if thor.available() else None
     for m in [int(v) for v in args.ms.split(",")]:
         x = mc.activations(m, seed=3000 + m)
         ids, w = mc.route(x, layer.router)
@@ -140,14 +143,64 @@ def main() -> None:
         if best is not None:
             graphs["fi"] = best[2]
             row["fi_tactic"] = best[0]
+        if thor_ex is not None:
+            # the integrated path: route with the Thor tile, gather, both GEMMs, scatter into bf16 slots
+            tt, (g1, g2) = thor.tactic(m)
+            tplan = grouped.Plan(m, mc.TOP + 1, mc.E + 1, "cuda", prefill=True)
+            ty = torch.zeros(m, mc.TOP + 1, mc.D, dtype=torch.bfloat16, device="cuda")
+            scr = thor.Scratch(m, mc.TOP, mc.E, mc.NI, mc.D, "cuda")
+            s_rows = thor.max_tiles(m * mc.TOP, mc.E, tt) * tt
+            grid = (grouped.max_items(m * (mc.TOP + 1), mc.E + 1, tt),)
+            gather, scatter = thor._glue()
+            fwm = thor._fi()
+
+            def thor_route():
+                grouped.route(picks, tplan, tt)
+
+            def thor_gather():
+                gather[grid](x, x.stride(0), tplan.members, tplan.items, tplan.counts, scr.hidden, scr.tile_expert,
+                             scr.tile_limit, scr.tiles, -(-m // tt), SLOTS=mc.TOP + 1, T=tt, D=mc.D, BD=thor._COPY,
+                             num_warps=4)
+
+            def thor_gemms():
+                thor._gemm(fwm, thor_ex.w1, thor_ex.w1_sf, thor_ex.w1_alpha, scr.hidden[:s_rows], scr.inter[:s_rows],
+                           s_rows // tt, scr, mc.E, True, g1)
+                thor._gemm(fwm, thor_ex.w2, thor_ex.w2_sf, thor_ex.w2_alpha, scr.inter[:s_rows], scr.hidden[:s_rows],
+                           s_rows // tt, scr, mc.E, False, g2)
+
+            def thor_scatter():
+                scatter[grid](scr.hidden, tplan.members, tplan.items, scr.tiles, ty.view(-1, mc.D), T=tt, D=mc.D,
+                              BD=thor._COPY, num_warps=4)
+
+            def thor_call():
+                grouped.route(picks, tplan, tt)
+                thor.run(x, thor_ex, tplan, ty, m, mc.TOP, scr)
+
+            try:
+                graphs["thor"] = capture(thor_call)
+                parts = {k: capture(f) for k, f in (("route", thor_route), ("gather", thor_gather),
+                                                    ("gemms", thor_gemms), ("scatter", thor_scatter))}
+                burn()
+                row["thor_parts_ms"] = {k: replay_ms(g, args.reps) for k, g in parts.items()}
+                row["thor_tactic"] = (tt, g1)
+                row["thor_scratch_mb"] = scr.nbytes() / 2 ** 20
+            except Exception as exc:  # noqa: BLE001
+                rep["errors"][f"M{m}.thor"] = repr(exc)[:500]
         res = interleaved(graphs, args.reps, rounds=7)
-        row["tf_ms"], row["fi_ms"] = res.get("tf"), res.get("fi")
+        row["tf_ms"], row["fi_ms"], row["thor_ms"] = res.get("tf"), res.get("fi"), res.get("thor")
         row["tf_all"], row["fi_all"] = res.get("tf_all"), res.get("fi_all")
         rep["rows"][f"M{m}"] = row
         print(f"[{mc.stamp()}] M={m}: TensorFold {row.get('tf_ms') or float('nan'):.4f} ms "
               f"{[round(v, 4) for v in row.get('tf_all') or []]}, FlashInfer W4A16 "
               f"{row.get('fi_ms') or float('nan'):.4f} ms {[round(v, 4) for v in row.get('fi_all') or []]} "
               f"{row.get('fi_tactic')}", flush=True)
+        if row.get("thor_ms") is not None:
+            parts = row.get("thor_parts_ms", {})
+            glue = sum(v for k, v in parts.items() if k != "gemms")
+            print(f"    thor (integrated) {row['thor_ms']:.4f} ms = route {parts.get('route', 0):.4f} + gather "
+                  f"{parts.get('gather', 0):.4f} + gemms {parts.get('gemms', 0):.4f} + scatter "
+                  f"{parts.get('scatter', 0):.4f} (glue {glue:.4f}); vs TensorFold x{row['tf_ms'] / row['thor_ms']:.2f}; "
+                  f"scratch {row.get('thor_scratch_mb', 0):.0f} MB", flush=True)
         Path(args.out).write_text(json.dumps(rep, indent=1, default=str))
     Path(args.out).write_text(json.dumps(rep, indent=1, default=str))
     print("errors:", list(rep["errors"])[:10], flush=True)

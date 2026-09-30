@@ -21,6 +21,8 @@ x = randn * 0.5 in bf16, routing by the layer's own router on x (fp32 logits, so
            tcgen05 MMA, fp32 sums): tools/thor/fi_w4a16_moe.py
   fiw4a4   FlashInfer 0.7.0.post1's CuTe-DSL NVFP4 x NVFP4 grouped MoE (W4A4; its C++ routing helpers replaced by
            torch equivalents offline): tools/thor/fi_w4a4_moe.py
+  thor     TensorFold's integrated Thor path (src/tensorfold/cuda/nvfp4/thor_experts.py): plan, glue, FlashInfer's
+           two grouped GEMMs, TensorFold's combine
   tw4a16   a Triton W4A16 probe (tools/thor/triton_w4a16_moe.py): e2m1 x e4m3 widened to bf16 per tile (exact),
            bf16 tl.dot with fp32 sums, swap-AB tiles of one expert's pairs
 
@@ -95,6 +97,41 @@ class TensorFoldPath:
         self.grouped.route(picks, plan, getattr(self.nvx, "PREFILL_TILE", self.grouped.PREFILL_TILE))
         self.nvx.gate_up(x, self.ex, plan, act, m, skip=mc.E)
         self.nvx.down(act, self.ex, plan, y.view(-1, mc.D), m, skip=mc.E)
+        return y
+
+    def __call__(self, x, picks, wts):
+        return self.moe_mod.combine(self.kernels(x, picks), wts)
+
+
+class ThorPath:
+    """The integrated Thor path (tensorfold.cuda.nvfp4.thor_experts) as nvfp4_moe.moe runs the routed experts: the
+    call's plan routed with the Thor tile, then the glue and FlashInfer's two grouped GEMMs, TensorFold's combine."""
+
+    def __init__(self, layer: mc.Layer) -> None:
+        from tensorfold.cuda import experts as grouped
+        from tensorfold.cuda import moe as moe_mod
+        from tensorfold.cuda.nvfp4 import thor_experts as thor
+
+        self.grouped, self.moe_mod, self.thor = grouped, moe_mod, thor
+        p = lambda q: (q.w, q.s, q.s2)  # noqa: E731
+        self.ex = thor.make(p(layer.gate), p(layer.up), p(layer.down))
+        self.bufs: dict[int, tuple] = {}
+
+    def _buf(self, m: int):
+        if m not in self.bufs:
+            plan = self.grouped.Plan(m, mc.TOP + 1, mc.E + 1, "cuda", prefill=True)
+            y = torch.zeros(m, mc.TOP + 1, mc.D, dtype=torch.bfloat16, device="cuda")
+            scr = self.thor.Scratch(m, mc.TOP, mc.E, mc.NI, mc.D, "cuda")
+            self.bufs[m] = (plan, y, scr)
+        return self.bufs[m]
+
+    prepare = TensorFoldPath.prepare
+
+    def kernels(self, x, picks):
+        m = x.shape[0]
+        plan, y, scr = self._buf(m)
+        self.grouped.route(picks, plan, self.thor.tactic(m)[0])
+        self.thor.run(x, self.ex, plan, y, m, mc.TOP, scr)
         return y
 
     def __call__(self, x, picks, wts):
@@ -342,6 +379,8 @@ def main() -> None:
                 return f4.FlashInferW4A4(layer)
 
             cands["fiw4a4"] = attempt(f"L{li}.fiw4a4.build", make_fiw4a4)
+        if "thor" in paths + args.speed_paths.split(","):
+            cands["thor"] = attempt(f"L{li}.thor.build", lambda: ThorPath(layer))
         if "tw4a16" in paths + args.speed_paths.split(","):
             def make_triton():
                 from triton_w4a16_moe import TritonW4A16
@@ -375,9 +414,9 @@ def main() -> None:
                 log(f"  M={m}: reference in {time.time() - t0:.1f}s, load {entry['load']}")
                 for p in paths:
                     got = None
-                    if p == "tf" and cands.get("tf") is not None:
-                        picks, wts = cands["tf"].prepare(x, ids, w)
-                        got = attempt(f"L{li}.M{m}.tf", lambda: cands["tf"](x, picks, wts))
+                    if p in ("tf", "thor") and cands.get(p) is not None:
+                        picks, wts = cands[p].prepare(x, ids, w)
+                        got = attempt(f"L{li}.M{m}.{p}", lambda: cands[p](x, picks, wts))
                     elif p.startswith("emu"):
                         got = attempt(f"L{li}.M{m}.{p}", lambda: emulate(x, ids, w, ref, int(p[3:])))
                     elif p == "fiw4a16" and cands.get(p) is not None:
@@ -442,14 +481,14 @@ def main() -> None:
                     c = cands.get("fi" if p in ("fi", "fi-ckpt") else p)
                     if c is None:
                         continue
-                    if p == "tf":
+                    if p in ("tf", "thor"):
                         picks, wts = c.prepare(x, ids, w)
-                        t = attempt(f"S.M{m}.tf", lambda: mc.time_cuda(lambda: c(x, picks, wts), args.reps))
-                        k = attempt(f"S.M{m}.tf_kernels", lambda: mc.time_cuda(lambda: c.kernels(x, picks),
-                                                                                 args.reps))
+                        t = attempt(f"S.M{m}.{p}", lambda: mc.time_cuda(lambda: c(x, picks, wts), args.reps))
+                        k = attempt(f"S.M{m}.{p}_kernels", lambda: mc.time_cuda(lambda: c.kernels(x, picks),
+                                                                                  args.reps))
                         if k is not None:
                             k["tflops"] = mc.flops(m) / (k["median_ms"] * 1e-3) / 1e12
-                            row["tf_kernels"] = k
+                            row[f"{p}_kernels"] = k
                     elif p == "fiw4a16":
                         import fi_w4a16_moe as fw
 

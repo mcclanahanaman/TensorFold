@@ -60,6 +60,9 @@ class Buffers:
         self.xs_gated = torch.empty((rows, c.heads * c.head_dim // 32), dtype=f32, device=dev)
         # the experts' prefill arithmetic for decode windows too (``moe_prefill``): their rows can share a pass's launch
         self.moe = moe_mod.MoEBuffers(rows, _MoECfg(c), dev, prefill=prefill if moe_prefill is None else moe_prefill)
+        from .nvfp4_moe import attach_thor
+
+        attach_thor(w, self.moe, rows)             # Thor (sm_110) experts: their scratch and kernels, built now
         # DeltaNet projections and outputs and attention outputs; ``commit`` reads the projections' conv channels
         lin = 1 if prefill else sum(1 for layer in w.layers if layer.linear)     # a prompt chunk commits each layer
         self.proj = torch.zeros((lin, rows, gdn_mod.widths(c.nk, c.nv)[1]), dtype=bf, device=dev)
