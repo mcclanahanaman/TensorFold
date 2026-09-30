@@ -110,9 +110,11 @@ def flashinfer() -> None:
 
 def cutlass() -> None:
     section("CUTLASS headers")
-    hits = sorted(set(glob.glob("/usr/**/cutlass/version.h", recursive=True)
-                      + glob.glob(sys.prefix + "/lib/python3*/site-packages/**/cutlass/version.h", recursive=True)
-                      + glob.glob("/opt/**/cutlass/version.h", recursive=True)))
+    roots = ["/usr/local/cuda/include", "/usr/include"]
+    for base in sys.path:
+        roots += [f"{base}/flashinfer/data/cutlass/include", f"{base}/cutlass_library/source/include",
+                  f"{base}/deep_gemm/include", f"{base}/flashinfer/data/include"]
+    hits = sorted({h for r in roots for h in glob.glob(f"{r}/cutlass/version.h")})
     for h in hits[:12]:
         text = Path(h).read_text()
         ver = [ln.strip() for ln in text.splitlines() if ln.strip().startswith("#define CUTLASS_") and "VERSION" in ln
