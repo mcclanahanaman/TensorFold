@@ -65,8 +65,9 @@ def test_the_loader_builds_the_nvfp4_faces(tiny: Path) -> None:
     assert getattr(moe.experts, "kernel", "") == "nvfp4"
     ex = moe.experts
     assert ex.routed == 2 and ex.width == 128 and ex.dims == 256
-    # the FP4 blocks dequantize to the checkpoint's exact weights (the stored values, not a requantization)
-    from tensorfold.cuda.nvfp4.experts import dense
+    # the FP4 blocks dequantize to the checkpoint's exact weights (the stored values, not a requantization); either
+    # layout (the portable kernel's, or Jetson Thor's)
+    from tensorfold.families.qwen4_exp.cuda.nvfp4_moe import routed_dense as dense
     from safetensors import safe_open
 
     gate = dense(ex.routed_experts, 0, "gate")
@@ -113,8 +114,13 @@ def test_the_reader_finds_the_published_naming(tmp_path: Path) -> None:
         pytest.skip("the loader builds CUDA tensors")
     a, b = load(plain, mtp=True, draft_vocab=None), load(named, mtp=True, draft_vocab=None)
     assert b.cfg.quant == "modelopt" and len(b.layers) == len(a.layers)
+    import dataclasses
+
     for i, (x, y) in enumerate(zip(a.layers, b.layers, strict=True)):
-        for face in ("up", "down", "up_scale", "down_scale"):
+        faces = [f.name for f in dataclasses.fields(x.moe.experts.routed_experts)
+                 if isinstance(getattr(x.moe.experts.routed_experts, f.name), torch.Tensor)]   # either layout's
+        assert faces
+        for face in faces:
             got, want = getattr(y.moe.experts.routed_experts, face), getattr(x.moe.experts.routed_experts, face)
             assert torch.equal(got, want), (i, face)
     assert torch.equal(b.embed[0].float(), a.embed[0].float())

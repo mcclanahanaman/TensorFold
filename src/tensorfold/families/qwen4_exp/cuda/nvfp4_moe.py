@@ -62,6 +62,12 @@ class MoE4:
         return ((gate / (1.0 + torch.exp(-gate))).to(torch.bfloat16).to(torch.float32) * up).to(torch.bfloat16)
 
 
+def routed_dense(routed, e: int, which: str) -> torch.Tensor:
+    """Expert ``e``'s gate, up or down weight [N, K] fp32 from either layout (a reference)."""
+
+    return (thor.dense if isinstance(routed, thor.ThorExperts) else nvx.dense)(routed, e, which)
+
+
 def _shared(lin, x: torch.Tensor, prompt: bool, f32: bool) -> torch.Tensor:
     """The shared expert's matmul: bf16 weights on the FP4 kernel's exact tables, MXFP8 ones on the lane matmul."""
 
