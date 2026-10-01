@@ -22,7 +22,7 @@ def text(tokens: int, seed: int) -> str:
     words = ["alpha", "bravo", "cobalt", "delta", "ember", "fjord", "garnet", "harbor", "indigo", "juniper", "kelp",
              "lumen", "meadow", "nectar", "onyx", "pylon", "quartz", "raven", "sierra", "tundra"]
     out = [f"Run {seed}."]
-    for i in range(tokens * 2 // 3):                       # about 1.5 tokens a word with the numbers
+    for i in range(tokens * 32 // 100):                    # Flash Next's tokenizer: about 3.1 tokens a word here
         out.append(words[rng.randrange(len(words))] if i % 3 else str(rng.randrange(100000)))
     return " ".join(out) + "\n\nReply with one word."
 
