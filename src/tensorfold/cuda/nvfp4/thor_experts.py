@@ -44,7 +44,12 @@ def _off(env: str = ENV) -> bool:
 
 @functools.lru_cache(maxsize=None)
 def available(device: int = 0) -> bool:
-    """sm_110, FlashInfer's W4A16 MoE importable and not switched off: decided once, before any weight is laid out."""
+    """sm_110, FlashInfer's W4A16 MoE importable and not switched off: decided once, before any weight is laid out.
+
+    A yes also builds TensorFold's grouped-experts extension (the plans this path routes with) right away, before
+    the weights load. Otherwise the warm-up would build it on the first start after an install or update, after the
+    weights, and on AGX Thor such a build left 1-2 GiB that the stream caches' sizing could not see; built before
+    the load, it cost nothing measurable."""
 
     if _off() or not torch.cuda.is_available() or torch.cuda.get_device_capability(device) != CAPABILITY:
         return False
@@ -57,6 +62,9 @@ def available(device: int = 0) -> bool:
         print(f"[tensorfold] Thor NVFP4 experts off: FlashInfer's W4A16 MoE is not usable here ({exc!r}); the "
               "portable kernel runs", flush=True)
         return False
+    from tensorfold.cuda import experts as grouped
+
+    grouped._ext()
     return True
 
 
