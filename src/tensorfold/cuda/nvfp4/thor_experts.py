@@ -28,6 +28,8 @@ MIN_TILE = 16               # the plan's items buffer holds items of 16 pairs at
 TACTICS = ((4, 16, 128, (1, 1)), (64, 16, 128, (2, 1)), (512, 32, 128, (2, 1)), (2048, 64, 128, (1, 1)),
            (1 << 30, 64, 128, (2, 1)))
 _COPY = 512                 # columns a glue step moves
+GRAPHS_ENV = "TENSORFOLD_THOR_FI_MOE_GRAPHS"
+GRAPH_ROWS = 64             # a scratch of at most this many rows (a decode window's, the drafts') records its calls
 
 
 def _fi():
@@ -36,8 +38,8 @@ def _fi():
     return moe_w4a16
 
 
-def _off() -> bool:
-    return os.environ.get(ENV, "1").strip().lower() in ("0", "off", "false", "no")
+def _off(env: str = ENV) -> bool:
+    return os.environ.get(env, "1").strip().lower() in ("0", "off", "false", "no")
 
 
 @functools.lru_cache(maxsize=None)
@@ -195,6 +197,8 @@ class Scratch:
         self.tile_limit = torch.zeros((s // MIN_TILE,), dtype=torch.int32, device=device)
         self.tiles = torch.zeros((1,), dtype=torch.int32, device=device)
         self.pos = torch.zeros((rows * (top_k + 1),), dtype=torch.int32, device=device)    # a pair's permuted row
+        # a decode buffer set's eager calls, recorded once a (layer, rows, buffers) and replayed (see ``run``)
+        self.graphs: dict | None = {} if rows <= GRAPH_ROWS and not _off(GRAPHS_ENV) else None
 
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in (self.hidden, self.inter, self.tile_expert, self.tile_limit,
@@ -280,19 +284,56 @@ def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_
 
     ``plan``: the call's pairs grouped by expert (``tensorfold.cuda.experts.route`` with ``tactic(rows)``'s tile), the
     shared expert (id E) in the last slot. No host sync: the grid and the shapes follow ``rows`` alone.
-    """
 
-    from tensorfold.cuda import experts as grouped
+    A decode buffer set's calls (a scratch of at most GRAPH_ROWS rows) issued eagerly, as the concurrent server issues
+    them, run as one CUDA graph a (layer, rows, buffers): the first such call launches the kernels and records them,
+    later ones replay the record, which reads their rows and plan afresh (the same kernels: the same bits). Inside a
+    caller's own capture (the single-stream engine's decode graphs) the kernels go in directly.
+    ``TENSORFOLD_THOR_FI_MOE_GRAPHS=0`` launches them every call.
+    """
 
     if x.dtype != torch.bfloat16 or y.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("the Thor experts read bf16 rows into bf16 slots (or fp32 ones: the MTP head's)")
     if rows > scr.rows:
         raise ValueError(f"a call of {rows} rows exceeds the Thor scratch's {scr.rows}")
-    fw = _fi()
     # a prompt plan holds this tactic's items; a decode plan (the MTP head's fp32 slots) always holds 16
-    tile, (g1, g2) = tactic(rows, None if plan.prefill else plan.tile)
+    tile, gemms = tactic(rows, None if plan.prefill else plan.tile)
     if plan.tile != tile:
         raise ValueError(f"the plan was routed with items of {plan.tile} pairs; this call's tile is {tile}")
+    if scr.graphs is None or torch.cuda.is_current_stream_capturing():
+        _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms)
+        return
+    key = (ex.w1.data_ptr(), ex.w2.data_ptr(), rows, top_k, x.data_ptr(), x.stride(0), y.data_ptr(), tuple(y.shape),
+           y.dtype, plan.members.data_ptr(), plan.items.data_ptr(), plan.counts.data_ptr(), tile)
+    graph = scr.graphs.get(key)
+    if graph is not None:
+        graph.replay()
+        return
+    _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms)        # this call's outputs; it builds what it reaches
+    scr.graphs[key] = _record(lambda: _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms))
+
+
+def _record(launch) -> torch.cuda.CUDAGraph:
+    """``launch``'s kernels as a CUDA graph, recorded on a side stream (nothing runs); replays go on the current one.
+    Each record keeps its own (empty: a call allocates nothing) memory pool, released with it: a pool shared by
+    records that die at different times trips torch's allocator when the next record reuses it."""
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(torch.cuda.Stream()):
+        graph.capture_begin(capture_error_mode="thread_local")
+        try:
+            launch()
+        finally:
+            graph.capture_end()
+    return graph
+
+
+def _launch(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_k: int, scr: Scratch, tile: int,
+            gemms: tuple) -> None:
+    from tensorfold.cuda import experts as grouped
+
+    fw = _fi()
+    g1, g2 = gemms
     nslots = y.shape[1]
     s = max_tiles(rows * top_k, ex.count, tile) * tile
     tiles = s // tile
@@ -305,7 +346,7 @@ def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_
     _gemm(fw, ex.w1, ex.w1_sf, ex.w1_alpha, scr.hidden[:s], scr.inter[:s], tiles, scr, ex.count, True, g1)
     _gemm(fw, ex.w2, ex.w2_sf, ex.w2_alpha, scr.inter[:s], scr.hidden[:s], tiles, scr, ex.count, False, g2)
     scatter[grid](scr.hidden, plan.members, plan.items, scr.tiles, y.view(-1, ex.dims), T=tile, D=ex.dims,
-                   BD=_COPY, num_warps=4)
+                  BD=_COPY, num_warps=4)
 
 
 _WARM: set = set()
@@ -319,6 +360,16 @@ def warm(ex: ThorExperts, scr: Scratch, top_k: int, *, prompt: bool = True) -> N
     from tensorfold.cuda import experts as grouped
 
     dev = scr.hidden.device
+    graphs, scr.graphs = scr.graphs, None             # the synthetic calls' buffers go: keep no record of them
+    try:
+        _warm(ex, scr, top_k, prompt, grouped, dev)
+    finally:
+        scr.graphs = graphs
+    torch.cuda.synchronize(dev)
+    torch.cuda.empty_cache()                      # the synthetic calls' buffers go back before the caches are sized
+
+
+def _warm(ex: ThorExperts, scr: Scratch, top_k: int, prompt: bool, grouped, dev) -> None:
     lo = 1
     for top, *_ in TACTICS:
         if lo > scr.rows:
@@ -337,8 +388,6 @@ def warm(ex: ThorExperts, scr: Scratch, top_k: int, *, prompt: bool = True) -> N
             _WARM.add((rows, prompt))
             del picks, plan, x, y
         lo = top + 1
-    torch.cuda.synchronize(dev)
-    torch.cuda.empty_cache()                      # the synthetic calls' buffers go back before the caches are sized
 
 
 def admission(geometry, decode_rows: int, prompt_rows: int | None = None):

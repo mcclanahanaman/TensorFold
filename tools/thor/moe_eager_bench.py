@@ -4,13 +4,16 @@ TensorFold's portable NVFP4 path against the Thor path (tensorfold.cuda.nvfp4.th
 
     FLASHINFER_NO_DOWNLOAD=1 python tools/thor/moe_eager_bench.py --model /hf/... --out /out/moe_eager.json
 
-A call is the part that differs between the paths: route (each path's tile) and the routed experts into the slots;
-the router, the shared expert and the combine are the same on both. ``decode`` calls use the prompt plan and bf16
-slots (TensorFold 0.6.0 decodes with its prompt arithmetic); ``mtp`` calls the decode plan and fp32 slots (the MTP
-head's drafts). Host: ``--calls`` calls issued while a GPU sleep holds the queue (nothing completes meanwhile, so the
-loop times the host alone; a call that synchronized would wait out the sleep); its FlashInfer, Triton-glue and route
-shares by wrappers. Wall: the same calls back to back, synchronized once (CUDA events alongside). Kernels:
-torch.profiler's GPU activities a call.
+A call is the part that differs between the paths: route (each path's tile) and the routed experts into the slots
+(the router, the shared expert and the combine are the same on both). The Thor path runs twice: launching its kernels
+every call (``thor_launch``) and, where the code records eager decode calls, replaying its record (``thor``: one CUDA
+graph a layer and row count). ``decode`` calls use the prompt plan and bf16 slots (TensorFold 0.6.0 decodes with its
+prompt arithmetic); ``mtp`` calls the decode plan and fp32 slots (the MTP head's drafts).
+
+Host: ``--calls`` calls issued while a GPU sleep holds the queue (nothing completes meanwhile, so the loop times the
+host alone; a call that synchronized would wait out the sleep), with its FlashInfer, Triton-glue and route shares by
+wrappers. Wall: the same calls back to back, synchronized once (CUDA events alongside). Kernels: torch.profiler's GPU
+activities a call.
 """
 
 from __future__ import annotations
@@ -57,7 +60,8 @@ class TimedKernel:
 class Call:
     """One path's route + routed experts at m rows on fixed buffers (as a server's buffer set holds them)."""
 
-    def __init__(self, ex, thor_path: bool, m: int, mtp: bool, x: torch.Tensor, picks: torch.Tensor, shares: Shares):
+    def __init__(self, ex, thor_path: bool, m: int, mtp: bool, x: torch.Tensor, picks: torch.Tensor, shares: Shares,
+                 records: bool = True):
         from tensorfold.cuda import experts as grouped
         from tensorfold.cuda.nvfp4 import experts as nvx
         from tensorfold.cuda.nvfp4 import thor_experts as thor
@@ -70,6 +74,8 @@ class Call:
         if thor_path:
             self.tile = thor.tactic(m)[0]
             self.scr = thor.Scratch(m, mc.TOP, mc.E, mc.NI, mc.D, "cuda")
+            if not records and getattr(self.scr, "graphs", None) is not None:
+                self.scr.graphs = None              # every call launches its kernels (the path before its records)
         else:
             self.tile = nvx.PREFILL_TILE
             self.act = torch.zeros(m * (mc.TOP + 1), mc.NI, dtype=torch.bfloat16, device="cuda")
@@ -131,6 +137,57 @@ def kernels(fn, calls: int) -> dict:
             "names": {k: v / calls for k, v in sorted(names.items(), key=lambda kv: -kv[1])}}
 
 
+def mem_available() -> int:
+    for line in open("/proc/meminfo"):
+        if line.startswith("MemAvailable:"):
+            return int(line.split()[1]) * 1024
+    return 0
+
+
+def records_cost(ex, router, rows_max: int, copies: int) -> dict:
+    """What the Thor path's records of eager decode calls cost: a first call (launch + record) and a replay, per row
+    count, and the memory ``copies`` x ``rows_max`` records hold (``copies`` output buffers stand in for layers)."""
+
+    import gc
+
+    from tensorfold.cuda import experts as grouped
+    from tensorfold.cuda.nvfp4 import thor_experts as thor
+
+    scr = thor.Scratch(rows_max, mc.TOP, mc.E, mc.NI, mc.D, "cuda")
+    if getattr(scr, "graphs", None) is None:
+        return {"records": "this code keeps none"}
+    plan = grouped.Plan(rows_max, mc.TOP + 1, mc.E + 1, "cuda", prefill=True)
+    x = mc.activations(rows_max, seed=5)
+    ids, _ = mc.route(x, router)
+    picks = torch.cat([ids, torch.full((rows_max, 1), mc.E, dtype=torch.int32, device="cuda")], 1).contiguous()
+    ys = [torch.zeros(rows_max, mc.TOP + 1, mc.D, dtype=torch.bfloat16, device="cuda") for _ in range(copies)]
+
+    def call(n: int, y: torch.Tensor) -> float:
+        grouped.route(picks[:n], plan, thor.tactic(n)[0])
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        thor.run(x[:n], ex, plan, y[:n], n, mc.TOP, scr)
+        torch.cuda.synchronize()
+        return (time.perf_counter() - t) * 1e3
+
+    gc.collect()
+    torch.cuda.synchronize()
+    time.sleep(1)
+    avail0, free0 = mem_available(), torch.cuda.mem_get_info()[0]
+    first = [call(n, ys[0]) for n in range(1, rows_max + 1)]
+    for y in ys[1:]:
+        for n in range(1, rows_max + 1):
+            call(n, y)
+    torch.cuda.synchronize()
+    time.sleep(1)
+    avail1, free1 = mem_available(), torch.cuda.mem_get_info()[0]
+    replay = [call(n, ys[0]) for n in range(1, rows_max + 1)]
+    count = len(scr.graphs)
+    return {"records": count, "first_call_ms": first, "replay_ms": replay,
+            "mem_available_drop_mib": (avail0 - avail1) / 2**20, "cuda_free_drop_mib": (free0 - free1) / 2**20,
+            "per_record_kib": (avail0 - avail1) / max(count, 1) / 1024}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True)
@@ -140,6 +197,7 @@ def main() -> None:
     ap.add_argument("--mtp-ms", default="1,2,4,7,28")
     ap.add_argument("--calls", type=int, default=50)
     ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--record-copies", type=int, default=10, help="output buffers standing in for layers (0: skip)")
     args = ap.parse_args()
 
     from tensorfold.cuda.nvfp4 import experts as nvx
@@ -163,7 +221,10 @@ def main() -> None:
         x = mc.activations(m, seed=m)
         ids, _ = mc.route(x, layer.router)
         picks = torch.cat([ids, torch.full((m, 1), mc.E, dtype=torch.int32, device="cuda")], 1).contiguous()
-        calls = {name: Call(exs[name], name == "thor", m, kind == "mtp", x, picks, shares) for name in ("tf", "thor")}
+        calls = {"tf": Call(exs["tf"], False, m, kind == "mtp", x, picks, shares),
+                 "thor_launch": Call(exs["thor"], True, m, kind == "mtp", x, picks, shares, records=False)}
+        if hasattr(thor.Scratch(1, mc.TOP, mc.E, mc.NI, mc.D, "cuda"), "graphs"):
+            calls["thor"] = Call(exs["thor"], True, m, kind == "mtp", x, picks, shares)
         for c in calls.values():                       # build every kernel this shape reaches
             for _ in range(3):
                 c()
@@ -179,15 +240,25 @@ def main() -> None:
             med.update(kernels(c, 10))
             row[name] = med
         report["rows"].append(row)
-        tf, th = row["tf"], row["thor"]
-        print(f"[{mc.stamp()}] {kind:6s} M={m:3d} | host us tf {tf['host_us']:7.1f} thor {th['host_us']:7.1f} "
-              f"(fi {th['fi_us']:6.1f} glue {th['glue_us']:6.1f} route {th['route_us']:5.1f}) | wall us tf "
-              f"{tf['wall_us']:7.1f} thor {th['wall_us']:7.1f} | gpu busy us tf {tf['gpu_busy_us']:7.1f} thor "
-              f"{th['gpu_busy_us']:7.1f} | gpu ops tf {tf['gpu_ops']:.1f} thor {th['gpu_ops']:.1f} | "
-              f"sleep left {th['sleep_left_s']:.2f}s", flush=True)
+        for name in calls:
+            r = row[name]
+            print(f"[{mc.stamp()}] {kind:6s} M={m:3d} {name:11s} host {r['host_us']:7.1f} us (fi {r['fi_us']:6.1f} "
+                  f"glue {r['glue_us']:6.1f} route {r['route_us']:5.1f}) | wall {r['wall_us']:7.1f} us | gpu busy "
+                  f"{r['gpu_busy_us']:7.1f} us in {r['gpu_ops']:.1f} ops | sleep left {r['sleep_left_s']:.2f}s",
+                  flush=True)
+        if "thor" in calls:                         # the records replay the launched kernels: the same bits
+            row["records_equal_launches"] = bool(torch.equal(calls["thor"].y, calls["thor_launch"].y))
         Path(args.out).write_text(json.dumps(report, indent=1))
     fw._run_grouped_gemm = gemm
     thor._glue = glue
+    if args.record_copies:
+        report["records_cost"] = rc = records_cost(exs["thor"], layer.router, 28, args.record_copies)
+        if isinstance(rc.get("records"), int):
+            print(f"[{mc.stamp()}] records: {rc['records']} hold {rc['mem_available_drop_mib']:.1f} MiB of "
+                  f"MemAvailable ({rc['per_record_kib']:.1f} KiB each; cuda free {rc['cuda_free_drop_mib']:.1f} MiB); "
+                  f"first call ms {[round(v, 2) for v in rc['first_call_ms'][:8]]}...; replay ms "
+                  f"{[round(v, 3) for v in rc['replay_ms'][:8]]}...", flush=True)
+        Path(args.out).write_text(json.dumps(report, indent=1))
 
 
 if __name__ == "__main__":

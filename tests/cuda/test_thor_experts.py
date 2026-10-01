@@ -1,5 +1,6 @@
 """Thor's routed NVFP4 experts (FlashInfer's W4A16 grouped GEMM on sm_110): the checkpoint's weights exactly, each
-pair's product to fp32 sums, a pair's bits alone or among any other pairs and under CUDA graph replays, the switch."""
+pair's product to fp32 sums, a pair's bits alone or among any other pairs and under CUDA graph replays (a caller's and
+the path's own records of eager decode calls), the switches."""
 
 from __future__ import annotations
 
@@ -122,6 +123,38 @@ def test_a_captured_call_replays_any_routing(layer):
         torch.cuda.synchronize()
         want = _run(ex, x.clone(), picks.clone())
         assert torch.equal(y[:, :TOP], want[:, :TOP]), seed
+
+
+def test_eager_calls_replay_the_first_calls_record(layer):
+    """A decode buffer set's eager calls: the first launches the kernels and records them, the later ones replay the
+    record with their own rows and routing, to the launched kernels' bits; another row count gets its own record."""
+
+    ex = layer[0]
+    rows = 6
+    scratch = thor.Scratch(rows, TOP, E, NI, D, "cuda")
+    assert scratch.graphs == {}
+    plan = grouped.Plan(rows, TOP + 1, E + 1, "cuda", prefill=True)
+    x = torch.empty((rows, D), dtype=torch.bfloat16, device="cuda")
+    picks = torch.empty((rows, TOP + 1), dtype=torch.int32, device="cuda")
+    y = torch.zeros((rows, TOP + 1, D), dtype=torch.bfloat16, device="cuda")
+    for n, seed in ((rows, 31), (rows, 32), (rows, 33), (3, 34), (3, 35)):
+        x[:n].copy_(_x(n, seed))
+        picks[:n].copy_(_picks(n, seed + 100))
+        grouped.route(picks[:n], plan, thor.tactic(n)[0])
+        y.zero_()
+        thor.run(x[:n], ex, plan, y[:n], n, TOP, scratch)
+        torch.cuda.synchronize()
+        want = _run(ex, x[:n].clone(), picks[:n].clone())             # a fresh scratch: the kernels launched
+        assert torch.equal(y[:n, :TOP], want[:, :TOP]), (n, seed)
+    assert len(scratch.graphs) == 2
+
+
+def test_the_graph_switch_and_prompt_scratch_launch_every_call(monkeypatch):
+    monkeypatch.setenv(thor.GRAPHS_ENV, "0")
+    assert thor.Scratch(4, TOP, E, NI, D, "cuda").graphs is None
+    monkeypatch.delenv(thor.GRAPHS_ENV)
+    assert thor.Scratch(4, TOP, E, NI, D, "cuda").graphs == {}
+    assert thor.Scratch(thor.GRAPH_ROWS + 1, TOP, E, NI, D, "cuda").graphs is None
 
 
 def test_a_decode_plan_fills_fp32_slots_with_the_same_values(layer):
