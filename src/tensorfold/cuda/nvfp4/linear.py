@@ -10,6 +10,8 @@ import torch
 
 from tensorfold.cuda import prompt_precision
 
+from . import thor_dense
+
 FP4, FP8, MXFP8, FP8G = 0, 1, 2, 3
 
 
@@ -326,6 +328,8 @@ class Mx8Linear:
 
         if prompt_precision.fp8():
             return self.prefill8(x, out)
+        if thor_dense.use(self):                      # Jetson Thor: cuBLAS bf16 on the exact weight (thor_dense)
+            return thor_dense.linear(x, self, out)
         if self.fold is None:
             self.fold = bool(((self.bs >= 3) & (self.bs <= 134)).all())
         return _prompt(MXFP8, self.w8, self.bs, 1.0, self.n, self.npad, x, out) if self.fold else self(x, out)

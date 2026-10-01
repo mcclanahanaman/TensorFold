@@ -13,6 +13,7 @@ import triton.language as tl
 
 from tensorfold.cuda import moe as moe_mod
 from tensorfold.cuda.kernels import gdn as shared_gdn
+from tensorfold.cuda.nvfp4 import thor_dense
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
@@ -34,6 +35,8 @@ def _gather(w: Weights, b: Buffers, part: torch.Tensor, flat: torch.Tensor, R: i
 
 def _mm(x: torch.Tensor, q: qmm.Q4, xs: torch.Tensor, out: torch.Tensor, b: Buffers, **kw) -> torch.Tensor:
     if getattr(q, "kernel", "qmm") == "b16":      # an NVFP4 checkpoint's BF16 linear (non-experts)
+        if b.prefill and thor_dense.use(q):       # Jetson Thor's prompt GEMM: cuBLAS bf16 (thor_dense)
+            return thor_dense.linear(x, q, out=out)
         return bf16.matmul(x, q, out=out)
     if not isinstance(q, qmm.Q4):                 # an EXL3 pack's matrix (``exl3_mm``): prompts on its prompt path
         return q.prefill(x, out) if b.prefill else q(x, out)

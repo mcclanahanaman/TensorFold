@@ -101,6 +101,10 @@ class FlashNextEngine:
 
             if thor_experts.available():             # Thor (sm_110) experts: their scratch counts before the caches
                 geometry = thor_experts.admission(geometry, streams * each if streams > 1 else max(8, each))
+            from tensorfold.cuda.nvfp4 import thor_dense
+
+            if thor_dense.available():               # Thor's prompt GEMMs: bf16 copies or a staging buffer, counted
+                geometry = thor_dense.admission(geometry, model_dir, mtp)
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
 
         workspace = vision_workspace() if vision else 0
@@ -154,6 +158,16 @@ class FlashNextEngine:
             print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
                   f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
                   f"workspace reserved{'; https URLs allowed' if vision_urls else ''}", flush=True)
+        from tensorfold.cuda.nvfp4 import thor_dense
+
+        if quant_method(read_config(model_dir)) == "modelopt" and thor_dense.available():
+            held = thor_dense.prepare(w)             # before the caches are sized: copies count as used memory
+            print(f"[tensorfold] Thor (sm_110): prompt GEMMs on cuBLAS bf16 ({held['mxfp8']} MXFP8 exact in bf16, "
+                  f"{held['bf16']} bf16, {held['kept']} kept); MXFP8 weights "
+                  + (f"as bf16 copies, {held['held_bytes'] / 2**30:.2f} GiB" if held["copy"] else
+                     f"dequantized at each call, {held['scratch_bytes'] / 2**20:.0f} MiB of staging")
+                  + f" ({thor_dense.ENV}=0 keeps the portable kernels, {thor_dense.WEIGHTS_ENV}=copy|dequant)",
+                  flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
