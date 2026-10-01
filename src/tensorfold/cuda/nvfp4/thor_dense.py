@@ -6,12 +6,13 @@ fp32 accumulation (``allow_bf16_reduced_precision_reduction`` off) instead of Te
 decode keeps its lane kernels. The hyper-connection down projection, whose fp32 sums feed its activation, stays on
 TensorFold's split-K kernel: cuBLAS's fp32 sums over its K of 10240 had 4-39x that kernel's error and changed bits with
 the row count. Each value of an MXFP8 weight, e4m3 x 2^(e-127), is exact in bf16 (``fold``):
-``copy`` keeps a bf16 copy of each such weight, made at load (more memory); ``dequant`` (the default) rebuilds the one
-a call needs in a staging buffer first. A call of fewer than PAD rows runs on PAD: from about 100 rows up cuBLAS keeps
-a row's bits whatever the call's row count or first row at these shapes (tools/thor/cublas_row_invariance.py); below
-64 it did not.
+``copy`` (the default) keeps a bf16 copy of each such weight, made at load and counted in the startup estimate (about
+5.5 GiB on local-inference-lab's checkpoint, that much less room for the KV caches, for about 3% faster prompts);
+``dequant`` rebuilds the one a call needs in a staging buffer first (82 MiB). Both give the same bits. A call of fewer
+than PAD rows runs on PAD: from about 100 rows up cuBLAS keeps a row's bits whatever the call's row count or first row
+at these shapes (tools/thor/cublas_row_invariance.py); below 64 it did not.
 
-``TENSORFOLD_THOR_DENSE=0`` keeps the portable kernels; ``TENSORFOLD_THOR_DENSE_WEIGHTS=copy`` holds bf16 copies.
+``TENSORFOLD_THOR_DENSE=0`` keeps the portable kernels; ``TENSORFOLD_THOR_DENSE_WEIGHTS=dequant`` keeps no copies.
 """
 
 from __future__ import annotations
@@ -33,9 +34,9 @@ def _off() -> bool:
 
 
 def copies() -> bool:
-    """Whether MXFP8 weights keep bf16 copies (``copy``) or are dequantized at each call (``dequant``)."""
+    """Whether MXFP8 weights keep bf16 copies (``copy``, the default) or are dequantized at each call (``dequant``)."""
 
-    value = os.environ.get(WEIGHTS_ENV, "dequant").strip().lower()
+    value = os.environ.get(WEIGHTS_ENV, "copy").strip().lower()
     if value not in ("copy", "dequant"):
         raise ValueError(f"{WEIGHTS_ENV}={value}: copy or dequant")
     return value == "copy"

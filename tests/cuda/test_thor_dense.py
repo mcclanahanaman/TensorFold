@@ -83,7 +83,17 @@ def test_the_error_stays_within_the_portable_prompt_gemm(ready, rows: int) -> No
     assert _rel(thor_dense.linear(x, m), ref) <= 1.5 * _rel(portable, ref)
 
 
-def test_a_prompt_on_the_thor_path_matches_the_portable_one(tmp_path: Path) -> None:
+def test_bf16_copies_are_the_default_and_dequant_keeps_none(monkeypatch) -> None:
+    monkeypatch.delenv(thor_dense.WEIGHTS_ENV, raising=False)
+    assert thor_dense.copies()
+    monkeypatch.setenv(thor_dense.WEIGHTS_ENV, "dequant")
+    assert not thor_dense.copies()
+    monkeypatch.setenv(thor_dense.WEIGHTS_ENV, "both")
+    with pytest.raises(ValueError):
+        thor_dense.copies()
+
+
+def test_a_prompt_on_the_thor_path_matches_the_portable_one(tmp_path: Path, monkeypatch) -> None:
     """A tiny MXFP8 checkpoint: every prompt GEMM is marked, copies and per-call dequantizing prefill to the same
     bits, and the first token and streams stay close to TensorFold's portable prompt GEMMs."""
 
@@ -93,6 +103,7 @@ def test_a_prompt_on_the_thor_path_matches_the_portable_one(tmp_path: Path) -> N
     tiny = write(tmp_path / "k2", mxfp8=True, ple_nvfp4=True, hidden=512)      # PLE kernels: 512-wide streams
     w = load(tiny, mtp=True, draft_vocab=None)
     old = (thor_dense.S.pad, thor_dense.S.staging, thor_dense.S.active)
+    monkeypatch.setenv(thor_dense.WEIGHTS_ENV, "dequant")              # prepared without copies; they come below
     try:
         held = thor_dense.prepare(w)
         assert held["mxfp8"] > 0 and held["bf16"] > 0 and not held["copy"]
