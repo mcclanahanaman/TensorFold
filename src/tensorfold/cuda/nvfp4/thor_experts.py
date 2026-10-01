@@ -31,6 +31,9 @@ _COPY = 512                 # columns a glue step moves
 
 
 def _fi():
+    # CuTe DSL keeps its compiled kernels under /tmp unless told otherwise: a lasting place makes restarts reuse them
+    os.environ.setdefault("CUTE_DSL_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "tensorfold",
+                                                             "cute_dsl"))
     from flashinfer.fused_moe.cute_dsl.blackwell import moe_w4a16
 
     return moe_w4a16
@@ -335,8 +338,10 @@ def warm(ex: ThorExperts, scr: Scratch, top_k: int, *, prompt: bool = True) -> N
             y = torch.zeros((rows, top_k + 1, ex.dims), dtype=torch.bfloat16 if prompt else torch.float32, device=dev)
             run(x, ex, plan, y, rows, top_k, scr)
             _WARM.add((rows, prompt))
+            del picks, plan, x, y
         lo = top + 1
     torch.cuda.synchronize(dev)
+    torch.cuda.empty_cache()                      # the synthetic calls' buffers go back before the caches are sized
 
 
 def admission(geometry, decode_rows: int, prompt_rows: int | None = None):
