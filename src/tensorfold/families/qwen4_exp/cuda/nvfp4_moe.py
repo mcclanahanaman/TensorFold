@@ -87,7 +87,12 @@ def moe4_from_checkpoint(gate: tuple, up: tuple, down: tuple,
     shared = shared if isinstance(shared, Expert4) else expert4_from_bf16(*shared)
     if thor.available(torch.cuda.current_device()):
         try:
-            return MoE4(thor.make(gate, up, down), shared)
+            routed = thor.make(gate, up, down)
+            if "on" not in _NOTED:
+                _NOTED.add("on")
+                print(f"[tensorfold] Thor (sm_110): routed NVFP4 experts on FlashInfer's W4A16 grouped GEMM "
+                      f"({thor.ENV}=0 keeps the portable kernel)", flush=True)
+            return MoE4(routed, shared)
         except ValueError as exc:                  # a layer the Thor layout cannot hold exactly keeps the portable one
             if str(exc) not in _NOTED:
                 _NOTED.add(str(exc))
@@ -142,20 +147,21 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, 
 
 
 def thor_layers(w) -> list:
-    """The layers whose routed experts run on the Thor path."""
+    """The layers (the MTP head's included) whose routed experts run on the Thor path."""
 
-    return [layer for layer in w.layers
+    mtp = getattr(getattr(w, "mtp", None), "layer", None)
+    return [layer for layer in [*w.layers, *([mtp] if mtp is not None else [])]
             if isinstance(getattr(getattr(getattr(layer, "moe", None), "experts", None), "routed_experts", None),
                           thor.ThorExperts)]
 
 
 def attach_thor(w, buf, rows: int) -> None:
-    """A buffer set with bf16 slots gets the Thor experts' scratch and warms their kernels, at load, not on a request."""
+    """A buffer set gets the Thor experts' scratch and warms their kernels, at load, not on a request."""
 
     layers = thor_layers(w)
-    if not layers or buf.y.dtype != torch.bfloat16:
+    if not layers:
         return
     ex = layers[0].moe.experts.routed_experts
     top_k = buf.slots - 1
     buf.thor = thor.Scratch(rows, top_k, ex.count, ex.width, ex.dims, buf.y.device)
-    thor.warm(ex, buf.thor, top_k)
+    thor.warm(ex, buf.thor, top_k, prompt=buf.y.dtype == torch.bfloat16)

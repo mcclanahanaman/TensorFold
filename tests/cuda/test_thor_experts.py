@@ -124,6 +124,20 @@ def test_a_captured_call_replays_any_routing(layer):
         assert torch.equal(y[:, :TOP], want[:, :TOP]), seed
 
 
+def test_a_decode_plan_fills_fp32_slots_with_the_same_values(layer):
+    """The MTP head's buffers (a decode plan, fp32 slots) get the bf16 outputs widened, the same bits."""
+
+    ex = layer[0]
+    x, picks = _x(5, 21), _picks(5, 22)
+    bf = _run(ex, x, picks)
+    plan = grouped.Plan(5, TOP + 1, E + 1, "cuda", prefill=False)
+    grouped.route(picks, plan, thor.tactic(5)[0])
+    y = torch.zeros((5, TOP + 1, D), dtype=torch.float32, device="cuda")
+    thor.run(x, ex, plan, y, 5, TOP, thor.Scratch(5, TOP, E, NI, D, "cuda"))
+    torch.cuda.synchronize()
+    assert torch.equal(y[:, :TOP], bf[:, :TOP].float())
+
+
 def test_the_portable_kernel_agrees_within_bf16(layer):
     ex, stock = layer[0], layer[1]
     x, picks = _x(32, 10), _picks(32, 11)

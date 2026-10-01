@@ -143,13 +143,13 @@ def dense(ex: ThorExperts, e: int, which: str) -> torch.Tensor:
     return full.view(r // (2 * GROUP), 2, GROUP, -1)[:, half].reshape(r // 2, -1)
 
 
-def tactic(rows: int) -> tuple[int, tuple]:
-    """(route tile, (gemm1 tactic, gemm2 tactic)) for a call of ``rows`` rows."""
+def tactic(rows: int, tile: int | None = None) -> tuple[int, tuple]:
+    """(route tile, (gemm1 tactic, gemm2 tactic)) for a call of ``rows`` rows; ``tile``: a decode plan's own (16)."""
 
-    for top, tile, mma, cluster in TACTICS:
+    for top, t_tile, mma, cluster in TACTICS:
         if rows <= top:
-            t = ((mma, tile, K_TILE), cluster, True)
-            return tile, (t, t)
+            t = ((mma, tile or t_tile, K_TILE), cluster, True)
+            return tile or t_tile, (t, t)
     raise AssertionError
 
 
@@ -284,13 +284,13 @@ def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_
 
     from tensorfold.cuda import experts as grouped
 
-    if y.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
-        raise ValueError("the Thor experts write bf16 slots from bf16 rows (prompt buffers, or decode buffers built "
-                         "with the prompt arithmetic)")
+    if x.dtype != torch.bfloat16 or y.dtype not in (torch.bfloat16, torch.float32):
+        raise ValueError("the Thor experts read bf16 rows into bf16 slots (or fp32 ones: the MTP head's)")
     if rows > scr.rows:
         raise ValueError(f"a call of {rows} rows exceeds the Thor scratch's {scr.rows}")
     fw = _fi()
-    tile, (g1, g2) = tactic(rows)
+    # a prompt plan holds this tactic's items; a decode plan (the MTP head's fp32 slots) always holds 16
+    tile, (g1, g2) = tactic(rows, None if plan.prefill else plan.tile)
     if plan.tile != tile:
         raise ValueError(f"the plan was routed with items of {plan.tile} pairs; this call's tile is {tile}")
     nslots = y.shape[1]
@@ -311,9 +311,10 @@ def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_
 _WARM: set = set()
 
 
-def warm(ex: ThorExperts, scr: Scratch, top_k: int) -> None:
+def warm(ex: ThorExperts, scr: Scratch, top_k: int, *, prompt: bool = True) -> None:
     """Build every kernel a call up to ``scr.rows`` rows can reach (both GEMMs of each tactic, the glue) now, not on a
-    request: one call at each tactic's smallest and largest row count, on synthetic routing."""
+    request: one call at each tactic's smallest and largest row count, on synthetic routing; ``prompt``: the buffers'
+    plans hold the tactics' items and their slots are bf16 (else decode plans of 16 and fp32 slots, the MTP head's)."""
 
     from tensorfold.cuda import experts as grouped
 
@@ -323,17 +324,17 @@ def warm(ex: ThorExperts, scr: Scratch, top_k: int) -> None:
         if lo > scr.rows:
             break
         for rows in sorted({lo, min(top, scr.rows)}):
-            if rows in _WARM:
+            if (rows, prompt) in _WARM:
                 continue
             g = torch.Generator(device="cpu").manual_seed(rows)
             picks = torch.stack([torch.randperm(ex.count, generator=g)[:top_k] for _ in range(rows)])
             picks = torch.cat([picks, torch.full((rows, 1), ex.count)], 1).to(torch.int32).to(dev).contiguous()
-            plan = grouped.Plan(rows, top_k + 1, ex.count + 1, dev, prefill=True)
+            plan = grouped.Plan(rows, top_k + 1, ex.count + 1, dev, prefill=prompt)
             grouped.route(picks, plan, tactic(rows)[0])
             x = torch.zeros((rows, ex.dims), dtype=torch.bfloat16, device=dev)
-            y = torch.zeros((rows, top_k + 1, ex.dims), dtype=torch.bfloat16, device=dev)
+            y = torch.zeros((rows, top_k + 1, ex.dims), dtype=torch.bfloat16 if prompt else torch.float32, device=dev)
             run(x, ex, plan, y, rows, top_k, scr)
-            _WARM.add(rows)
+            _WARM.add((rows, prompt))
         lo = top + 1
     torch.cuda.synchronize(dev)
 
@@ -343,7 +344,7 @@ def admission(geometry, decode_rows: int, prompt_rows: int | None = None):
 
     from tensorfold.cuda.geometry import PREFILL_ROWS, with_fixed
 
-    rows = (decode_rows, prompt_rows or PREFILL_ROWS)
+    rows = (decode_rows, decode_rows, prompt_rows or PREFILL_ROWS)   # decode windows, the MTP head's, a prompt chunk
 
     def extra(t: dict) -> int:
         experts, top_k = int(t["num_experts"]), int(t["num_experts_per_tok"])
