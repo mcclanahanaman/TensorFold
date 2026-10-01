@@ -151,16 +151,17 @@ def main() -> None:
             scr = thor.Scratch(m, mc.TOP, mc.E, mc.NI, mc.D, "cuda")
             s_rows = thor.max_tiles(m * mc.TOP, mc.E, tt) * tt
             grid = (grouped.max_items(m * (mc.TOP + 1), mc.E + 1, tt),)
-            gather, scatter = thor._glue()
+            tiles_k, gather, scatter = thor._glue()
             fwm = thor._fi()
 
             def thor_route():
                 grouped.route(picks, tplan, tt)
 
             def thor_gather():
-                gather[grid](x, x.stride(0), tplan.members, tplan.items, tplan.counts, scr.hidden, scr.tile_expert,
-                             scr.tile_limit, scr.tiles, -(-m // tt), SLOTS=mc.TOP + 1, T=tt, D=mc.D, BD=thor._COPY,
-                             num_warps=4)
+                tiles_k[grid](tplan.members, tplan.items, tplan.counts, scr.tile_expert, scr.tile_limit, scr.tiles,
+                              scr.pos, -(-m // tt), T=tt, num_warps=1)
+                gather[(m,)](x, x.stride(0), scr.pos, scr.hidden, TOPK=mc.TOP, KP=16, SLOTS=mc.TOP + 1, D=mc.D,
+                             BD=thor._COPY, num_warps=4)
 
             def thor_gemms():
                 thor._gemm(fwm, thor_ex.w1, thor_ex.w1_sf, thor_ex.w1_alpha, scr.hidden[:s_rows], scr.inter[:s_rows],

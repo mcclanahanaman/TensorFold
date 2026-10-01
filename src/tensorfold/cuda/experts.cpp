@@ -36,7 +36,7 @@ void plan(const at::Tensor& picks, int64_t pairs, int64_t experts, int64_t tile,
   TORCH_CHECK(picks.is_contiguous() && picks.numel() >= pairs, "picks: contiguous, one id a pair");
   for (const auto* t : {&members, &items, &counts, &rank, &hist}) check(*t, "plan buffer", at::kInt);
   TORCH_CHECK(members.numel() >= pairs && counts.numel() >= 2, "plan buffers too small");
-  TORCH_CHECK(tile == 16 || tile == 64, "items hold 16 pairs (decode) or 64 (prefill)");
+  TORCH_CHECK(tile == 16 || tile == 32 || tile == 64, "items hold 16 pairs (decode), 32 (Thor) or 64 (prefill)");
   experts_plan_cuda(picks, pairs, experts, tile, members, items, counts, rank, hist);
 }
 

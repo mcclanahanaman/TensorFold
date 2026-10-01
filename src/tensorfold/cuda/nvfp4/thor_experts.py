@@ -180,7 +180,7 @@ def scratch_rows(rows: int, top_k: int, experts: int) -> int:
 
 def scratch_bytes(rows: int, top_k: int, experts: int, width: int, dims: int) -> int:
     s = scratch_rows(rows, top_k, experts)
-    return s * (dims + width) * 2 + 2 * (s // MIN_TILE) * 4 + 4
+    return s * (dims + width) * 2 + 2 * (s // MIN_TILE) * 4 + 4 + rows * (top_k + 1) * 4
 
 
 class Scratch:
@@ -194,10 +194,11 @@ class Scratch:
         self.tile_expert = torch.zeros((s // MIN_TILE,), dtype=torch.int32, device=device)
         self.tile_limit = torch.zeros((s // MIN_TILE,), dtype=torch.int32, device=device)
         self.tiles = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.pos = torch.zeros((rows * (top_k + 1),), dtype=torch.int32, device=device)    # a pair's permuted row
 
     def nbytes(self) -> int:
         return sum(t.numel() * t.element_size() for t in (self.hidden, self.inter, self.tile_expert, self.tile_limit,
-                                                           self.tiles))
+                                                           self.tiles, self.pos))
 
 
 @functools.lru_cache(maxsize=1)
@@ -208,9 +209,9 @@ def _glue():
     import triton.language as tl
 
     @triton.jit
-    def gather(X, x_stride, MEMBERS, ITEMS, COUNTS, HIDDEN, TE, TLIM, NT, shared_items,
-               SLOTS: tl.constexpr, T: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
-        """Program i: item i (<= T pairs of one expert) -> route tile i: its expert, row limit and pairs' rows."""
+    def tiles(MEMBERS, ITEMS, COUNTS, TE, TLIM, NT, POS, shared_items, T: tl.constexpr):
+        """Program i: item i (<= T pairs of one expert) -> route tile i: its expert, its row limit, and each of its
+        pairs' permuted row (POS[pair])."""
 
         i = tl.program_id(0)
         n = tl.load(COUNTS) - shared_items          # the shared expert (the last id) has the last items; it runs apart
@@ -224,12 +225,22 @@ def _glue():
             r = tl.arange(0, T)
             ok = r < cnt
             p = tl.load(MEMBERS + first + r, mask=ok, other=0)
-            src = (p // SLOTS).to(tl.int64) * x_stride
-            dst = (i * T + r).to(tl.int64) * D
-            for d0 in tl.static_range(0, D, BD):
-                d = d0 + tl.arange(0, BD)
-                v = tl.load(X + src[:, None] + d[None, :], mask=ok[:, None], other=0.0)
-                tl.store(HIDDEN + dst[:, None] + d[None, :], v, mask=ok[:, None])
+            tl.store(POS + p, i * T + r, mask=ok)
+
+    @triton.jit
+    def gather(X, x_stride, POS, HIDDEN, TOPK: tl.constexpr, KP: tl.constexpr, SLOTS: tl.constexpr,
+               D: tl.constexpr, BD: tl.constexpr):
+        """Program r: row r of x, read once, to its routed pairs' permuted rows."""
+
+        r = tl.program_id(0)
+        k = tl.arange(0, KP)
+        ok = k < TOPK
+        dst = tl.load(POS + r * SLOTS + k, mask=ok, other=0).to(tl.int64) * D
+        src = r.to(tl.int64) * x_stride
+        for d0 in tl.static_range(0, D, BD):
+            d = d0 + tl.arange(0, BD)
+            v = tl.load(X + src + d)
+            tl.store(HIDDEN + dst[:, None] + d[None, :], tl.broadcast_to(v[None, :], (KP, BD)), mask=ok[:, None])
 
     @triton.jit
     def scatter(YP, MEMBERS, ITEMS, NT, Y, T: tl.constexpr, D: tl.constexpr, BD: tl.constexpr):
@@ -248,7 +259,7 @@ def _glue():
                 v = tl.load(YP + src[:, None] + d[None, :], mask=ok[:, None], other=0.0)
                 tl.store(Y + p[:, None] + d[None, :], v, mask=ok[:, None])
 
-    return gather, scatter
+    return tiles, gather, scatter
 
 
 def _gemm(fw, w, sf, alpha, act_in, out, tiles, scr, experts: int, gated: bool, t) -> None:
@@ -286,9 +297,11 @@ def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_
     s = max_tiles(rows * top_k, ex.count, tile) * tile
     tiles = s // tile
     grid = (grouped.max_items(rows * nslots, ex.count + 1, tile),)
-    gather, scatter = _glue()
-    gather[grid](x, x.stride(0), plan.members, plan.items, plan.counts, scr.hidden, scr.tile_expert, scr.tile_limit,
-                  scr.tiles, -(-rows // tile), SLOTS=nslots, T=tile, D=ex.dims, BD=_COPY, num_warps=4)
+    tiles_k, gather, scatter = _glue()
+    tiles_k[grid](plan.members, plan.items, plan.counts, scr.tile_expert, scr.tile_limit, scr.tiles, scr.pos,
+                  -(-rows // tile), T=tile, num_warps=1)
+    gather[(rows,)](x, x.stride(0), scr.pos, scr.hidden, TOPK=top_k, KP=1 << (top_k - 1).bit_length(), SLOTS=nslots,
+                    D=ex.dims, BD=_COPY, num_warps=4)
     _gemm(fw, ex.w1, ex.w1_sf, ex.w1_alpha, scr.hidden[:s], scr.inter[:s], tiles, scr, ex.count, True, g1)
     _gemm(fw, ex.w2, ex.w2_sf, ex.w2_alpha, scr.inter[:s], scr.hidden[:s], tiles, scr, ex.count, False, g2)
     scatter[grid](scr.hidden, plan.members, plan.items, scr.tiles, y.view(-1, ex.dims), T=tile, D=ex.dims,
