@@ -265,6 +265,13 @@ def instrument(w, cfg) -> None:
     wrap(attn_mod, "attention", core_meta)
     wrap(attn_mod, "qsa_pool", "attn.qsa_pool")
     wrap(attn_mod, "qsa_rows", rows_meta)
+    from tensorfold.families.qwen4_exp.cuda import thor_qsa          # Thor's prompt attention path (THOR-K4-QSA)
+
+    wrap(thor_qsa, "attention", lambda q, cache, shadow, pos0, scratch, rows, scale, out, *, context, bits:
+         core_meta(q, None, None, pos0, scratch, rows, scale, context=context))
+    wrap(thor_qsa, "qsa_rows", rows_meta)
+    wrap(thor_qsa, "stage", "attn.shadow")
+    wrap(thor_qsa, "stage_all", "attn.shadow")
 
     def router_meta(x, rows, out=None):
         return "moe.router", 2.0 * x.shape[0] * rows.shape[0] * x.shape[1], 0.0
