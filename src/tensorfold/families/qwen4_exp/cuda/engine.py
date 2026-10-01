@@ -105,6 +105,10 @@ class FlashNextEngine:
 
             if thor_dense.available():               # Thor's prompt GEMMs: bf16 copies or a staging buffer, counted
                 geometry = thor_dense.admission(geometry, model_dir, mtp)
+        from . import thor_qsa
+
+        if thor_qsa.available():                     # Thor's prompt attention: an 8-bit cache's bf16 shadow, counted
+            geometry = thor_qsa.admission(geometry, bits)
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
 
         workspace = vision_workspace() if vision else 0
@@ -177,6 +181,11 @@ class FlashNextEngine:
                   f"({str(thor_gdn.S.dtype).replace('torch.', '')} q/k/v, fp32 state, 64-row chunks; kept points and "
                   f"prompt pieces on the 64-row grid), ready in {time.perf_counter() - began:.1f}s "
                   f"({thor_gdn.ENV}=0 keeps TensorFold's chain)", flush=True)
+        if thor_qsa.available() and thor_qsa.prepare(bits):
+            shadow = thor_qsa.shadow_bytes(self.max_len, w.cfg.kv_heads, w.cfg.head_dim) if bits == 8 else 0
+            print("[tensorfold] Thor (sm_110): sparse-attention prompt kernels: tensor-core block scores, attention on "
+                  + (f"a bf16 shadow of each layer's 8-bit cache ({shadow / 2**30:.2f} GiB)" if bits == 8 else
+                     "the bf16 cache") + f" ({thor_qsa.ENV}=0 keeps TensorFold's)", flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None

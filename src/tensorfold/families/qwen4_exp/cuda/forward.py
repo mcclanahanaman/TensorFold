@@ -18,7 +18,7 @@ from tensorfold.cuda.nvfp4 import thor_dense
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
-from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm
+from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_qsa
 from . import image_rows
 from .hc_check import fuser as _hc_fuser
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
@@ -293,12 +293,25 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
             if b.attn.qsa:
                 attn_mod.qsa_pool(ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0, rope=rope,
                                   delta=delta, length=length, sections=sections)
+            thor = thor_qsa.use() and (bits == 0 or b.thor_shadow is not None)    # Thor (sm_110): see thor_qsa
+            whole = thor and bits and a1 - a0 > ATT_ROWS          # several row blocks: the 8-bit cache staged once
+            if whole:
+                thor_qsa.stage_all(cache, b.thor_shadow, host_pos + a1 - a0)
+            elif thor and bits:
+                thor_qsa.begin(b.thor_shadow)
             for r0 in range(a0, a1, ATT_ROWS):
                 n = min(ATT_ROWS, a1 - r0)
                 b.pos_blk.fill_(host_pos + r0 - a0)
                 ends = host_pos + r0 - a0 + n
                 if b.attn.qsa:
-                    attn_mod.qsa_rows(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n, context=ends)
+                    (thor_qsa.qsa_rows if thor else attn_mod.qsa_rows)(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n,
+                                                                       context=ends)
+                if thor:
+                    if bits and not whole:                     # a short segment: the blocks its rows read
+                        thor_qsa.stage(cache, b.thor_shadow, b.attn, b.pos_blk, n, ends)
+                    thor_qsa.attention(b.q[r0:r0 + n], cache, b.thor_shadow, b.pos_blk, b.attn, n, scale,
+                                       b.attn_o[r0:r0 + n], context=ends, bits=bits)
+                    continue
                 attn_mod.attention(b.q[r0:r0 + n], cache.k, cache.v, b.pos_blk, b.attn, n, scale,
                                    out=b.attn_o[r0:r0 + n], context=ends, ks=cache.ks, vs=cache.vs, bits=bits)
             continue

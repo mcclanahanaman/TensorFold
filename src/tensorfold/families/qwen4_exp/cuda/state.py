@@ -56,6 +56,9 @@ class Buffers:
         self.iq = torch.empty((rows, c.index_heads, c.index_dim), dtype=bf, device=dev)
         self.attn = attn_mod.AttnScratch(min(rows, ATT_ROWS) if prefill else rows, c.heads, c.head_dim, capacity,
                                          dev, budget=c.index_budget, ratio=c.index_ratio)
+        from . import thor_qsa
+
+        self.thor_shadow = thor_qsa.attach(w, capacity) if prefill else None    # Thor: an 8-bit cache's bf16 shadow
         self.gated = torch.empty((rows, c.heads * c.head_dim), dtype=bf, device=dev)
         self.xs_gated = torch.empty((rows, c.heads * c.head_dim // 32), dtype=f32, device=dev)
         # the experts' prefill arithmetic for decode windows too (``moe_prefill``): their rows can share a pass's launch
