@@ -199,6 +199,17 @@ def instrument(w, cfg) -> None:
     wrap(forward, "_mm", mm_meta)
     wrap(mtp, "_mm", mm_meta)
     wrap(bf16, "matmul", b16_meta)
+    try:                                              # Jetson Thor's prompt GEMMs (THOR-K2), where present
+        from tensorfold.cuda.nvfp4 import thor_dense
+    except ImportError:
+        thor_dense = None
+    if thor_dense is not None and hasattr(thor_dense, "linear"):
+        def thor_meta(x, lin, out=None):
+            if L.stack and L.stack[-1].startswith(("dense.", "moe.shared")):
+                return None                               # inside ``_mm`` or the shared expert: labelled there
+            return b16_meta(x, lin)
+
+        wrap(thor_dense, "linear", thor_meta)
     for owner in (forward, mtp):
         wrap(owner, "_embed", "embed")
         wrap(owner, "finish", "finish")
