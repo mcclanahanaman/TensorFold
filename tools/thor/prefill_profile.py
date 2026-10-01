@@ -243,6 +243,13 @@ def instrument(w, cfg) -> None:
     wrap(gdn_io, "front", "gdn.front")
     wrap(gdn_io, "back", "gdn.back")
     wrap(shared_gdn, "chain", chain_meta)
+    try:                                              # Jetson Thor's chunked DeltaNet prompt chain (THOR-K4)
+        from tensorfold.cuda.kernels import thor_gdn
+    except ImportError:
+        thor_gdn = None
+    if thor_gdn is not None:
+        wrap(thor_gdn, "chain", lambda q, k, v, g, beta, state, final, out=None:
+             chain_meta(q, k, v, g, beta, state, final))
 
     def core_meta(q, kc, vc, pos0, scratch, rows, scale, out=None, *, context=None, **kw):
         if context is None:

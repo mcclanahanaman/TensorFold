@@ -4,7 +4,7 @@ referee sides with.
     python tools/thor/thor_divergence.py collect BASE_URL OUT.json [--top 5] [--only NAME,...]
     python tools/thor/thor_divergence.py compare STOCK.json THOR.json [--out DIFF.json]
     python tools/thor/thor_divergence.py reference MODEL STOCK.json THOR.json OUT.json [--context 131072]
-        [--dense] [--kv-dtype int8] [--save-logits LOGITS.pt]
+        [--dense] [--gdn64] [--kv-dtype int8] [--save-logits LOGITS.pt]
     python tools/thor/thor_divergence.py logits MODEL STOCK.json THOR.json OUT.pt [--kv-dtype int8]
     python tools/thor/thor_divergence.py distance REFEREE.json REFEREE.pt A.pt B.pt [--out DIST.json]
     python tools/thor/thor_divergence.py selfcheck MODEL [--layer 23]
@@ -18,7 +18,10 @@ fp32 SwiGLU, fp32 expert outputs, everything else TensorFold's own prompt arithm
 prompt plus the common prefix, and reports the referee's log probabilities of both runs' tokens there: the run whose
 token the referee ranks higher "agrees". ``--dense`` (THOR-K2) also makes every dense prompt GEMM exact
 (tools/thor/dense_reference.py: float64 on the exact weights, rounded once to each buffer's dtype), so neither run's
-GEMM arithmetic is the referee's; ``--save-logits`` keeps the referee's full next-token logits at each divergence (the
+GEMM arithmetic is the referee's; ``--gdn64`` (THOR-K4) makes every prompt pass's DeltaNet chain exact too
+(tools/thor/gdn_reference.py: the fp64 rule on TensorFold's front outputs, read-outs rounded once to fp32), so neither
+TensorFold's chain nor Thor's chunked one is the referee's; ``--save-logits`` keeps the referee's full next-token
+logits at each divergence (the
 head's float64 logits with ``--dense``). ``logits`` saves a run's own full next-token logits on the same prefixes
 (this process's environment picks the run: TENSORFOLD_THOR_FI_MOE / TENSORFOLD_THOR_DENSE), and ``distance`` gives,
 per divergence, the referee's log probabilities of both tokens and each run's distance from the referee's logits.
@@ -255,7 +258,8 @@ def logits(model: str, a_path: Path, b_path: Path, out_path: Path, context: int,
     engine, app = _engine(model, context, kv_dtype, thor_layout=False)
     box = _capture()
     saved = {"env": {k: os.environ.get(k) for k in ("TENSORFOLD_THOR_FI_MOE", "TENSORFOLD_THOR_DENSE",
-                                                     "TENSORFOLD_THOR_DENSE_WEIGHTS")}, "kv_dtype": kv_dtype,
+                                                     "TENSORFOLD_THOR_DENSE_WEIGHTS", "TENSORFOLD_THOR_GDN")},
+             "kv_dtype": kv_dtype,
              "faithful": faithful, "rows": {}}
     for r, ids in _prefixes(a_path, b_path, app):
         t0 = time.time()
@@ -286,7 +290,7 @@ def _next_token_top(engine, ids: list[int], top: int = 20) -> dict:
 
 
 def reference(model: str, a_path: Path, b_path: Path, out_path: Path, context: int, dense: bool = False,
-              kv_dtype: str = "bf16", save_logits: Path | None = None) -> None:
+              kv_dtype: str = "bf16", save_logits: Path | None = None, gdn64: bool = False) -> None:
     import torch
 
     import moe_reference
@@ -298,9 +302,13 @@ def reference(model: str, a_path: Path, b_path: Path, out_path: Path, context: i
         import dense_reference
 
         dense_reference.install(engine.w)
+    if gdn64:
+        import gdn_reference
+
+        gdn_reference.install_prompt_chain()
     box = _capture()
     prefixes = {r["name"]: ids for r, ids in _prefixes(a_path, b_path, app)}
-    saved: dict = {"dense": dense, "kv_dtype": kv_dtype, "rows": {}}
+    saved: dict = {"dense": dense, "gdn64": gdn64, "kv_dtype": kv_dtype, "rows": {}}
     results = []
     for r in diff:
         if r["equal"]:
@@ -321,7 +329,7 @@ def reference(model: str, a_path: Path, b_path: Path, out_path: Path, context: i
         agrees = None if la is None and lb is None else ("A" if (lb is None or (la is not None and la > lb)) else "B")
         r = {**r, "reference": {"top": ref["top"][:5], "logprob_a_token": la, "logprob_b_token": lb,
                                 "argmax": int(ref["id"]), "agrees_with": agrees, "seconds": time.time() - t0,
-                                "prefix_tokens": len(ids), "dense": dense, "kv_dtype": kv_dtype}}
+                                "prefix_tokens": len(ids), "dense": dense, "gdn64": gdn64, "kv_dtype": kv_dtype}}
         print(f"{r['name']:14s} referee: A's token lp {la}, B's token lp {lb}, argmax {ref['id']} -> agrees with "
               f"{agrees} ({time.time() - t0:.0f}s, {len(ids)} tokens)", flush=True)
         results.append(r)
@@ -426,6 +434,7 @@ def main() -> None:
     r.add_argument("out", type=Path)
     r.add_argument("--context", type=int, default=131072)
     r.add_argument("--dense", action="store_true", help="every dense prompt GEMM exact too (dense_reference.py)")
+    r.add_argument("--gdn64", action="store_true", help="every prompt DeltaNet chain exact too (gdn_reference.py)")
     r.add_argument("--kv-dtype", default="bf16")
     r.add_argument("--save-logits", type=Path, default=None)
     lg = sub.add_parser("logits")
@@ -454,7 +463,8 @@ def main() -> None:
         if args.out:
             args.out.write_text(json.dumps(rows, indent=1))
     elif args.cmd == "reference":
-        reference(args.model, args.a, args.b, args.out, args.context, args.dense, args.kv_dtype, args.save_logits)
+        reference(args.model, args.a, args.b, args.out, args.context, args.dense, args.kv_dtype, args.save_logits,
+                  args.gdn64)
     elif args.cmd == "logits":
         logits(args.model, args.a, args.b, args.out, args.context, args.kv_dtype, args.faithful)
     elif args.cmd == "distance":
