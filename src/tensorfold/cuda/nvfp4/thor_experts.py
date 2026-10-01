@@ -31,9 +31,6 @@ _COPY = 512                 # columns a glue step moves
 
 
 def _fi():
-    # CuTe DSL keeps its compiled kernels under /tmp unless told otherwise: a lasting place makes restarts reuse them
-    os.environ.setdefault("CUTE_DSL_CACHE_DIR", os.path.join(os.path.expanduser("~"), ".cache", "tensorfold",
-                                                             "cute_dsl"))
     from flashinfer.fused_moe.cute_dsl.blackwell import moe_w4a16
 
     return moe_w4a16
