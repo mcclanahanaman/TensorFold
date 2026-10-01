@@ -1,13 +1,13 @@
 """K2 A/B on Jetson Thor (THOR-K2): one engine, the same prompts on TensorFold's prompt GEMMs, thor_dense with bf16
 copies, and thor_dense dequantizing at each call.
 
-    TENSORFOLD_THOR_DENSE_WEIGHTS=copy python tools/thor/k2_check.py MODEL_DIR OUT_DIR
+    python tools/thor/k2_check.py MODEL_DIR OUT_DIR          (copies are thor_dense's default: HD-2026-10-01-07)
 
 The engine is built as served (int8 KV, --parallel 4) with the copies made at load. Phase 1: per prompt, ``stock``
 (``thor_dense.set_active(False)``) then ``copy``; phase 2 (the copies dropped): ``dequant``, and ``stock`` again on the
 32k prompt. Each mode: kprof events at 32k (class times), plain wall time for synthetic 8k/32k/128k and natural-text
 32k warm and with the n-gram table's pages dropped, and the head logits' hash (copy and dequant must agree). Writes
-k2_check.json and ledger_metrics.json (prefill_* of ``dequant``, the default).
+k2_check.json and ledger_metrics.json (prefill_* of ``copy``, the default since HD-2026-10-01-07).
 """
 
 from __future__ import annotations
@@ -108,8 +108,8 @@ def main() -> None:
     (out / "k2_check.json").write_text(json.dumps(report, indent=1, default=str))
     passed = sum(1 for v in checks.values() if v)
     (out / "ledger_metrics.json").write_text(json.dumps({
-        "prefill_8k": table_rows["synthetic 8k"]["dequant"], "prefill_32k": table_rows["synthetic 32k"]["dequant"],
-        "prefill_128k": table_rows["synthetic 128k"]["dequant"], "tests_passed": passed,
+        "prefill_8k": table_rows["synthetic 8k"]["copy"], "prefill_32k": table_rows["synthetic 32k"]["copy"],
+        "prefill_128k": table_rows["synthetic 128k"]["copy"], "tests_passed": passed,
         "tests_failed": len(checks) - passed}))
     print(f"[k2] checks {passed}/{len(checks)}; done in {time.perf_counter() - t0:.0f}s", flush=True)
 

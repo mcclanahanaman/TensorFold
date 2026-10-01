@@ -3,15 +3,15 @@ on thor_gdn's chunked chain (``thor``).
 
     python tools/thor/k4_check.py MODEL_DIR OUT_DIR [--events 8192,32768,131072]
 
-The engine is built as served (int8 KV, --parallel 4: the r11 recipe, thor_dense dequantizing, the Thor experts,
-stage-ahead) and thor_gdn is switched per mode with ``thor_gdn.set_active``; nothing is kept between prompts (each
-fills from row 0). Per mode: kprof events at each ``--events`` length (the GPU timeline by kernel class: the DeltaNet
-prompt class, gdn.chain/front/back, and the rest), then plain wall time for synthetic 8k, 32k and 128k and natural-text
-32k warm and with the n-gram table's pages dropped, in two orders (stock then thor, then thor then stock); each run's
-head-logit hash (the same prompt in both orders must hash the same on one path: determinism); and follow-ups of 16k,
-32k and 48k prompts (40 new tokens, resumed from the kept point), twice per mode in alternating order. Writes
-k4_check.json and ledger_metrics.json (prefill_* of ``thor`` in the first order, as first requests; tests: the
-determinism checks).
+The engine is built as served (int8 KV, --parallel 4: the Thor experts, stage-ahead and thor_dense with its default
+weights, bf16 copies since HD-2026-10-01-07; TENSORFOLD_THOR_DENSE_WEIGHTS=dequant gives r11's recipe) and thor_gdn is
+switched per mode with ``thor_gdn.set_active``; nothing is kept between prompts (each fills from row 0). Per mode: kprof
+events at each ``--events`` length (the GPU timeline by kernel class: the DeltaNet prompt class, gdn.chain/front/back,
+and the rest), then plain wall time for synthetic 8k, 32k and 128k and natural-text 32k warm and with the n-gram table's
+pages dropped, in two orders (stock then thor, then thor then stock); each run's head-logit hash (the same prompt in
+both orders must hash the same on one path: determinism); and follow-ups of 16k, 32k and 48k prompts (40 new tokens,
+resumed from the kept point), twice per mode in alternating order. Writes k4_check.json and ledger_metrics.json
+(prefill_* of ``thor`` in the first order, as first requests; tests: the determinism checks).
 """
 
 from __future__ import annotations
