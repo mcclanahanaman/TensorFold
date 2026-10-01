@@ -168,6 +168,15 @@ class FlashNextEngine:
                      f"dequantized at each call, {held['scratch_bytes'] / 2**20:.0f} MiB of staging")
                   + f" ({thor_dense.ENV}=0 keeps the portable kernels, {thor_dense.WEIGHTS_ENV}=copy|dequant)",
                   flush=True)
+        from tensorfold.cuda.kernels import thor_gdn
+
+        began = time.perf_counter()                  # Thor, NVFP4 checkpoints: built now, before the caches
+        if quant_method(read_config(model_dir)) == "modelopt" and thor_gdn.available() and \
+                thor_gdn.prepare(w.cfg.nk, w.cfg.nv):
+            print(f"[tensorfold] Thor (sm_110): DeltaNet prompt chains on FlashInfer's chunked kernel "
+                  f"({str(thor_gdn.S.dtype).replace('torch.', '')} q/k/v, fp32 state, 64-row chunks; kept points and "
+                  f"prompt pieces on the 64-row grid), ready in {time.perf_counter() - began:.1f}s "
+                  f"({thor_gdn.ENV}=0 keeps TensorFold's chain)", flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
@@ -376,13 +385,17 @@ class FlashNextEngine:
         markers = getattr(self, "points", None)
         if points is None:
             points = markers(prompt) if markers is not None else []
-        stops = [p for p in points if cached + MIN_GAP <= p < end]
+        from tensorfold.cuda.kernels import thor_gdn
+
+        stops = (thor_gdn.stops(points, cached + MIN_GAP, end) if thor_gdn.use() else      # Thor: on the 64-row grid
+                 [p for p in points if cached + MIN_GAP <= p < end])
         def keep(p, snap, tail):
             self._remember(list(prompt[:p]), {"state": snap, "tail": tail})
         first = prefill(self.e, prompt, sampling, resume=hit[1] if hit else None, constraint=constraint,
                         probabilities=probabilities, keep_at=end, stops=stops, keep=keep)
         # the state one token before the prompt's end, so the same prompt or a next turn resumes from it
-        self._remember(list(prompt[:end]), self.e.kept)
+        if end is not None:
+            self._remember(list(prompt[:end]), self.e.kept)
         torch.cuda.synchronize()
         stats: dict[str, Any] = {"prefill_s": round(time.perf_counter() - t0, 4), "cached": len(hit[0]) if hit else 0,
                                  "drafts": True}

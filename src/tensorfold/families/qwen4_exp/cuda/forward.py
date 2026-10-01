@@ -13,6 +13,7 @@ import triton.language as tl
 
 from tensorfold.cuda import moe as moe_mod
 from tensorfold.cuda.kernels import gdn as shared_gdn
+from tensorfold.cuda.kernels import thor_gdn
 from tensorfold.cuda.nvfp4 import thor_dense
 
 from . import attention as attn_mod
@@ -174,6 +175,8 @@ def gdn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
 def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: Cut | None = None) -> None:
     """A prompt chunk's DeltaNet; the layer commits at once (a chunk keeps every row)."""
 
+    if thor_gdn.use():                           # Jetson Thor: the chunked chain on fp16 q, k, v (thor_gdn)
+        return _thor_prefill_chain(g, st, li, b, a0, a1, c, cut)
     n, p, cur = a1 - a0, b.proj[0, a0:a1], st.cur[li]
     b.conv_ptr.fill_(st.conv[li].data_ptr())
     q, k, v, gt, beta = gdn_io.front(p, b.conv_ptr, b.sid[:n], b.windows[:n], g.conv, g.a_log, g.dt_bias, c.nk)
@@ -192,6 +195,48 @@ def _prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: 
         y = shared_gdn.chain(q[m:], k[m:], v[m:], gt[m:], beta[m:], mid, st.rec[cur, li])
         gdn_io.back(y, p[m:], g.norm, c.eps, b.gout[a0 + m:a1], b.gxs[a0 + m:a1])
         cur = 1 - cur                            # the second launch wrote the state back where the first read it
+    st.cur[li] = 1 - cur
+    shift_windows(st.conv[li:li + 1], b.proj[0:1, a0:a1], n, c.conv_dim)
+
+
+def _thor_prefill_chain(g, st: State, li: int, b: Buffers, a0: int, a1: int, c, cut: Cut | None = None) -> None:
+    """``_prefill_chain`` on Jetson Thor: a prompt's rows below thor_gdn.LIMIT on the chunked kernel (fp16 q, k, v),
+    later rows on TensorFold's chain; the piece splits there and at a kept point, the state carried in fp32."""
+
+    n, p, cur = a1 - a0, b.proj[0, a0:a1], st.cur[li]
+    b.conv_ptr.fill_(st.conv[li].data_ptr())
+    fast = thor_gdn.chunked_rows(st.pos, n)       # the piece's first rows, below the limit
+    if fast == n:
+        dt = thor_gdn.S.dtype
+        qk = torch.empty((2, n, c.nk, c.dk), dtype=dt, device=p.device)
+        gb = torch.empty((2, n, c.nv), dtype=torch.float32, device=p.device)
+        out = (qk[0], qk[1], torch.empty((n, c.nv, c.dv), dtype=dt, device=p.device), gb[0], gb[1])
+        q16 = q, k, v, gt, beta = gdn_io.front(p, b.conv_ptr, b.sid[:n], b.windows[:n], g.conv, g.a_log, g.dt_bias,
+                                               c.nk, out=out, rows_per_block=thor_gdn.ROWS_PER_BLOCK)
+    else:                                        # TensorFold's front; the chunked rows' q, k, v rounded to fp16
+        q, k, v, gt, beta = gdn_io.front(p, b.conv_ptr, b.sid[:n], b.windows[:n], g.conv, g.a_log, g.dt_bias, c.nk,
+                                         rows_per_block=thor_gdn.ROWS_PER_BLOCK)
+        q16 = (q[:fast].half(), k[:fast].half(), v[:fast].half(), gt, beta) if fast else None
+    edges = sorted({0, n, *([fast] if 0 < fast < n else []), *([cut.row] if cut is not None else [])})
+    spans = list(zip(edges, edges[1:]))
+    tmp = torch.empty_like(st.rec[cur, li]) if len(spans) > 1 else None
+    src = st.rec[cur, li]
+    for i, (lo, hi) in enumerate(spans):         # the last span writes rec[1 - cur]; earlier ones alternate with tmp
+        dst = st.rec[1 - cur, li] if (len(spans) - 1 - i) % 2 == 0 else tmp
+        if lo < fast:
+            qq, kk, vv, _, _ = q16
+            y = thor_gdn.chain(qq[lo:hi], kk[lo:hi], vv[lo:hi], gt[lo:hi], beta[lo:hi], src, dst)
+        else:
+            y = shared_gdn.chain(q[lo:hi], k[lo:hi], v[lo:hi], gt[lo:hi], beta[lo:hi], src, dst)
+        gdn_io.back(y, p[lo:hi], g.norm, c.eps, b.gout[a0 + lo:a0 + hi], b.gxs[a0 + lo:a0 + hi],
+                    rows_per_block=thor_gdn.ROWS_PER_BLOCK)
+        if cut is not None and hi == cut.row:    # the kept point's state and conv window
+            if cut.rec is None:
+                cut.rec, cut.conv = torch.empty_like(st.rec[0]), torch.empty_like(st.conv)
+            cut.rec[li].copy_(dst)
+            cut.conv[li].copy_(st.conv[li])
+            shift_windows(cut.conv[li:li + 1], b.proj[0:1, a0:a0 + hi], hi, c.conv_dim)
+        src = dst
     st.cur[li] = 1 - cur
     shift_windows(st.conv[li:li + 1], b.proj[0:1, a0:a1], n, c.conv_dim)
 

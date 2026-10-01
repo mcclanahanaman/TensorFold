@@ -20,8 +20,10 @@ def _ext():
 
 
 def front(p: torch.Tensor, conv_ptrs: torch.Tensor, sid: torch.Tensor, windows: torch.Tensor, conv_w: torch.Tensor,
-          a_log: torch.Tensor, dt_bias: torch.Tensor, nk: int, out: tuple | None = None) -> tuple[torch.Tensor, ...]:
-    """``windows`` taps: < 3 a row of stream ``sid``'s conv state, else projection row tap - 3; fills ``out``."""
+          a_log: torch.Tensor, dt_bias: torch.Tensor, nk: int, out: tuple | None = None,
+          rows_per_block: int = 1) -> tuple[torch.Tensor, ...]:
+    """``windows`` taps: < 3 a row of stream ``sid``'s conv state, else projection row tap - 3; fills ``out`` (q, k
+    fp32 and v bf16, or all three bf16 or fp16). ``rows_per_block`` 8: fewer, longer blocks, the same values."""
 
     if out is None:
         rows, nv = windows.shape[0], a_log.numel()
@@ -30,12 +32,13 @@ def front(p: torch.Tensor, conv_ptrs: torch.Tensor, sid: torch.Tensor, windows: 
         v = torch.empty((rows, nv, DV), dtype=torch.bfloat16, device=dev)
         g = torch.empty((rows, nv), dtype=torch.float32, device=dev)
         out = (q, torch.empty_like(q), v, g, torch.empty_like(g))
-    _ext().front(p, conv_ptrs, sid, windows, conv_w, a_log, dt_bias, *out)
+    _ext().front(p, conv_ptrs, sid, windows, conv_w, a_log, dt_bias, *out, int(rows_per_block))
     return out
 
 
 def back(y: torch.Tensor, p: torch.Tensor, norm_w: torch.Tensor, eps: float, out: torch.Tensor,
-         xs: torch.Tensor) -> None:
-    """Gated RMSNorm of the read-out ``y`` (z from ``p``) into bf16 ``out`` and its 32-channel group sums ``xs``."""
+         xs: torch.Tensor, rows_per_block: int = 1) -> None:
+    """Gated RMSNorm of the read-out ``y`` (bf16, fp16 or fp32; z from ``p``) into bf16 ``out`` and its 32-channel group
+    sums ``xs``. ``rows_per_block`` 8: fewer, longer blocks, the same values."""
 
-    _ext().back(y, p, norm_w, float(eps), out, xs)
+    _ext().back(y, p, norm_w, float(eps), out, xs, int(rows_per_block))

@@ -10,6 +10,7 @@ import torch
 from tensorfold.cuda.logprobs import capture
 
 from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_bytes
+from tensorfold.cuda.kernels import thor_gdn
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
 from tensorfold.cuda.sampling import sample_streams
@@ -233,7 +234,8 @@ class MultiDecoder:
             self._drop_kept(st)
             self.free.append(st)
             raise
-        e.stops = sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)}) \
+        e.stops = (thor_gdn.stops(self.points(s.prompt), begin + MIN_GAP, entry_end(s.prompt)) if thor_gdn.use() else
+                   sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)})) \
             if s.draft and st.image_positions is None and self.points is not None else []
         s.sid, s.st = self.next_id, st
         self.next_id += 1
@@ -284,6 +286,8 @@ class MultiDecoder:
         for s in self._order():
             e, mtp, start, _ = self.fills[s.sid]
             n = min(next((p for p in e.stops if p > start), len(s.prompt)) - start, room)
+            if thor_gdn.use():                  # Thor's chunked DeltaNet chain: a piece ends on its 64-row grid
+                n = thor_gdn.piece_rows(start, n, len(s.prompt))
             ends = sum(1 for x, a, k in pieces if a + k == len(x.prompt))
             if n == 0 or (start + n == len(s.prompt) and ends == ENDS):
                 break

@@ -33,3 +33,18 @@ def _give_back_gpu_memory():
     if torch.cuda.is_initialized():
         gc.collect()
         torch.cuda.empty_cache()
+
+
+@pytest.fixture(autouse=True)
+def _thor_gdn_off_after():
+    """Jetson Thor's chunked DeltaNet prompt chain (thor_gdn) is process-wide once an engine prepares it: it is off again
+    after each test, so the next one starts from TensorFold's chain."""
+
+    yield
+    if not _cuda():
+        return
+    try:
+        from tensorfold.cuda.kernels import thor_gdn
+    except ImportError:
+        return
+    thor_gdn.set_active(False)

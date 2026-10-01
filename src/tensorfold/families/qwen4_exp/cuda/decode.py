@@ -9,6 +9,7 @@ from typing import Sequence
 import numpy as np
 import torch
 
+from tensorfold.cuda.kernels import thor_gdn
 from tensorfold.cuda.logprobs import capture
 
 from tensorfold.cuda.sampling import comm_gather, nucleus_rows, sample_rows
@@ -116,9 +117,14 @@ def _gathered_fits(sampling: Sampling | None) -> bool:
 PREFILL_ROWS = 2048      # rows of a prompt chunk
 
 
-def entry_end(prompt: Sequence[int]) -> int:
-    """Where a prompt's kept state ends: one token early, since a next turn sent back without its reasoning renders ``<think>`` and two newlines there."""
+def entry_end(prompt: Sequence[int]) -> int | None:
+    """Where a prompt's kept state ends: one token early, since a next turn sent back without its reasoning renders ``<think>`` and two newlines there.
 
+    On Jetson Thor's chunked DeltaNet chain (thor_gdn): the last multiple of 64 before that, so a resumed prompt's chains
+    split where a fresh prefill's keep their bits; None under 65 tokens (nothing is kept)."""
+
+    if thor_gdn.use():
+        return thor_gdn.kept_point(len(prompt))
     return max(1, len(prompt) - 1)
 
 
