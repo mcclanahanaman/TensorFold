@@ -12,6 +12,7 @@ from tensorfold.cuda.geometry import PREFILL_ROWS, indexed_prompt_bytes
 
 IDLE_ROWS = 4096
 ROWS_ENV = "TENSORFOLD_PREFILL_ROWS"   # AGX Thor: an idle prompt piece's rows (unset or empty: PREFILL_ROWS)
+POOL_ENV = "TENSORFOLD_THOR_POOL"      # =0: wide pieces keep today's memory gate (no kept ends freed for the pool)
 ROWS_GRID = 64                        # Thor's DeltaNet chunk and expert route tile: pieces on this grid keep every bit
 MAX_ROWS = 16384                      # the widest piece checked on Thor; every buffer's element offsets stay in 32 bits
 THOR = (11, 0)
@@ -81,6 +82,16 @@ def _widen(receipt: dict, text: dict, rows: int, extra: int) -> tuple[int, int]:
                    serving_peak_bytes_estimate=serving, total_bytes_estimate=total,
                    full_mapped_working_set_bytes_estimate=total + receipt["mapped_table_bytes"])
     return rows, workspace
+
+
+def keeps_pool(rows: int, capability: tuple[int, int]) -> bool:
+    """AGX Thor with pieces wider than the released ones: a cache grow first frees kept prompt ends while the GPU
+    driver's free pages can't hold it and the reserve, so the extra piece bytes never push a grow into reclaiming
+    the mapped n-gram tables (ROWS-2: 7-109 s stalls); released pieces, other devices and ``TENSORFOLD_THOR_POOL=0``
+    keep today's gate."""
+
+    off = os.environ.get(POOL_ENV, "1").strip().lower() in ("0", "off", "false", "no")
+    return tuple(capability) == THOR and rows > PREFILL_ROWS and not off
 
 
 def pass_limit(rows: int, live: bool, share: float, round_s: float | None, row_s: float | None,

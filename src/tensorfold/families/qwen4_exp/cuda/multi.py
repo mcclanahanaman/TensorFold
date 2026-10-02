@@ -12,7 +12,7 @@ from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_bytes
 from tensorfold.cuda.kernels import thor_gdn
 from tensorfold.cuda.markers import MIN_GAP
-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
+from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, driver_pool, torch_live
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
@@ -22,7 +22,7 @@ from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_b
 from . import attn_multi, gdn_multi, image_rows, prefixes
 from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
 from .mtp import mtp_compute, mtp_stage
-from .prompt_plan import pass_limit
+from .prompt_plan import keeps_pool, pass_limit
 from .state import ENDS, Buffers, State
 from ..cuda import CONFIDENCE, DEPTH
 
@@ -74,6 +74,8 @@ class MultiDecoder:
         live = free
         self.memory_gate = MemoryGate(live() if live is not None else 1 << 62,
                                       reserve=max(2 * GIB, workspace_bytes), live=live)
+        if torch.cuda.is_available() and keeps_pool(prefill_rows, torch.cuda.get_device_capability()):
+            self.memory_gate.pool = driver_pool(torch)
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
         self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]
@@ -115,6 +117,11 @@ class MultiDecoder:
                                 f"{LIMIT_ENV} if more GPU memory is available.")
                     break
                 return False
+        if self.memory_gate.pool is not None:    # Thor's wide pieces: kept ends go before the n-gram tables' pages
+            while self.memory_gate.short(grow + st.layer_bytes(size)) and self._evict_kept(st, protect=protect):
+                pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()         # freed blocks back to the driver, where the grow takes its pages
         try:
             added = st.resize(size)
         except Exception:

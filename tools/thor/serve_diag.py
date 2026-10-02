@@ -17,8 +17,8 @@ The arguments are tensorfold.cli's. One JSON object a line; "k" names the record
 - "admit": a request admitted (prompt length); "finish": streams that ended;
 - "st": every TF_DIAG_EVERY s: the cumulative counters (gathers, stages, passes, rounds and their seconds, grows,
   evictions, shrinks, empty_cache calls and seconds), the process's faults, the gate (room, reserve, held, waits,
-  ends), kept prompts (count, rows), live/filling streams, free slots, torch allocated/reserved/peak reserved bytes and
-  its device allocs, frees and retries.
+  ends, the driver pool a wide-piece gate keeps), kept prompts (count, rows), live/filling streams, free slots, torch
+  allocated/reserved/peak reserved bytes and its device allocs, frees and retries.
 TF_DIAG_BALLAST_GIB allocates (and touches) that much GPU memory before the model loads: the memory a wider pass's
 buffers take, without the wider pass.
 """
@@ -183,8 +183,10 @@ def install() -> None:
             if st.capacity != cap0 or ok is not True:
                 C["grows" if st.capacity != cap0 else "refused"] += 1
                 C["grow_s"] += dt
+                pool = getattr(self.memory_gate, "pool", None)
                 emit({"k": "grow", "rows": int(rows), "cap0": int(cap0), "cap1": int(st.capacity), "ok": ok,
-                      "alone": bool(alone), "dt": round(dt, 4), "held": int(self.memory_gate.held)})
+                      "alone": bool(alone), "dt": round(dt, 4), "held": int(self.memory_gate.held),
+                      "pool": int(pool()) if pool is not None else None})
 
     evict0 = MD._evict_kept
 
@@ -252,6 +254,8 @@ def status() -> None:
                 rec.update(room=int(g.room), reserve=int(g.reserve), held=int(g.held), waits=int(g.waits),
                            ends=int(g.ends), kept=len(kept), kept_rows=sum(len(k[0]) for k in kept),
                            live=len(md.streams), filling=len(md.filling), free_slots=len(md.free))
+                pool = getattr(g, "pool", None)
+                rec["pool"] = int(pool()) if pool is not None else None
             if torch.cuda.is_initialized():
                 s = torch.cuda.memory_stats()
                 rec.update(alloc=s.get("allocated_bytes.all.current", 0),

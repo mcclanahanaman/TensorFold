@@ -36,7 +36,7 @@ def allocations(monkeypatch):
     lang.constexpr = object
     triton = ModuleType("triton")
     triton.language = lang
-    triton.jit = lambda fn: fn
+    triton.jit = lambda fn=None, **kw: fn if fn is not None else (lambda f: f)   # @jit and @jit(...)
     triton.cdiv = lambda a, b: (a + b - 1) // b
     triton.next_power_of_2 = lambda n: 1 << (n - 1).bit_length()
     monkeypatch.setitem(sys.modules, "triton", triton)
