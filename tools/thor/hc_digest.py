@@ -25,14 +25,16 @@ OPS = (
     ('_down_act', 'down + act (fused)'),
     ('_mix_h', 'mix from h'),
     ('_upmix_h', 'up + mix (fused)'),
+    ('_upmix4', 'up + mix (fused)'),
 )
 
 _OPS_BY_NAME = dict(OPS)
+_LABELS = tuple(dict.fromkeys(label for _, label in OPS))      # op labels in order, each once
 
 
 def ops(entry: dict) -> dict:
     """Sum n and ms per op label over one entry's kernels; grids counts the distinct keys."""
-    acc = {label: [0, 0.0, set()] for _, label in OPS}
+    acc = {label: [0, 0.0, set()] for label in _LABELS}
     for kernel in entry['kernels']:
         label = _OPS_BY_NAME.get(kernel['key'].split('|', 1)[0])
         if label is not None:
@@ -88,7 +90,7 @@ def markdown(d: dict) -> str:
              '|---|---|---|---|---|---|---|---|']
     for label, sides in d.items():
         off, on = sides['off'], sides['on']
-        for _, op in OPS:
+        for op in _LABELS:
             if (off is not None and op in off['ops']) or (on is not None and op in on['ops']):
                 lines.append(f'| {label} | {op} | '
                              + ' | '.join(_cells(off, op) + _cells(on, op)) + ' |')
