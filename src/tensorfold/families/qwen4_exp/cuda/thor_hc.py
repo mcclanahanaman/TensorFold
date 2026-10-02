@@ -364,8 +364,10 @@ def check(hc, rows: int, eps: float, streams: int, low: int, device, seed: int =
 
 def prepare(w) -> bool:
     """Compile and check the kernels on this device against TensorFold's read-out (rows 128, 1000 and 4096 through
-    the first layer's hyper-connections), before the caches: the path turns on only if the down projection and the
-    mix are bit-equal; the fused up projection only if it is too."""
+    the first layer's hyper-connections): the path turns on only if the down projection and the mix are bit-equal;
+    the fused up projection only if it is too. The engine calls it after the caches' room is set and before its
+    warm-up, which loads the prompt kernels (cuBLAS and Triton's) either way: the room is the same with the path on
+    or off (hcf-m1: on, this check's kernels took 0.15 GiB of driver memory before the room was set)."""
 
     S.ready = S.active = S.upmix = False
     if not available():
