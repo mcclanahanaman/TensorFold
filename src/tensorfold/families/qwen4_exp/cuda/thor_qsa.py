@@ -15,11 +15,17 @@ rate. Here, for prompt passes:
 - the indexer's block scores are tensor-core dot products (``_scores``: 32 rows x 4 heads against 128 pooled keys a
   program, fp32 sums), and TensorFold's own selection (``attention._launch_select``) picks the blocks.
 
-Exactness. Every row is still computed on its own: its scores, its selection and its attention read only the row's
-query and the cache (the shadow holds the same values however it was staged), so prompts resume, fill together and
-fill with or without drafts with the same bits, at any split; decode windows keep TensorFold's kernels. The values
-are TensorFold's up to rounding: the same products summed in another order. tools/thor/qsa_check.py measures both
-paths against fp64 on real prompts.
+Exactness. Only sparse rows (a row past ``budget + ratio - 1`` keys, from prompt position ``first_sparse``) take this
+path; a dense row keeps TensorFold's kernels, also inside a row block that holds both (the block is split at the
+first sparse row), so a prompt under 2,052 tokens, and the first 2,051 rows of any prompt, have TensorFold's bits
+exactly, with or without this path. (The same kernel compiled for a bf16 operand and two pipeline stages sums the same
+products in another order: on dense rows that gave rounding-level differences that flipped near-tie replies of short
+prompts. Keeping them costs 2.0% of the 8k prompt rate, 0.5% at 32k and 0.1% at 128k on Thor.) Every row is still
+computed on its own: whether it is sparse, its scores, its selection and its attention depend only on the row's
+position, its query and the cache (the shadow holds the same values however it was staged), so prompts resume, fill
+together and fill with or without drafts with the same bits, at any split; decode windows keep TensorFold's kernels.
+On sparse rows the values are TensorFold's up to rounding: the same products summed in another order.
+tools/thor/qsa_check.py measures both paths against fp64 on real prompts.
 
 ``TENSORFOLD_THOR_QSA=0`` keeps TensorFold's prompt kernels; any other GPU never reaches this module.
 """
@@ -28,6 +34,7 @@ from __future__ import annotations
 
 import functools
 import os
+from types import SimpleNamespace
 
 import torch
 import triton
@@ -65,6 +72,25 @@ def use() -> bool:
     """Whether prompt passes run here."""
 
     return S.active
+
+
+DENSE_ON_TF = True          # dense rows keep TensorFold's kernels (False: every prompt row here, as first gated)
+
+
+def first_sparse(scratch) -> int | None:
+    """The first prompt position whose row is sparse (it reads more than ``budget + ratio - 1`` keys, so more than
+    ``budget / ratio`` complete blocks), or None with QSA off (a cache within the budget): 2,051 for Flash Next."""
+
+    return (scratch.budget // scratch.ratio + 1) * scratch.ratio - 1 if scratch.qsa else None
+
+
+def rows_from(scratch, k: int) -> SimpleNamespace:
+    """The prompt block's scratch as seen by a launch whose row 0 is the block's row ``k`` (its selections, key counts
+    and partial sums from there on)."""
+
+    return SimpleNamespace(nch=scratch.nch, qsa=scratch.qsa, budget=scratch.budget, ratio=scratch.ratio,
+                           idw=scratch.idw, po=scratch.po[k:], pm=scratch.pm[k:], pl=scratch.pl[k:],
+                           ids=scratch.ids[k:], nk=scratch.nk[k:], sparse=scratch.sparse[k:])
 
 
 def set_active(on: bool) -> None:

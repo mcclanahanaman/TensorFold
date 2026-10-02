@@ -295,6 +295,9 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
                                   delta=delta, length=length, sections=sections)
             # Thor (sm_110), see thor_qsa: a bf16 cache, or an 8-bit one through the buffers' shadow; never a 4-bit one
             thor = thor_qsa.use() and (bits == 0 or bits == 8 and b.thor_shadow is not None)
+            lo = (thor_qsa.first_sparse(b.attn) if thor_qsa.DENSE_ON_TF else 0) if thor else None
+            if lo is None or host_pos + a1 - a0 <= lo:           # no sparse row here: TensorFold's kernels
+                thor = False
             whole = thor and bits and a1 - a0 > ATT_ROWS          # several row blocks: the 8-bit cache staged once
             if whole:
                 thor_qsa.stage_all(cache, b.thor_shadow, host_pos + a1 - a0)
@@ -302,19 +305,25 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
                 thor_qsa.begin(b.thor_shadow)
             for r0 in range(a0, a1, ATT_ROWS):
                 n = min(ATT_ROWS, a1 - r0)
-                b.pos_blk.fill_(host_pos + r0 - a0)
-                ends = host_pos + r0 - a0 + n
+                p0 = host_pos + r0 - a0
+                b.pos_blk.fill_(p0)
+                ends = p0 + n
+                k = min(n, max(0, lo - p0)) if thor else n      # the block's dense rows: TensorFold's kernels
                 if b.attn.qsa:
-                    (thor_qsa.qsa_rows if thor else attn_mod.qsa_rows)(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n,
-                                                                       context=ends)
-                if thor:
+                    (thor_qsa.qsa_rows if k < n else attn_mod.qsa_rows)(b.iq[r0:r0 + n], pooled, b.pos_blk, b.attn, n,
+                                                                         context=ends)
+                if k:
+                    attn_mod.attention(b.q[r0:r0 + k], cache.k, cache.v, b.pos_blk, b.attn, k, scale,
+                                       out=b.attn_o[r0:r0 + k], context=p0 + k, ks=cache.ks, vs=cache.vs, bits=bits)
+                if k < n:                                      # the sparse rows: Thor's kernels
+                    sc = b.attn
+                    if k:                                      # after the dense rows' launches, in stream order
+                        sc = thor_qsa.rows_from(b.attn, k)
+                        b.pos_blk.fill_(p0 + k)
                     if bits and not whole:                     # a short segment: the blocks its rows read
-                        thor_qsa.stage(cache, b.thor_shadow, b.attn, b.pos_blk, n, ends)
-                    thor_qsa.attention(b.q[r0:r0 + n], cache, b.thor_shadow, b.pos_blk, b.attn, n, scale,
-                                       b.attn_o[r0:r0 + n], context=ends, bits=bits)
-                    continue
-                attn_mod.attention(b.q[r0:r0 + n], cache.k, cache.v, b.pos_blk, b.attn, n, scale,
-                                   out=b.attn_o[r0:r0 + n], context=ends, ks=cache.ks, vs=cache.vs, bits=bits)
+                        thor_qsa.stage(cache, b.thor_shadow, sc, b.pos_blk, n - k, ends)
+                    thor_qsa.attention(b.q[r0 + k:r0 + n], cache, b.thor_shadow, b.pos_blk, sc, n - k, scale,
+                                       b.attn_o[r0 + k:r0 + n], context=ends, bits=bits)
             continue
         if b.attn.qsa:
             attn_mod.qsa_select(b.iq[a0:a1], ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0,

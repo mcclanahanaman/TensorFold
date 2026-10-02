@@ -1,7 +1,8 @@
 """Jetson Thor's sparse-attention prompt kernels (THOR-K4-QSA): the 8-bit cache's bf16 shadow holds the values
 TensorFold's kernel dequantizes, the prompt attention on it and the tensor-core block scores agree with TensorFold's
 kernels up to rounding (the scores select the same blocks), and Flash Next's prompts keep their bits with the path
-on: chunkings, a resume and drafted tokens, past the indexer budget, on an 8-bit and a bf16 cache."""
+on: chunkings, a resume and drafted tokens, past the indexer budget, on an 8-bit and a bf16 cache; dense rows (up to
+2,051 keys) are TensorFold's bits exactly."""
 
 import pytest
 import torch
@@ -182,6 +183,40 @@ def test_a_4bit_cache_keeps_tensorfolds_kernels_after_an_8bit_engine_turned_the_
     tf_e = Engine(w, capacity=4096, max_rows=8, prefill_rows=512, kv_dtype="int4")
     assert prefill(tf_e, prompt, None) == first
     assert all(torch.equal(a, b) for a, b in zip(got, _state(tf_e)))
+
+
+@pytest.mark.parametrize("dtype,bits", [("int8", 8), ("bf16", 16)])
+def test_dense_rows_keep_tensorfolds_bits_with_the_path_on(thor_on, dtype, bits):
+    """Dense rows keep TensorFold's kernels: a prompt under 2,052 tokens has TensorFold's bits exactly with the path on,
+    in one pass or several, and so do its MTP drafts; a longer prompt's first 2,051 rows (the row blocks that hold dense
+    and sparse rows split between the two) leave TensorFold's cache bits, whatever the chunking."""
+
+    from test_flashnext_forward import _rows
+
+    w = _model()
+    prompt = [(37 * i + 11) % V for i in range(2000)]             # every row dense (at most 2,051 keys)
+    tf_e = Engine(w, capacity=4096, max_rows=8, prefill_rows=2048, kv_dtype=dtype)
+    tf_first = prefill(tf_e, prompt, None)
+    want = _state(tf_e)
+    ref = serial_decode(tf_e, tf_first, 24, None).tokens
+    longer = [(37 * i + 11) % V for i in range(2600)]
+    tf_long = Engine(w, capacity=4096, max_rows=8, prefill_rows=2048, kv_dtype=dtype)
+    prefill(tf_long, longer, None)
+    assert thor_on(bits) and thor_qsa.use() and thor_qsa.DENSE_ON_TF
+    head = thor_qsa.first_sparse(tf_long.pbuf.attn)
+    assert head == 2051
+
+    def cache_head(e):
+        return [x for c in e.st.kc for x in _rows(c, head)] + [k[:head] for k in e.st.ikc]
+
+    for rows in (2048, 512, 1000):
+        e = Engine(w, capacity=4096, max_rows=8, prefill_rows=rows, graphs=True, kv_dtype=dtype)
+        assert prefill(e, prompt, None) == tf_first, rows
+        assert all(torch.equal(a, b) for a, b in zip(_state(e), want)), rows
+        assert mtp_decode(e, tf_first, 24, None, depth=4, confidence=0.3).tokens == ref, rows
+        e = Engine(w, capacity=4096, max_rows=8, prefill_rows=rows, graphs=True, kv_dtype=dtype)
+        prefill(e, longer, None)
+        assert all(torch.equal(a, b) for a, b in zip(cache_head(e), cache_head(tf_long))), rows
 
 
 def test_whole_and_block_staging_give_the_same_bits():
