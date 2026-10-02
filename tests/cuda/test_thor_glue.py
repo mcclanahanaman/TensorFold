@@ -151,6 +151,27 @@ def test_decode_buffers_and_more_than_one_gpu_keep_the_scatter(layer, ready):
     assert dec.kept is None
 
 
+def test_the_engines_decode_windows_keep_the_scatter(layer, ready):
+    """The engine's decode windows run their experts on prompt-arithmetic buffers (``Buffers(moe_prefill=True)``: bf16
+    slots and a prompt plan, as ``_buffers`` builds them); ``forward.moe_block`` leaves the slots in the experts' rows
+    for prompt buffers (``Buffers.prefill``) only, so a decode window's MoE is the scatter path."""
+
+    from tensorfold.families.qwen4_exp.cuda import forward
+
+    ex, router, cfg = layer
+    w = SimpleNamespace(cfg=SimpleNamespace(top_k=TOP, experts=E, moe_width=NI, hidden=D), comm=None, x3=None)
+    lw = SimpleNamespace(moe=SimpleNamespace(router=router, experts=ex))
+    x = _x(8, 7)
+    for prefill in (False, True):
+        b = SimpleNamespace(prefill=prefill, moe=_buffers(8, cfg), mixed=x, xs_mixed=x)
+        mode, y, wts = forward.moe_block(lw, w, b, 8)
+        assert mode == 2 and wts.shape == (8, TOP + 1)
+        if prefill:
+            assert isinstance(y, thor_glue.Rows) and b.moe.kept is y
+        else:
+            assert isinstance(y, torch.Tensor) and b.moe.kept is None and y.data_ptr() == b.moe.y.data_ptr()
+
+
 def test_the_switch_keeps_the_scatter(layer, monkeypatch):
     ex, router, cfg = layer
     monkeypatch.setattr(thor_glue.S, "ready", True)

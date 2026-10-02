@@ -23,8 +23,10 @@ bf16 roundings). Every stored value is TensorFold's, bit for bit. ``prepare`` ch
 against the kernels they replace before turning the path on (the SwiGLU on every bf16 gate value);
 tools/thor/glue_check.py checks the layer on real prompts.
 
-``TENSORFOLD_THOR_MOE_GLUE=0`` keeps the scatter and the shared expert's kernels; decode windows (and the MTP head's
-fp32 slots) always keep them; any other GPU never reaches this module.
+``TENSORFOLD_THOR_MOE_GLUE=0`` keeps the scatter and the shared expert's kernels; decode windows (their buffers run the
+prompt arithmetic, but ``forward.moe_block`` asks for this path on prompt buffers only) and the MTP head's fp32 slots
+always keep them, except a decode window's rows that share a prompt pass's MoE call (the prompt's buffers); any
+other GPU never reaches this module.
 """
 
 from __future__ import annotations

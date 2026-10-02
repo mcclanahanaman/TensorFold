@@ -397,7 +397,10 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     m = layer.moe
     if getattr(m.experts, "kernel", "qmm") == "nvfp4":      # an NVFP4 checkpoint: the FP4 experts
         buf = b.moe
-        nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg), unscattered=w.comm is None)
+        # prompt buffers only: a decode window's buffers run the prompt arithmetic (moe_prefill: bf16 slots, a prompt
+        # plan) and keep the scatter, so decode is TensorFold's path (THOR-EXPERT-GLUE)
+        nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg),
+                      unscattered=w.comm is None and b.prefill)
         if buf.kept is not None:                        # Jetson Thor's prompt passes: the slots where the experts left them
             return 2, buf.kept, buf.wts[:R]
     elif w.x3 is not None:                              # an EXL3 pack: each expert at its own width, one GPU
