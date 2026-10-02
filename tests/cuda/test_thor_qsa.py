@@ -101,7 +101,12 @@ def test_prompt_attention_agrees_with_tensorfolds_kernel_to_rounding(cap, rows):
     thor_qsa.attention(qr, cache, shadow, pos0, scratch, rows, d ** -0.5, got, context=cap, bits=8)
     rel = float((got.float() - ref.float()).abs().max()) / float(ref.float().abs().max())
     assert rel < 1e-2, rel
-    assert float((got == ref).float().mean()) > 0.99
+    if thor_qsa.S.attn:                     # one pass a row (THOR-K4-QSA-ATTN): fp64's error, not TensorFold's bits
+        want = _attention64(qr, shadow, scratch, int(pos0), rows)
+        err_tf, err_thor = _rel(ref, want), _rel(got, want)
+        assert err_thor <= 1.5 * err_tf + 1e-6, (err_thor, err_tf)
+    else:
+        assert float((got == ref).float().mean()) > 0.99
     for r in (0, rows // 2, rows - 1):                            # a row alone: the same bits as in its block
         one = torch.empty_like(ref[:1])
         sub = attn_mod.AttnScratch(1, heads, d, 4096, DEV, budget=2048, ratio=4)
@@ -111,6 +116,64 @@ def test_prompt_attention_agrees_with_tensorfolds_kernel_to_rounding(cap, rows):
         thor_qsa.attention(qr[r:r + 1], cache, shadow, pos0 + r, sub, 1, d ** -0.5, one, context=cap - rows + r + 1,
                            bits=8)
         assert torch.equal(one[0], got[r]), r
+
+
+def _attention64(qr, shadow, scratch, p0: int, rows: int) -> torch.Tensor:
+    """Each row's attention in fp64 on the shadow's values (the values both kernels read), rotated back."""
+
+    heads, d = qr.shape[1], qr.shape[2]
+    out = torch.empty((rows, heads, d), dtype=torch.float64, device=DEV)
+    for r in range(rows):
+        if scratch.qsa and int(scratch.sparse[r]):
+            keys = scratch.ids[r, :int(scratch.nk[r])].long()
+        else:
+            keys = torch.arange(p0 + r + 1, device=DEV)
+        k, v = shadow.k[keys].double(), shadow.v[keys].double()            # [n, 2, d]
+        for j in range(2):
+            qq = qr[r, j * 12:(j + 1) * 12].double()
+            out[r, j * 12:(j + 1) * 12] = torch.softmax(qq @ k[:, j].T * d ** -0.5, dim=1) @ v[:, j]
+    return _h32_64(out)
+
+
+def _h32_64(x: torch.Tensor) -> torch.Tensor:
+    hm = torch.ones((1, 1), dtype=torch.float64, device=x.device)
+    for _ in range(5):
+        hm = torch.cat([torch.cat([hm, hm], 1), torch.cat([hm, -hm], 1)], 0)
+    return (x.reshape(-1, 32) @ (hm / 32 ** 0.5).T).reshape(x.shape)
+
+
+def _rel(got: torch.Tensor, want: torch.Tensor) -> float:
+    """The largest per-row-and-head relative error against fp64."""
+
+    diff = (got.double() - want).norm(dim=-1)
+    return float((diff / want.norm(dim=-1).clamp_min(1e-30)).max())
+
+
+@pytest.mark.parametrize("cap,rows", [(4096, 64), (9000, 256), (40000, 96), (131072, 32)])
+def test_select_rows_lists_tensorfolds_blocks_bit_for_bit(cap, rows):
+    """THOR-K4-QSA-ATTN's selection against TensorFold's on the same scores: ties (repeated values), zeros and -0.0
+    included, at row widths up to 32,768 blocks."""
+
+    g = torch.Generator(device=DEV).manual_seed(cap + rows)
+    pos0 = torch.tensor([cap - rows], dtype=torch.int32, device=DEV)
+    a = attn_mod.AttnScratch(rows, 24, 256, cap, DEV, budget=2048, ratio=4)
+    b = attn_mod.AttnScratch(rows, 24, 256, cap, DEV, budget=2048, ratio=4)
+    blocks = -(-cap // 4)
+    sc = torch.rand((rows, a.nb), generator=g, device=DEV)
+    sc = torch.where(torch.rand(sc.shape, generator=g, device=DEV) < 0.3, (sc * 8).floor() / 8, sc)   # many ties
+    sc[:, ::7] = 0.0
+    sc[:, 3::11] = -0.0
+    a.scores.copy_(sc)
+    b.scores.copy_(sc)
+    attn_mod._launch_select(a, pos0, rows, blocks)
+    thor_qsa.select(b, pos0, rows, blocks)
+    assert torch.equal(a.sparse, b.sparse) and torch.equal(a.nk, b.nk)
+    assert torch.equal(a.ids, b.ids)
+    width = 1 << (blocks - 1).bit_length()
+    for w in [w for w in (2, 8, 16) if width <= 4096 * w]:       # any warps: the same lists
+        b.ids.zero_()
+        thor_qsa.select(b, pos0, rows, blocks, warps=w)
+        assert torch.equal(a.ids, b.ids), w
 
 
 def test_tensor_core_scores_select_tensorfolds_blocks():

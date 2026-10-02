@@ -316,11 +316,22 @@ class Bench:
         res["rows_tf_ms"] = timed(lambda: self.orig_rows(iq, pooled, pos0, scratch, n, context=context))
         if int((sp != 0).sum()):
             res["select_tf_ms"] = timed(lambda: self.am._launch_select(scratch, pos0, n, blocks))
+        tq.set_attn(False)                                 # THOR-K4-QSA (r19): TensorFold's selection
         res["rows_thor_ms"] = timed(lambda: tq.qsa_rows(iq, pooled, pos0, scratch, n, context=context))
+        tq.set_attn(True)
         if not res["sparse_rows"]:
             return
         tc = scratch.scores[:n, :blocks].clone()
         ids_tc = scratch.ids[:n].clone()
+        nk_tc, sp_tc = scratch.nk[:n].clone(), scratch.sparse[:n].clone()
+        res["rows_new_ms"] = timed(lambda: tq.qsa_rows(iq, pooled, pos0, scratch, n, context=context))
+        res["select_new_ms"] = timed(lambda: tq.select(scratch, pos0, n, blocks))
+        res["select_new_equal"] = bool(torch.equal(scratch.ids[:n], ids_tc) and torch.equal(scratch.nk[:n], nk_tc)
+                                       and torch.equal(scratch.sparse[:n], sp_tc))
+        width = max(16, triton.next_power_of_2(blocks))
+        for w in [w for w in (2, 4, 8, 16) if width <= 4096 * w]:         # at most 128 keys a thread
+            res[f"select_new_ms_w{w}"] = timed(lambda: tq.select(scratch, pos0, n, blocks, warps=w))
+            res["select_new_equal"] &= bool(torch.equal(scratch.ids[:n], ids_tc))
         res["scores_equal_frac"] = float((tc == sc_ref)[live].float().mean())
         res["scores_rel_max"] = float(((tc - sc_ref).abs() / sc_ref.abs().clamp_min(1e-6))[live].max())
         rows_sp = torch.nonzero(sp != 0).squeeze(1)
@@ -367,13 +378,27 @@ class Bench:
                 tq.stage(cache, shadow, scratch, pos_t, n, ctx)
 
             res["stage_ms"] = timed(staged)                    # the slice's blocks, as the first of a segment
+        tq.set_attn(False)                                 # THOR-K4-QSA (r19): chunks and merge on the shadow
         res["attn_thor_ms"] = timed(lambda: tq.attention(q[:n], cache, shadow, pos_t, scratch, n, scale, tmp,
                                                          context=ctx, bits=bits))
         thor = tmp.clone()
+        tq.set_attn(True)
+        res["attn_new_ms"] = timed(lambda: tq.attention(q[:n], cache, shadow, pos_t, scratch, n, scale, tmp,
+                                                        context=ctx, bits=bits))
+        new = tmp.clone()
+        kb, vb = (shadow.k, shadow.v) if bits else (kc, vc)
+        for bt, w, st in ((64, 4, 2), (64, 4, 4), (64, 8, 3), (32, 4, 3), (32, 4, 5), (32, 2, 4), (128, 8, 2),
+                          (128, 8, 3)):
+            try:
+                res[f"attn_new_ms_{bt}_{w}_{st}"] = timed(lambda: tq.row_attention(
+                    q[:n], kb, vb, pos_t, scratch, n, scale, tmp, bits=bits, tile=bt, warps=w, stages=st))
+                res[f"attn_new_equal_{bt}_{w}_{st}"] = bool(torch.equal(tmp, new)) if bt == tq.ROW_TILE else None
+            except Exception as exc:  # noqa: BLE001
+                res[f"attn_new_ms_{bt}_{w}_{st}"] = repr(exc)[-200:]
         res["attn_equal_frac"] = float((thor == ref).float().mean())
         res["attn_rel"] = float((thor.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-30))
         pick = torch.linspace(0, n - 1, min(self.sample_rows, n), device=dev).round().long().unique()
-        errs_tf, errs_th = [], []
+        errs_tf, errs_th, errs_new = [], [], []
         h, d = q.shape[1], q.shape[2]
         hk = kc.shape[1]
         g = h // hk
@@ -395,12 +420,17 @@ class Bench:
             nrm = want.norm(dim=1).clamp_min(1e-30)
             errs_tf.append(((ref[r].double() - want).norm(dim=1) / nrm).max().item())
             errs_th.append(((thor[r].double() - want).norm(dim=1) / nrm).max().item())
+            errs_new.append(((new[r].double() - want).norm(dim=1) / nrm).max().item())
         res["err_rows"] = len(errs_tf)
         res["err_tf_mean"] = sum(errs_tf) / len(errs_tf)
         res["err_thor_mean"] = sum(errs_th) / len(errs_th)
         res["err_tf_max"] = max(errs_tf)
         res["err_thor_max"] = max(errs_th)
         res["err_ratio_max"] = max(b / a for a, b in zip(errs_tf, errs_th))
+        res["err_new_mean"] = sum(errs_new) / len(errs_new)
+        res["err_new_max"] = max(errs_new)
+        res["err_ratio_new_max"] = max(b / a for a, b in zip(errs_tf, errs_new))
+        res["err_ratio_new_mean"] = res["err_new_mean"] / res["err_tf_mean"]
 
 
 PROMPTS = {"syn8k": (8192, False, 4242 + 8192), "syn32k": (32768, False, 4242 + 32768),

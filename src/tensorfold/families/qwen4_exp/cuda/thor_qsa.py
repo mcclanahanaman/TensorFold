@@ -27,6 +27,12 @@ together and fill with or without drafts with the same bits, at any split; decod
 On sparse rows the values are TensorFold's up to rounding: the same products summed in another order.
 tools/thor/qsa_check.py measures both paths against fp64 on real prompts.
 
+THOR-K4-QSA-ATTN: a sparse row's attention is one program a row and KV head over its whole key list (``_row_attn``:
+the online softmax of TensorFold's ``attention._tile`` over the list's 64-key tiles in order, no chunk partials and no
+merge), and its selection is TensorFold's search with 32-bit keys and fewer warps a row (``_select_rows``: the same cut
+and the same lists, bit for bit). Both depend only on the row, so the contract above holds.
+``TENSORFOLD_THOR_QSA_ATTN=0`` keeps THOR-K4-QSA's kernels (chunks, merge and TensorFold's selection).
+
 ``TENSORFOLD_THOR_QSA=0`` keeps TensorFold's prompt kernels; any other GPU never reaches this module.
 """
 
@@ -41,12 +47,16 @@ import triton
 import triton.language as tl
 
 from . import attention as attn_mod
-from .kvquant import dequant_group_8
+from .attention import _tile
+from .kvquant import dequant_group_8, h32
 
 ENV = "TENSORFOLD_THOR_QSA"
+ENV_ATTN = "TENSORFOLD_THOR_QSA_ATTN"
 CAPABILITY = (11, 0)
 STAGES = 2                  # the attention chunk kernel's pipeline depth on the shadow (bf16 loads)
 SCORE_ROWS, SCORE_BLOCKS = 32, 128
+ROW_TILE, ROW_WARPS, ROW_STAGES = 64, 4, 2      # _row_attn: keys a tile, warps, pipeline depth (k4qa-r1 sweep)
+SELECT_WARPS = {16384: 4, 32768: 8}    # _select_rows' warps by row width (blocks, a power of 2; 4 below; k4qa-r1)
 
 
 def _off() -> bool:
@@ -63,6 +73,7 @@ def available(device: int = 0) -> bool:
 class _State:
     active = False          # prompt passes take this path (``prepare`` turns it on)
     shadow = False          # the cache is 8-bit: prompt buffers hold a bf16 shadow of one layer's keys and values
+    attn = os.environ.get(ENV_ATTN, "1").strip().lower() not in ("0", "off", "false", "no")   # THOR-K4-QSA-ATTN
 
 
 S = _State()
@@ -97,6 +108,12 @@ def set_active(on: bool) -> None:
     """This path (True) or TensorFold's prompt kernels (False), once prepared: for A/B runs and tests."""
 
     S.active = bool(on) and available()
+
+
+def set_attn(on: bool) -> None:
+    """THOR-K4-QSA-ATTN's kernels (True) or THOR-K4-QSA's (False): for A/B runs and tests."""
+
+    S.attn = bool(on)
 
 
 def shadow_bytes(capacity: int, kv_heads: int, head_dim: int) -> int:
@@ -284,29 +301,142 @@ def _scores(IQ, POOLED, POS0, SC, NB, R, HI: tl.constexpr, DI: tl.constexpr, RAT
         tl.store(SC + rr[:, None].to(tl.int64) * NB + b[None, :], tot, mask=ok)
 
 
+@triton.jit
+def _select_rows(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.constexpr, IDW: tl.constexpr,
+                 BLOCK: tl.constexpr):
+    """``attention._select`` with 32-bit keys (its search finds the same cut: the largest t with at least TOP keys
+    >= t), so a row needs half the registers and an SM holds several rows: the same lists, bit for bit."""
+
+    r = tl.program_id(0)
+    end = tl.load(POS0) + r + 1
+    complete = end // RATIO
+    if complete <= TOP:
+        tl.store(NKR + r, end)
+        tl.store(SPR + r, 0)
+    else:
+        b = tl.arange(0, BLOCK)
+        ok = b < complete
+        v = tl.load(SC + r.to(tl.int64) * NB + b, mask=ok, other=0.0)
+        bits = v.to(tl.uint32, bitcast=True)
+        key = tl.where((bits & 0x80000000) != 0, ~bits, bits | 0x80000000)
+        key = tl.where(ok, key, 0)
+        lo = tl.zeros((), dtype=tl.uint32)
+        hi = tl.full((), 0xFFFFFFFF, dtype=tl.uint32)
+        for _ in range(32):                             # 2^32 candidates halve to one
+            span = hi - lo
+            mid = lo + span // 2 + (span & 1)           # ceil((lo + hi) / 2) without overflow
+            count = tl.sum(tl.where(key >= mid, 1, 0), axis=0)
+            take = count >= TOP
+            lo = tl.where(take, mid, lo)
+            hi = tl.where(take, hi, mid - 1)
+        cut = lo
+        above = ok & (key > cut)
+        equal = ok & (key == cut)
+        need = TOP - tl.sum(above.to(tl.int32), axis=0)
+        rank = tl.cumsum(equal.to(tl.int32), axis=0)
+        chosen = above | (equal & (rank <= need))
+        place = tl.cumsum(chosen.to(tl.int32), axis=0) - 1
+        for k in tl.static_range(RATIO):
+            tl.store(IDS + r * IDW + place * RATIO + k, b * RATIO + k, mask=chosen)
+        t = tl.arange(0, RATIO)
+        tail = RATIO * complete + t
+        tl.store(IDS + r * IDW + TOP * RATIO + t, tail, mask=tail < end)
+        tl.store(NKR + r, TOP * RATIO + end - RATIO * complete)
+        tl.store(SPR + r, 1)
+
+
+def select(scratch, pos0: torch.Tensor, rows: int, blocks: int, warps: int | None = None) -> None:
+    """``attention._launch_select``'s lists: ``_select_rows`` up to 32,768 blocks a row, TensorFold's tiled
+    selection past them."""
+
+    width = max(16, triton.next_power_of_2(blocks))
+    if width > attn_mod.SELECT_REGS:
+        attn_mod._launch_select(scratch, pos0, rows, blocks)
+        return
+    _select_rows[(rows,)](scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, scratch.nb,
+                          RATIO=scratch.ratio, TOP=scratch.budget // scratch.ratio, IDW=scratch.idw, BLOCK=width,
+                          num_warps=warps or SELECT_WARPS.get(width, 4))
+
+
 def qsa_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch, rows: int, *,
              context: int | None = None) -> None:
-    """``attention.qsa_rows`` with tensor-core scores: the blocks of rows P0 .. P0 + rows - 1, selected by
-    TensorFold's own selection."""
+    """``attention.qsa_rows`` with tensor-core scores: the blocks of rows P0 .. P0 + rows - 1, selected as
+    TensorFold selects them (``select``; THOR-K4-QSA: TensorFold's own selection)."""
 
     ratio = scratch.ratio
     blocks = scratch.nb if context is None else min(scratch.nb, max(1, triton.cdiv(context, ratio)))
     _scores[(triton.cdiv(rows, SCORE_ROWS), triton.cdiv(blocks, SCORE_BLOCKS))](
         iq, pooled, pos0, scratch.scores, scratch.nb, rows, HI=iq.shape[1], DI=pooled.shape[1], RATIO=ratio,
         TOP=scratch.budget // ratio, TR=SCORE_ROWS, BB=SCORE_BLOCKS, num_warps=8)
-    attn_mod._launch_select(scratch, pos0, rows, blocks)
+    if S.attn:
+        select(scratch, pos0, rows, blocks)
+    else:
+        attn_mod._launch_select(scratch, pos0, rows, blocks)
 
 
 # ----------------------------------------------------------------------------------------------------- attention
 
+@triton.jit
+def _row_attn(Q, KC, VC, POS0, IDS, NKR, SPR, OUT, H: tl.constexpr, HK: tl.constexpr, D: tl.constexpr,
+              G: tl.constexpr, SCALE: tl.constexpr, IDW: tl.constexpr, QSA: tl.constexpr, BITS: tl.constexpr,
+              BT: tl.constexpr):
+    """Row r's attention for KV head hk over its whole key list (a sparse row's through IDS) in one pass: the online
+    softmax of ``attention._tile`` over the list's BT-key tiles in order, then o / l, rotated back for an 8-bit
+    cache's shadow. Only the row's own keys, in its own order, enter its sums."""
+
+    r = tl.program_id(0)
+    hk = tl.program_id(1)
+    n = tl.load(POS0) + r + 1
+    sparse = False
+    if QSA:
+        sparse = tl.load(SPR + r) != 0
+        n = tl.where(sparse, tl.load(NKR + r), n)
+    gg = tl.arange(0, 16)
+    d = tl.arange(0, D)
+    q = tl.load(Q + (r * H + hk * G + gg[:, None]) * D + d[None, :], mask=gg[:, None] < G, other=0.0)
+    m = tl.full((16,), float("-inf"), tl.float32)
+    l = tl.zeros((16,), tl.float32)
+    o = tl.zeros((16, D), tl.float32)
+    for t in range(0, tl.cdiv(n, BT)):
+        ki = t * BT + tl.arange(0, BT)
+        valid = ki < n
+        if QSA:
+            if sparse:
+                ki = tl.load(IDS + r * IDW + ki, mask=valid, other=0)
+        off = (ki[:, None].to(tl.int64) * HK + hk) * D + d[None, :]
+        kk = tl.load(KC + off, mask=valid[:, None], other=0.0)
+        vv = tl.load(VC + off, mask=valid[:, None], other=0.0)
+        m, l, o = _tile(q, kk, vv, m, l, o, valid, SCALE)
+    result = o / l[:, None]
+    if BITS:
+        result = tl.reshape(h32(tl.reshape(result, (16 * D // 32, 32)), M=16 * D // 32), (16, D))
+    tl.store(OUT + (r * H + hk * G + gg[:, None]) * D + d[None, :], result.to(tl.bfloat16), mask=gg[:, None] < G)
+
+
+def row_attention(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, pos0: torch.Tensor, scratch, rows: int,
+                  scale: float, out: torch.Tensor, *, bits: int, tile: int | None = None, warps: int | None = None,
+                  stages: int | None = None) -> torch.Tensor:
+    """``_row_attn`` for rows P0 .. P0 + rows - 1 on bf16 keys and values (the shadow or a bf16 cache)."""
+
+    _, h, d = q.shape
+    hk = kc.shape[1]
+    _row_attn[(rows, hk)](q, kc, vc, pos0, scratch.ids, scratch.nk, scratch.sparse, out, H=h, HK=hk, D=d, G=h // hk,
+                          SCALE=scale, IDW=scratch.idw, QSA=scratch.qsa, BITS=bits, BT=tile or ROW_TILE,
+                          num_warps=warps or ROW_WARPS, num_stages=stages or ROW_STAGES)
+    return out
+
+
 def attention(q: torch.Tensor, cache, shadow: Shadow | None, pos0: torch.Tensor, scratch, rows: int, scale: float,
               out: torch.Tensor, *, context: int, bits: int) -> torch.Tensor:
-    """``attention.attention`` for a prompt block: TensorFold's chunk kernel on the bf16 shadow (an 8-bit cache) or
-    the bf16 cache, two pipeline stages, then its merge, which rotates the output back for the 8-bit cache."""
+    """``attention.attention`` for a prompt block on the bf16 shadow (an 8-bit cache) or the bf16 cache:
+    ``row_attention`` (THOR-K4-QSA: TensorFold's chunk kernel, two pipeline stages, then its merge, which rotates
+    the output back for the 8-bit cache)."""
 
     _, h, d = q.shape
     hk = cache.k.shape[1]
     kc, vc = (shadow.k, shadow.v) if bits else (cache.k, cache.v)
+    if S.attn:
+        return row_attention(q, kc, vc, pos0, scratch, rows, scale, out, bits=bits)
     nch = scratch.nch
     keys = context
     if scratch.qsa:
