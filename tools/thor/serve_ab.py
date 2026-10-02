@@ -15,7 +15,8 @@ In this order, every request counted (no warm-up exclusion), thinking off, greed
   last assistant start, which the next turn shares);
 - decode: one stream (a short prompt, --decode tokens, end tokens ignored), then --streams at once (other prompts): each
   stream's decode tok/s as the server reports it (tokens after the first over the time after its prefill), and all
-  streams' tokens after their first over the wall time from the earliest first token to the last end.
+  streams' tokens after their first over the wall time from the earliest first token to the last end; each stream's
+  MTP acceptance and tokens a round (the server's ``speculative`` figures), which near-tie flips can move.
 Each reply's token hash (the server's ``token_sha``) is kept: two builds gave the same greedy text where they match.
 Standard library only.
 """
@@ -60,7 +61,7 @@ def chat(base: str, model: str, messages: list[dict], max_tokens: int, *, ignore
                                  {"Content-Type": "application/json", "Accept": "text/event-stream"})
     t0 = time.perf_counter()
     first = None
-    usage, stats, pieces = {}, {}, []
+    usage, stats, spec, pieces = {}, {}, {}, []
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.strip()
@@ -80,6 +81,7 @@ def chat(base: str, model: str, messages: list[dict], max_tokens: int, *, ignore
             pieces.append(delta.get("content") or delta.get("reasoning_content") or "")
             usage = event.get("usage") or usage
             stats = event.get("tensorfold") or stats
+            spec = event.get("speculative") or spec
     end = time.perf_counter()
     first = first if first is not None else end
     prompt = int(usage.get("prompt_tokens") or 0)
@@ -90,7 +92,8 @@ def chat(base: str, model: str, messages: list[dict], max_tokens: int, *, ignore
             "tok_s": round((prompt - cached) / ttft, 1) if prompt and ttft > 0 else None,
             "server_ttft_s": stats.get("time_to_first_token"), "server_prefill_s": stats.get("prefill_seconds"),
             "server_decode_tok_s": stats.get("tokens_per_second"), "token_sha": stats.get("token_sha"),
-            "drafts": stats.get("drafts"), "text": "".join(pieces)}
+            "drafts": stats.get("drafts"), "acceptance": spec.get("acceptance_rate"),
+            "tokens_per_round": spec.get("tokens_per_round"), "text": "".join(pieces)}
 
 
 def public(row: dict) -> dict:
@@ -142,7 +145,8 @@ def main() -> None:
     report["decode"]["one"] = public(one)
     print(f"{tag} decode 1 stream: {one['completion_tokens']} tokens, server {one['server_decode_tok_s'] or 0:.1f} "
           f"tok/s, client {(one['completion_tokens'] - 1) / (one['end'] - one['first']):.1f} tok/s after the first; "
-          f"sha {one['token_sha']}", flush=True)
+          f"MTP acceptance {one['acceptance']}, {one['tokens_per_round']} tokens a round; sha {one['token_sha']}",
+          flush=True)
     rows: list = [None] * args.streams
 
     def go(i: int) -> None:
@@ -161,8 +165,10 @@ def main() -> None:
     report["decode"]["many"] = {"streams": [public(r) for r in rows], "wall_tok_s": agg,
                                 "server_sum_tok_s": sum(r["server_decode_tok_s"] or 0 for r in rows)}
     each = " / ".join(f"{r['server_decode_tok_s'] or 0:.1f}" for r in rows)
+    accepted = " / ".join(f"{r['acceptance'] or 0:.3f}" for r in rows)
     print(f"{tag} decode {args.streams} streams: server {each} tok/s (sum "
-          f"{report['decode']['many']['server_sum_tok_s']:.1f}), wall {agg:.1f} tok/s", flush=True)
+          f"{report['decode']['many']['server_sum_tok_s']:.1f}), wall {agg:.1f} tok/s; MTP acceptance {accepted}",
+          flush=True)
     save()
 
 
