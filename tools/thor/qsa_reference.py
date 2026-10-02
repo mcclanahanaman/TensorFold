@@ -110,7 +110,14 @@ def attend(q: torch.Tensor, kc: torch.Tensor, vc: torch.Tensor, p0: int, scratch
             sp = scratch.sparse[r0:r0 + n] != 0
             if bool(sp.any()):
                 ids = scratch.ids[r0:r0 + n].long()
-                ok = torch.arange(width, device=dev)[None, :] < scratch.nk[r0:r0 + n, None].long()
+                # the sparse rows' lists only: a dense row's nk is its length, and its slots still hold an earlier
+                # prompt's selections (keys past this prompt's end: the gate run's out-of-bounds scatter)
+                ok = (torch.arange(width, device=dev)[None, :] < scratch.nk[r0:r0 + n, None].long()) & sp[:, None]
+                bad = ok & ((ids < 0) | (ids >= end[:, None]))
+                if bool(bad.any()):
+                    row = int(torch.nonzero(bad.any(1))[0, 0])
+                    raise RuntimeError(f"qsa_reference: row {p0 + r0 + row}'s key list holds a key past its end "
+                                       f"({int(ids[row][bad[row]][0])} of {int(end[row])} keys)")
                 sel = torch.zeros((n, ctx + 1), dtype=torch.bool, device=dev)
                 sel.scatter_(1, torch.where(ok, ids, torch.full_like(ids, ctx)), True)   # column ctx: unused slots
                 mask = torch.where(sp[:, None], sel, mask)
