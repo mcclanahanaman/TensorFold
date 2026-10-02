@@ -51,3 +51,35 @@ def test_speedups_and_main(tmp_path, capsys):
     assert got["speedups"]["nat32k"]["8192"]["attn_thor_ms/attn_new_ms"] == 2.5
     text = capsys.readouterr().out
     assert "| nat32k | 8192 |" in text
+
+
+SEL_ROWS = [
+    {"prompt": "nat32k", "layer": "3", "p0": 8192, "rows": 256, "select_tf_ms": 0.4, "select_new_ms": 0.3,
+     "select_sel_ms": 0.05, "select_new_equal": True, "select_sel_equal": True},
+    {"prompt": "nat32k", "layer": "7", "p0": 8192, "rows": 256, "select_tf_ms": 0.6, "select_new_ms": 0.5,
+     "select_sel_ms": 0.1, "select_new_equal": True, "select_sel_equal": True},
+    {"prompt": "syn128k", "layer": "3", "p0": 130816, "rows": 256, "select_tf_ms": 2.0, "select_new_ms": 1.5,
+     "select_sel_ms": 0.25, "select_sel_equal": False},
+]
+
+
+def test_the_cuda_selection_columns():
+    """THOR-K4-QSA-SEL: the CUDA selection's time, its speedups over TensorFold's selection and the Triton 32-bit one,
+    and whether its lists equal TensorFold's on every layer of a slice."""
+
+    s = ks.summarize(SEL_ROWS)
+    a, b = s["nat32k"]["8192"], s["syn128k"]["130816"]
+    assert abs(a["select_sel_ms"] - 0.075) < 1e-12 and a["select_sel_equal"] is True
+    assert b["select_sel_equal"] is False
+    assert ("select_tf_ms", "select_sel_ms") in ks.DEFAULT_PAIRS
+    assert ("select_new_ms", "select_sel_ms") in ks.DEFAULT_PAIRS
+    sp = ks.speedups(s, ks.DEFAULT_PAIRS)
+    assert abs(sp["nat32k"]["8192"]["select_tf_ms/select_sel_ms"] - 0.5 / 0.075) < 1e-12
+    assert abs(sp["syn128k"]["130816"]["select_new_ms/select_sel_ms"] - 6.0) < 1e-12
+    lines = ks.markdown(s, sp).splitlines()
+    head = [c.strip() for c in lines[0].strip("|").split("|")]
+    assert len(head) == 17 and head[-3:] == ["select sel ms", "select tf/sel", "sel equal"]
+    assert head[:14] == [c.strip() for c in ks.HEADER.strip("|").split("|")][:14]
+    assert lines[1] == "|---" * 17
+    assert [c.strip() for c in lines[2].strip("|").split("|")][-3:] == ["0.075", "6.67", "yes"]
+    assert [c.strip() for c in lines[3].strip("|").split("|")][-3:] == ["0.250", "8.00", "no"]
