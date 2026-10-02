@@ -398,16 +398,17 @@ def _warm(ex: ThorExperts, scr: Scratch, top_k: int, prompt: bool, grouped, dev)
         lo = top + 1
 
 
+def config_scratch_bytes(t: dict, rows: int) -> int:
+    """The scratch a buffer set of ``rows`` rows holds (``Scratch``), from the checkpoint's config ``t``."""
+
+    return scratch_bytes(rows, int(t["num_experts_per_tok"]), int(t["num_experts"]), int(t["moe_intermediate_size"]),
+                         int(t["hidden_size"]))
+
+
 def admission(geometry, decode_rows: int, prompt_rows: int | None = None):
     """The engine's geometry plus the Thor experts' fixed scratch: a decode window's and a prompt chunk's rows."""
 
     from tensorfold.cuda.geometry import PREFILL_ROWS, with_fixed
 
     rows = (decode_rows, decode_rows, prompt_rows or PREFILL_ROWS)   # decode windows, the MTP head's, a prompt chunk
-
-    def extra(t: dict) -> int:
-        experts, top_k = int(t["num_experts"]), int(t["num_experts_per_tok"])
-        width, dims = int(t["moe_intermediate_size"]), int(t["hidden_size"])
-        return sum(scratch_bytes(r, top_k, experts, width, dims) for r in rows)
-
-    return lambda text: with_fixed(geometry(text), extra(text))
+    return lambda text: with_fixed(geometry(text), sum(config_scratch_bytes(text, r) for r in rows))

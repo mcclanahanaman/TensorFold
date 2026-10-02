@@ -94,13 +94,16 @@ class FlashNextEngine:
                     if streams > 1 else
                     (lambda text: gdn_geometry(text, tp, each, indexed=True, mtp=mtp, kv_bits=bits,
                                                kept=KEEP_SERIAL + 1, prefill_rows=rows0)))
+        thor_rows = None                             # Thor's NVFP4 path: its own bytes for a prompt piece's rows
         if exl3:
             geometry = admission(geometry)
         elif quant_method(read_config(model_dir)) == "modelopt":
             from tensorfold.cuda.nvfp4 import thor_experts
 
-            if thor_experts.available():             # Thor (sm_110) experts: their scratch counts before the caches
+            experts_on = thor_experts.available()
+            if experts_on:                           # Thor (sm_110) experts: their scratch counts before the caches
                 geometry = thor_experts.admission(geometry, streams * each if streams > 1 else max(8, each))
+            thor_rows = (lambda text, rows: thor_experts.config_scratch_bytes(text, rows) if experts_on else 0)
             from tensorfold.cuda.nvfp4 import thor_dense
 
             if thor_dense.available():               # Thor's prompt GEMMs: bf16 copies or a staging buffer, counted
@@ -119,7 +122,7 @@ class FlashNextEngine:
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
         self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
             self.capacity_plan, config(model_dir), torch.cuda.get_device_capability(), world=tp, vision=vision,
-            fp8=prompt_precision.fp8())
+            fp8=prompt_precision.fp8(), thor=thor_rows)
         if prompt_workspace:
             peak = self.capacity_plan["total_bytes_estimate"] / 2**30
             print(f"[tensorfold] {self.prefill_rows}-row idle prompt workspace {prompt_workspace / 2**30:.2f} GiB; "
