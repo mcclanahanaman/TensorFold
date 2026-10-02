@@ -96,6 +96,20 @@ def test_pairs_keep_their_bits_alone_among_others_and_across_tactics(layer):
         assert torch.equal(small[:, :TOP], big[lo:lo + n, :TOP]), (lo, n)
 
 
+@pytest.mark.parametrize("rows", [4096, 8192])
+def test_wide_prompt_pieces_keep_each_pairs_bits_across_the_2048_row_tactic(layer, rows):
+    """Pieces wider than 2048 rows (TENSORFOLD_PREFILL_ROWS) take the cluster (2, 1) tactic; each pair keeps the bits
+    it has in a 2048-row call (the released pieces' tactic) and in a smaller one."""
+
+    ex = layer[0]
+    assert thor.tactic(rows)[1] != thor.tactic(2048)[1]
+    x, picks = _x(rows, 5), _picks(rows, 6)
+    wide = _run(ex, x, picks)
+    for lo, n in ((0, 2048), (rows - 2048, 2048), (1000, 700)):
+        part = _run(ex, x[lo:lo + n].contiguous(), picks[lo:lo + n].contiguous())
+        assert torch.equal(part[:, :TOP], wide[lo:lo + n, :TOP]), (lo, n)
+
+
 def test_a_captured_call_replays_any_routing(layer):
     ex = layer[0]
     rows = 8
