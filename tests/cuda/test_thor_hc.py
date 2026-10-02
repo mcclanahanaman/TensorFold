@@ -79,15 +79,29 @@ def test_the_fused_down_projection_stores_the_readouts_act_and_gates(rows: int, 
         assert _same(inj, inj0)
 
 
-@pytest.mark.parametrize("block_n,warps,stages", [(64, 4, 3), (128, 4, 3), (64, 8, 2), (128, 8, 4)])
-def test_the_fused_down_projections_bits_do_not_depend_on_its_tiles(block_n: int, warps: int, stages: int) -> None:
+@pytest.mark.parametrize("bm,block_n,warps,stages", [(64, 128, 8, 3), (128, 64, 4, 3), (64, 64, 4, 2),
+                                                     (128, 128, 8, 4)])
+def test_the_fused_down_projections_bits_do_not_depend_on_its_tiles(bm: int, block_n: int, warps: int,
+                                                                   stages: int) -> None:
     down, up, scale = _weights(12)
     h, pss = _h(300, 5)
     act0, inj0, _, _, _ = _reference(h, pss, scale, down, up, True)
     act, inj = torch.empty_like(act0), torch.empty_like(inj0)
-    thor_hc.down_act(h, pss, scale, down, act, inj, S, LOW, EPS, block_n=block_n, num_warps=warps,
+    thor_hc.down_act(h, pss, scale, down, act, inj, S, LOW, EPS, bm=bm, block_n=block_n, num_warps=warps,
                      num_stages=stages)
     assert _same(act, act0) and _same(inj, inj0)
+
+
+@pytest.mark.parametrize("bm,db,warps,stages", [(64, 64, 8, 2), (128, 64, 4, 2), (64, 32, 4, 2), (128, 32, 8, 3)])
+def test_the_four_stream_up_projection_mixes_as_the_general_kernel(bm: int, db: int, warps: int, stages: int) -> None:
+    down, up, scale = _weights(18)
+    h, pss = _h(333, 21)
+    act, _, upv, _, _ = _reference(h, pss, scale, down, up, True)
+    want, got = torch.empty((333, D), dtype=torch.bfloat16, device=DEV), torch.full((333, D), 7.0, device=DEV,
+                                                                                   dtype=torch.bfloat16)
+    thor_hc.upmix(act, up.weight, h, pss, scale, want, S, EPS, up=torch.empty_like(upv))     # _upmix_h
+    thor_hc.upmix(act, up.weight, h, pss, scale, got, S, EPS, bm=bm, db=db, num_warps=warps, num_stages=stages)
+    assert _same(got, want)
 
 
 def test_a_row_keeps_its_bits_whatever_rows_share_its_tile() -> None:

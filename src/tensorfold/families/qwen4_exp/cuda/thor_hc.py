@@ -9,13 +9,15 @@ and ``normed`` is written once and read twice. Here, for prompt passes:
 
 - ``_down_act``: the down projection reads the streams ``h`` and normalizes them as it loads them (the very
   expression of ``glue._hc_normed``: bf16(h x rinv x scale), rinv from the write-back's 256-column partial sums in
-  order), sums the same 32 K slices in one program (each slice on its own fp32 accumulator, the same tensor-core dot
-  of 64-column blocks as ``bf16._b16mm``, then added to the running total in slice order from slice 0, as ``_reduce``
-  does) and applies ``glue._hc_act``'s activation and inject gates to the total: no partials, no ``normed``;
+  order), sums the same 32 K slices in one loop of one program (each slice on its own fp32 accumulator, the same
+  tensor-core dot of 64-column blocks as ``bf16._b16mm``, then added to the running total in slice order from slice
+  0, as ``_reduce`` does) and applies ``glue._hc_act``'s activation and inject gates to the total: no partials, no
+  ``normed``;
 - ``_mix_h``: ``glue._hc_mix`` with ``normed`` recomputed from ``h`` (the same expression), after the up projection;
-- ``_upmix_h`` (only where a startup check finds it bit-equal to the up projection it replaces, see ``prepare``): the
-  up projection's 64-column blocks for the four streams of a tile on the tensor cores, rounded to bf16, then the mix
-  in the same program: ``up`` is never stored.
+- ``_upmix4`` (``_upmix_h`` for other stream counts; only where a startup check finds it bit-equal to the up
+  projection it replaces, see ``prepare``): the up projection's 64-column blocks for the four streams of a tile on the
+  tensor cores, each stream on its own accumulator, rounded to bf16, then the mix in the same program: ``up`` is never
+  stored.
 
 Exactness. Every value these kernels store is the stored value of the kernels they replace, bit for bit: the same
 products summed in the same order, the same roundings, the same elementwise expressions (``glue._bsig``,
@@ -42,10 +44,10 @@ from .glue import _bsig, _bsilu
 
 ENV = "TENSORFOLD_THOR_HC_FUSE"
 CAPABILITY = (11, 0)
-BM, BK = 128, 64                # the down projection's row tile and K block (bf16._b16mm's prompt tile)
-DOWN_N, DOWN_WARPS, DOWN_STAGES = 64, 4, 3      # its column tile, warps and pipeline depth
+BK = 64                         # the K block of every dot (bf16._b16mm's): a slice of 320 is 5 of them
+DOWN_BM, DOWN_N, DOWN_WARPS, DOWN_STAGES = 64, 128, 8, 3    # _down_act: tile, warps, pipeline depth (hcf-t2)
 MIX_BLOCK = 256                 # _mix_h: dims a program (glue.hc_mix's)
-UP_BM, UP_DB, UP_WARPS, UP_STAGES = 128, 64, 4, 3   # _upmix_h: rows and dims a program, warps, pipeline depth
+UP_BM, UP_DB, UP_WARPS, UP_STAGES = 64, 64, 8, 2            # _upmix4: rows and dims a program, warps, depth (hcf-t2)
 
 
 def _off() -> bool:
@@ -84,41 +86,45 @@ def use(hc) -> bool:
 @triton.jit(do_not_specialize=["M"])
 def _down_act(H, PSS, SCALE, W, ACT, INJ, M, eps,
               N: tl.constexpr, D: tl.constexpr, S: tl.constexpr, NC: tl.constexpr, SK: tl.constexpr,
-              LOW: tl.constexpr, HAS_INJ: tl.constexpr, BM: tl.constexpr, BLOCK_N: tl.constexpr, BK: tl.constexpr):
+              LOW: tl.constexpr, HAS_INJ: tl.constexpr, BM: tl.constexpr, BLOCK_N: tl.constexpr, BK: tl.constexpr,
+              STAGES: tl.constexpr):
     """Program (row tile, column tile), column tiles of a row tile adjacent: the normalized streams [BM, S*D] @ W.T
-    for W's first N rows, K in bf16.split_k's SK slices (each on a fresh fp32 accumulator, BK blocks in order, then
-    added to the total in slice order), then hc_act's SiLU (columns < LOW) and inject gates (LOW..N-1, N <= LOW + S)
-    of the total."""
+    for W's first N rows in one loop over the K blocks: each of bf16.split_k's SK slices on a fresh fp32 accumulator
+    (its BK blocks in order), added to the total at the slice's end in slice order; then hc_act's SiLU (columns <
+    LOW) and inject gates (LOW..N-1, N <= LOW + S) of the total."""
 
     K: tl.constexpr = S * D
     NT: tl.constexpr = (N + BLOCK_N - 1) // BLOCK_N
     KS: tl.constexpr = K // SK                  # a slice's K
     NB: tl.constexpr = KS // BK                 # BK blocks a slice
-    PER: tl.constexpr = D // KS                 # slices a stream
+    PERB: tl.constexpr = D // BK                # BK blocks a stream
+    SP: tl.constexpr = triton.next_power_of_2(S)
     pid = tl.program_id(0)
     pid_m = pid // NT
     pid_n = pid % NT
     rm = pid_m * BM + tl.arange(0, BM)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rk = tl.arange(0, BK)
+    rs = tl.arange(0, SP)
     m_ok = rm < M
     n_ok = rn < N
+    t = tl.zeros((BM, SP), dtype=tl.float32)
+    for c in tl.static_range(NC):               # glue._hc_normed's rinv: each stream's partial sums in order
+        t += tl.load(PSS + (rm[:, None] * NC + c) * S + rs[None, :], mask=m_ok[:, None] & (rs < S)[None, :], other=0.0)
+    rinvs = 1.0 / tl.sqrt(t / D + eps)
     total = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
-    for st in range(S):
-        t = tl.zeros((BM,), dtype=tl.float32)
-        for c in range(NC):                     # glue._hc_normed's rinv: the stream's partial sums in order
-            t += tl.load(PSS + (rm * NC + c) * S + st, mask=m_ok, other=0.0)
-        rinv = 1.0 / tl.sqrt(t / D + eps)
-        for j in range(PER):
+    acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
+    for kb in tl.range(0, SK * NB, num_stages=STAGES):
+        k0 = kb * BK
+        rinv = tl.sum(tl.where(rs[None, :] == kb // PERB, rinvs, 0.0), axis=1)    # the block's stream: exact
+        hv = tl.load(H + rm[:, None] * K + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
+        sc = tl.load(SCALE + k0 + rk).to(tl.float32)
+        x = (hv * rinv[:, None] * sc[None, :]).to(tl.bfloat16)
+        w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
+        acc = tl.dot(x, tl.trans(w), acc)
+        if kb % NB == NB - 1:                   # a slice's end: _reduce's order, slice 0 as is, then + each slice
+            total = tl.where(kb == NB - 1, acc, total + acc)
             acc = tl.zeros((BM, BLOCK_N), dtype=tl.float32)
-            for i in range(NB):
-                k0 = (st * PER + j) * KS + i * BK
-                hv = tl.load(H + rm[:, None] * K + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
-                sc = tl.load(SCALE + k0 + rk).to(tl.float32)
-                x = (hv * rinv[:, None] * sc[None, :]).to(tl.bfloat16)
-                w = tl.load(W + rn[:, None] * K + (k0 + rk)[None, :], mask=n_ok[:, None], other=0.0)
-                acc = tl.dot(x, tl.trans(w), acc)
-            total = tl.where(st * PER + j == 0, acc, total + acc)     # _reduce: slice 0, then + each slice in order
     v = (total / S).to(tl.bfloat16).to(tl.float32)
     a = _bsilu(v)
     tl.store(ACT + rm[:, None] * LOW + rn[None, :], a.to(tl.bfloat16), mask=m_ok[:, None] & (rn < LOW)[None, :])
@@ -184,9 +190,58 @@ def _upmix_h(ACT, W, H, PSS, SCALE, MIXED, UP, M, eps,
     tl.store(MIXED + rm[:, None] * D + dd[None, :], (total / S).to(tl.bfloat16), mask=m_ok[:, None])
 
 
+@triton.jit(do_not_specialize=["M"])
+def _upmix4(ACT, W, H, PSS, SCALE, MIXED, M, eps,
+            D: tl.constexpr, S: tl.constexpr, LOW: tl.constexpr, NC: tl.constexpr,
+            BM: tl.constexpr, DB: tl.constexpr, BK: tl.constexpr, STAGES: tl.constexpr):
+    """_upmix_h for four streams: the four streams' dot chains side by side (each its own fp32 accumulator over the
+    BK blocks in order, an act block loaded once for all four), then the mix in stream order."""
+
+    tl.static_assert(S == 4)
+    rm = tl.program_id(0) * BM + tl.arange(0, BM)
+    dd = tl.program_id(1) * DB + tl.arange(0, DB)
+    rk = tl.arange(0, BK)
+    m_ok = rm < M
+    acc0 = tl.zeros((BM, DB), dtype=tl.float32)
+    acc1 = tl.zeros((BM, DB), dtype=tl.float32)
+    acc2 = tl.zeros((BM, DB), dtype=tl.float32)
+    acc3 = tl.zeros((BM, DB), dtype=tl.float32)
+    for k0 in tl.range(0, LOW, BK, num_stages=STAGES):
+        a = tl.load(ACT + rm[:, None] * LOW + (k0 + rk)[None, :], mask=m_ok[:, None], other=0.0)
+        w0 = tl.load(W + (0 * D + dd)[:, None] * LOW + (k0 + rk)[None, :])
+        w1 = tl.load(W + (1 * D + dd)[:, None] * LOW + (k0 + rk)[None, :])
+        w2 = tl.load(W + (2 * D + dd)[:, None] * LOW + (k0 + rk)[None, :])
+        w3 = tl.load(W + (3 * D + dd)[:, None] * LOW + (k0 + rk)[None, :])
+        acc0 = tl.dot(a, tl.trans(w0), acc0)
+        acc1 = tl.dot(a, tl.trans(w1), acc1)
+        acc2 = tl.dot(a, tl.trans(w2), acc2)
+        acc3 = tl.dot(a, tl.trans(w3), acc3)
+    total = tl.zeros((BM, DB), dtype=tl.float32)
+    for s in tl.static_range(S):
+        n = s * D + dd
+        t = tl.zeros((BM,), dtype=tl.float32)
+        for c in tl.static_range(NC):
+            t += tl.load(PSS + (rm * NC + c) * S + s, mask=m_ok, other=0.0)
+        rinv = 1.0 / tl.sqrt(t / D + eps)
+        hv = tl.load(H + rm[:, None] * (S * D) + n[None, :], mask=m_ok[:, None], other=0.0).to(tl.float32)
+        sc = tl.load(SCALE + n).to(tl.float32)
+        nv = (hv * rinv[:, None] * sc[None, :]).to(tl.bfloat16).to(tl.float32)
+        if s == 0:
+            acc = acc0
+        elif s == 1:
+            acc = acc1
+        elif s == 2:
+            acc = acc2
+        else:
+            acc = acc3
+        up = acc.to(tl.bfloat16).to(tl.float32)
+        total += (_bsig(up) * nv).to(tl.bfloat16).to(tl.float32)
+    tl.store(MIXED + rm[:, None] * D + dd[None, :], (total / S).to(tl.bfloat16), mask=m_ok[:, None])
+
+
 def down_act(h: torch.Tensor, pss: torch.Tensor, scale: torch.Tensor, down, act: torch.Tensor,
-             inject: torch.Tensor | None, streams: int, low: int, eps: float, *, block_n: int = DOWN_N,
-             num_warps: int = DOWN_WARPS, num_stages: int = DOWN_STAGES) -> None:
+             inject: torch.Tensor | None, streams: int, low: int, eps: float, *, bm: int = DOWN_BM,
+             block_n: int = DOWN_N, num_warps: int = DOWN_WARPS, num_stages: int = DOWN_STAGES) -> None:
     """``down``: the hyper-connection's bf16 down (+ inject) rows (``bf16.B16``, [low (+ streams), S*D]); writes act
     [R, low] and the inject gates [R, streams] (when ``inject`` is given) as hc_normed, bf16.matmul(f32) and hc_act
     would."""
@@ -202,10 +257,10 @@ def down_act(h: torch.Tensor, pss: torch.Tensor, scale: torch.Tensor, down, act:
     if down.n < used:
         raise ValueError(f"thor_hc.down_act: {down.n} rows, inject gates need {used}")
     nt = -(-used // block_n)
-    _down_act[(triton.cdiv(rows, BM) * nt,)](
+    _down_act[(triton.cdiv(rows, bm) * nt,)](
         h, pss, scale, down.weight, act, inject if inject is not None else act, rows, eps,
-        N=used, D=d, S=streams, NC=pss.shape[1], SK=sk, LOW=low, HAS_INJ=inject is not None, BM=BM,
-        BLOCK_N=block_n, BK=BK, num_warps=num_warps, num_stages=num_stages)
+        N=used, D=d, S=streams, NC=pss.shape[1], SK=sk, LOW=low, HAS_INJ=inject is not None, BM=bm,
+        BLOCK_N=block_n, BK=BK, STAGES=num_stages, num_warps=num_warps)
 
 
 def mix(up: torch.Tensor, h: torch.Tensor, pss: torch.Tensor, scale: torch.Tensor, mixed: torch.Tensor,
@@ -219,16 +274,22 @@ def mix(up: torch.Tensor, h: torch.Tensor, pss: torch.Tensor, scale: torch.Tenso
 def upmix(act: torch.Tensor, up_w: torch.Tensor, h: torch.Tensor, pss: torch.Tensor, scale: torch.Tensor,
           mixed: torch.Tensor, streams: int, eps: float, *, up: torch.Tensor | None = None, bm: int = UP_BM,
           db: int = UP_DB, num_warps: int = UP_WARPS, num_stages: int = UP_STAGES) -> None:
-    """``up_w``: the up projection's bf16 rows [S*D, low]; ``up``: also store the rounded projection (checks)."""
+    """``up_w``: the up projection's bf16 rows [S*D, low]; four streams on ``_upmix4``, else (or with ``up``: also
+    store the rounded projection, for checks) on ``_upmix_h``."""
 
     rows, wide = h.shape
     d, low = wide // streams, act.shape[1]
     if up_w.shape != (wide, low) or low % BK or d % db:
         raise ValueError(f"thor_hc.upmix: up rows {tuple(up_w.shape)} for streams {tuple(h.shape)}")
-    _upmix_h[(triton.cdiv(rows, bm), d // db)](
+    if streams == 4 and up is None:
+        _upmix4[(triton.cdiv(rows, bm), d // db)](
+            act, up_w, h, pss, scale, mixed, rows, eps, D=d, S=streams, LOW=low, NC=pss.shape[1], BM=bm, DB=db,
+            BK=BK, STAGES=num_stages, num_warps=num_warps)
+        return
+    _upmix_h[(triton.cdiv(rows, 128), d // 64)](
         act, up_w, h, pss, scale, mixed, up if up is not None else mixed, rows, eps,
-        D=d, S=streams, LOW=low, NC=pss.shape[1], BM=bm, DB=db, BK=BK, STORE_UP=up is not None,
-        num_warps=num_warps, num_stages=num_stages)
+        D=d, S=streams, LOW=low, NC=pss.shape[1], BM=128, DB=64, BK=BK, STORE_UP=up is not None,
+        num_warps=4, num_stages=3)
 
 
 def _up_ref(act: torch.Tensor, lin, out: torch.Tensor) -> torch.Tensor:
@@ -288,10 +349,12 @@ def check(hc, rows: int, eps: float, streams: int, low: int, device, seed: int =
     down_act(h, pss, hc.scale, hc.down.b, act1, inj1, streams, low, eps)
     mixed1 = torch.empty_like(mixed0)
     mix(up0, h, pss, hc.scale, mixed1, streams, eps)
-    up2, mixed2 = torch.empty_like(up0), torch.empty_like(mixed0)
-    upmix(act0, hc.up.weight, h, pss, hc.scale, mixed2, streams, eps, up=up2)
+    up2, mixed2, mixed3 = torch.empty_like(up0), torch.empty_like(mixed0), torch.empty_like(mixed0)
+    upmix(act0, hc.up.weight, h, pss, hc.scale, mixed2, streams, eps, up=up2)     # its projection stored too
+    upmix(act0, hc.up.weight, h, pss, hc.scale, mixed3, streams, eps)             # the served kernel
     out = {"rows": rows, "act": same(act0, act1), "inject": same(inj0, inj1) if has_inj else None,
-           "mix": same(mixed0, mixed1), "up_fused": same(up0, up2), "mix_fused": same(mixed0, mixed2)}
+           "mix": same(mixed0, mixed1), "up_fused": same(up0, up2),
+           "mix_fused": same(mixed0, mixed2) and same(mixed0, mixed3)}
     if not out["up_fused"]:
         diff = (up0.float() - up2.float()).abs()
         out["up_fused_mismatch"] = int((up0.view(torch.int16) != up2.view(torch.int16)).sum())
