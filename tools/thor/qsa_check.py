@@ -316,22 +316,47 @@ class Bench:
         res["rows_tf_ms"] = timed(lambda: self.orig_rows(iq, pooled, pos0, scratch, n, context=context))
         if int((sp != 0).sum()):
             res["select_tf_ms"] = timed(lambda: self.am._launch_select(scratch, pos0, n, blocks))
+        attn, sel = tq.S.attn, tq.S.sel
         tq.set_attn(False)                                 # THOR-K4-QSA (r19): TensorFold's selection
+        tq.set_sel(False)
         res["rows_thor_ms"] = timed(lambda: tq.qsa_rows(iq, pooled, pos0, scratch, n, context=context))
         tq.set_attn(True)
         if not res["sparse_rows"]:
+            tq.set_attn(attn)
+            tq.set_sel(sel)
             return
         tc = scratch.scores[:n, :blocks].clone()
         ids_tc = scratch.ids[:n].clone()
         nk_tc, sp_tc = scratch.nk[:n].clone(), scratch.sparse[:n].clone()
+        listed = (sp_tc != 0)[:, None] & (torch.arange(ids_tc.shape[1], device=dev)[None, :] < nk_tc[:, None])
+
+        def same_lists(fn) -> bool:
+            """fn's lists against TensorFold's on Thor's scores, from buffers cleared first (nothing left over)."""
+            scratch.ids[:n].fill_(-1)
+            scratch.nk[:n].fill_(-1)
+            scratch.sparse[:n].fill_(-1)
+            fn()
+            return bool(torch.equal(scratch.nk[:n], nk_tc) and torch.equal(scratch.sparse[:n], sp_tc)
+                        and torch.equal(scratch.ids[:n][listed], ids_tc[listed]))
+
         res["rows_new_ms"] = timed(lambda: tq.qsa_rows(iq, pooled, pos0, scratch, n, context=context))
         res["select_new_ms"] = timed(lambda: tq.select(scratch, pos0, n, blocks))
-        res["select_new_equal"] = bool(torch.equal(scratch.ids[:n], ids_tc) and torch.equal(scratch.nk[:n], nk_tc)
-                                       and torch.equal(scratch.sparse[:n], sp_tc))
+        res["select_new_equal"] = same_lists(lambda: tq.select(scratch, pos0, n, blocks))
         width = max(16, triton.next_power_of_2(blocks))
         for w in [w for w in (2, 4, 8, 16) if width <= 4096 * w]:         # at most 128 keys a thread
             res[f"select_new_ms_w{w}"] = timed(lambda: tq.select(scratch, pos0, n, blocks, warps=w))
-            res["select_new_equal"] &= bool(torch.equal(scratch.ids[:n], ids_tc))
+            res["select_new_equal"] &= same_lists(lambda: tq.select(scratch, pos0, n, blocks, warps=w))
+        tq.set_sel(True)                                   # THOR-K4-QSA-SEL: the CUDA radix select
+        try:
+            res["rows_sel_ms"] = timed(lambda: tq.qsa_rows(iq, pooled, pos0, scratch, n, context=context))
+            res["select_sel_equal"] = True
+            for v in (tq.SEL_VARIANT,):
+                name = "select_sel_ms"
+                res[name] = timed(lambda: tq.select(scratch, pos0, n, blocks, variant=v))
+                res["select_sel_equal"] &= same_lists(lambda: tq.select(scratch, pos0, n, blocks, variant=v))
+        finally:
+            tq.set_attn(attn)
+            tq.set_sel(sel)
         res["scores_equal_frac"] = float((tc == sc_ref)[live].float().mean())
         res["scores_rel_max"] = float(((tc - sc_ref).abs() / sc_ref.abs().clamp_min(1e-6))[live].max())
         rows_sp = torch.nonzero(sp != 0).squeeze(1)
@@ -462,6 +487,65 @@ def kernels(args) -> None:
         bench.prompt = ""
         print(f"[qsa] {name}: done ({got['tok_s']:.0f} tok/s with the benches inside)", flush=True)
     (args.out / "qsa_kernels.json").write_text(json.dumps(bench.results, indent=1))
+
+
+def selall(args) -> None:
+    """THOR-K4-QSA-SEL: in served prompt passes (the Thor path on), every slice's selection (every attention layer and
+    256-row block) against TensorFold's ``_launch_select`` on the same scores; lists, key counts and sparse flags."""
+
+    from types import SimpleNamespace
+
+    from tensorfold.families.qwen4_exp.cuda import attention as attn_mod
+    from tensorfold.families.qwen4_exp.cuda import thor_qsa
+
+    args.out.mkdir(parents=True, exist_ok=True)
+    engine = pp.build_engine(args.model, 4, "int8")
+    orig = thor_qsa.select
+    st = {"sel": bool(thor_qsa.S.sel), "attn": bool(thor_qsa.S.attn), "use": bool(thor_qsa.use()), "calls": 0,
+          "rows": 0, "sparse_rows": 0, "mismatch_calls": 0, "mismatch_rows": 0, "max_blocks": 0, "first": []}
+    ref = {}
+
+    def select(scratch, pos0, rows, blocks, warps=None, variant=None):
+        orig(scratch, pos0, rows, blocks, warps=warps, variant=variant)
+        key = id(scratch)
+        if key not in ref:
+            ref[key] = SimpleNamespace(scores=scratch.scores, ids=torch.empty_like(scratch.ids),
+                                       nk=torch.empty_like(scratch.nk), sparse=torch.empty_like(scratch.sparse),
+                                       nb=scratch.nb, ratio=scratch.ratio, budget=scratch.budget, idw=scratch.idw)
+        r = ref[key]
+        r.ids.fill_(-1)
+        attn_mod._launch_select(r, pos0, rows, blocks)
+        nk, sp = scratch.nk[:rows], scratch.sparse[:rows]
+        listed = (r.sparse[:rows] != 0)[:, None] & (torch.arange(r.ids.shape[1], device=nk.device)[None, :]
+                                                     < r.nk[:rows, None])
+        bad = (nk != r.nk[:rows]) | (sp != r.sparse[:rows]) | ((scratch.ids[:rows] != r.ids[:rows]) & listed).any(1)
+        nbad = int(bad.sum())
+        st["calls"] += 1
+        st["rows"] += int(rows)
+        st["sparse_rows"] += int((r.sparse[:rows] != 0).sum())
+        st["max_blocks"] = max(st["max_blocks"], int(blocks))
+        if nbad:
+            st["mismatch_calls"] += 1
+            st["mismatch_rows"] += nbad
+            if len(st["first"]) < 8:
+                st["first"].append({"call": st["calls"], "pos0": int(pos0[0]), "rows": int(rows), "blocks": int(blocks),
+                                    "row": int(torch.nonzero(bad)[0, 0])})
+
+    thor_qsa.select = select
+    per = {}
+    for name in [p for p in args.prompts.split(",") if p]:
+        n, natural, seed = PROMPTS[name]
+        ids = pp.prompt_ids(args.model, n, seed, natural=natural)
+        nr.forget(engine)
+        before = dict(st)
+        got = pp.run_prompt(engine, ids)
+        per[name] = {k: st[k] - before[k] for k in ("calls", "rows", "sparse_rows", "mismatch_calls", "mismatch_rows")}
+        print(f"[selall] {name}: {per[name]} ({got['tok_s']:.0f} tok/s with the checks inside)", flush=True)
+    thor_qsa.select = orig
+    st["per_prompt"] = per
+    (args.out / "qsa_selall.json").write_text(json.dumps(st, indent=1))
+    print(f"[selall] sel {st['sel']} attn {st['attn']} use {st['use']}: {st['calls']} calls, {st['sparse_rows']} "
+          f"sparse rows, max blocks {st['max_blocks']}, mismatching rows {st['mismatch_rows']}", flush=True)
 
 
 def two_streams(engine, a: list[int], b: list[int]) -> tuple:
@@ -627,6 +711,10 @@ def main() -> None:
     k.add_argument("out", type=Path)
     k.add_argument("--prompts", default="nat32k,syn128k")
     k.add_argument("--sample-rows", type=int, default=24)
+    c = sub.add_parser("selall")
+    c.add_argument("model", type=Path)
+    c.add_argument("out", type=Path)
+    c.add_argument("--prompts", default="nat32k,syn128k")
     a = sub.add_parser("ab")
     a.add_argument("model", type=Path)
     a.add_argument("out", type=Path)
@@ -636,6 +724,8 @@ def main() -> None:
         select(args)
     elif args.cmd == "kernels":
         kernels(args)
+    elif args.cmd == "selall":
+        selall(args)
     elif args.cmd == "ab":
         ab(args)
 

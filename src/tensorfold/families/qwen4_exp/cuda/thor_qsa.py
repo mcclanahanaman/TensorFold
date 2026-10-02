@@ -33,6 +33,11 @@ merge), and its selection is TensorFold's search with 32-bit keys and fewer warp
 and the same lists, bit for bit). Both depend only on the row, so the contract above holds.
 ``TENSORFOLD_THOR_QSA_ATTN=0`` keeps THOR-K4-QSA's kernels (chunks, merge and TensorFold's selection).
 
+THOR-K4-QSA-SEL: the selection is a CUDA radix select (``thor_select.cu``: one CTA a row, the row's keys in registers,
+the TOP-th largest key in three digit steps, then the blocks placed in block order by warp ballots), TensorFold's cut
+and lists bit for bit, with or without THOR-K4-QSA-ATTN. ``TENSORFOLD_THOR_QSA_SEL=0`` keeps the Triton selection
+(``_select_rows`` with THOR-K4-QSA-ATTN, else TensorFold's).
+
 ``TENSORFOLD_THOR_QSA=0`` keeps TensorFold's prompt kernels; any other GPU never reaches this module.
 """
 
@@ -52,11 +57,13 @@ from .kvquant import dequant_group_8, h32
 
 ENV = "TENSORFOLD_THOR_QSA"
 ENV_ATTN = "TENSORFOLD_THOR_QSA_ATTN"
+ENV_SEL = "TENSORFOLD_THOR_QSA_SEL"
 CAPABILITY = (11, 0)
 STAGES = 2                  # the attention chunk kernel's pipeline depth on the shadow (bf16 loads)
 SCORE_ROWS, SCORE_BLOCKS = 32, 128
 ROW_TILE, ROW_WARPS, ROW_STAGES = 64, 4, 2      # _row_attn: keys a tile, warps, pipeline depth (k4qa-r1 sweep)
 SELECT_WARPS = {16384: 4, 32768: 8}    # _select_rows' warps by row width (blocks, a power of 2; 4 below; k4qa-r1)
+SEL_VARIANT = 0             # thor_select.cu's launch variant (0: the served kernels; others in tuning builds)
 
 
 def _off() -> bool:
@@ -74,6 +81,7 @@ class _State:
     active = False          # prompt passes take this path (``prepare`` turns it on)
     shadow = False          # the cache is 8-bit: prompt buffers hold a bf16 shadow of one layer's keys and values
     attn = os.environ.get(ENV_ATTN, "1").strip().lower() not in ("0", "off", "false", "no")   # THOR-K4-QSA-ATTN
+    sel = os.environ.get(ENV_SEL, "1").strip().lower() not in ("0", "off", "false", "no")     # THOR-K4-QSA-SEL
 
 
 S = _State()
@@ -116,6 +124,24 @@ def set_attn(on: bool) -> None:
     S.attn = bool(on)
 
 
+def set_sel(on: bool) -> None:
+    """THOR-K4-QSA-SEL's CUDA selection (True) or the Triton one (False): for A/B runs and tests."""
+
+    S.sel = bool(on)
+
+
+@functools.lru_cache(maxsize=1)
+def _sel_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    here = Path(__file__).parent
+    return load(name="tensorfold_qwen4_exp_thor_select", sources=[str(here / "thor_select.cpp"),
+                                                                    str(here / "thor_select.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
 def shadow_bytes(capacity: int, kv_heads: int, head_dim: int) -> int:
     """A bf16 shadow of one layer's keys and values at ``capacity`` cache rows."""
 
@@ -146,6 +172,13 @@ def prepare(kv_bits: int) -> bool:
 
     S.shadow = kv_bits == 8
     S.active = available() and kv_bits in (8, 16)
+    if S.active and S.sel:                  # built now, before the caches
+        try:
+            _sel_ext()
+        except Exception as exc:            # noqa: BLE001  (any failure keeps the Triton selection)
+            print(f"[tensorfold] Thor QSA CUDA selection off: its build failed ({exc!r}); the Triton selection runs",
+                  flush=True)
+            S.sel = False
     return S.active
 
 
@@ -345,10 +378,15 @@ def _select_rows(SC, POS0, IDS, NKR, SPR, NB, RATIO: tl.constexpr, TOP: tl.const
         tl.store(SPR + r, 1)
 
 
-def select(scratch, pos0: torch.Tensor, rows: int, blocks: int, warps: int | None = None) -> None:
-    """``attention._launch_select``'s lists: ``_select_rows`` up to 32,768 blocks a row, TensorFold's tiled
-    selection past them."""
+def select(scratch, pos0: torch.Tensor, rows: int, blocks: int, warps: int | None = None,
+           variant: int | None = None) -> None:
+    """``attention._launch_select``'s lists: THOR-K4-QSA-SEL's CUDA radix select (``warps`` None), else
+    ``_select_rows`` up to 32,768 blocks a row and TensorFold's tiled selection past them."""
 
+    if S.sel and warps is None:
+        _sel_ext().select(scratch.scores, pos0, scratch.ids, scratch.nk, scratch.sparse, int(rows), int(blocks),
+                          scratch.ratio, scratch.budget // scratch.ratio, SEL_VARIANT if variant is None else variant)
+        return
     width = max(16, triton.next_power_of_2(blocks))
     if width > attn_mod.SELECT_REGS:
         attn_mod._launch_select(scratch, pos0, rows, blocks)
@@ -368,7 +406,7 @@ def qsa_rows(iq: torch.Tensor, pooled: torch.Tensor, pos0: torch.Tensor, scratch
     _scores[(triton.cdiv(rows, SCORE_ROWS), triton.cdiv(blocks, SCORE_BLOCKS))](
         iq, pooled, pos0, scratch.scores, scratch.nb, rows, HI=iq.shape[1], DI=pooled.shape[1], RATIO=ratio,
         TOP=scratch.budget // ratio, TR=SCORE_ROWS, BB=SCORE_BLOCKS, num_warps=8)
-    if S.attn:
+    if S.sel or S.attn:
         select(scratch, pos0, rows, blocks)
     else:
         attn_mod._launch_select(scratch, pos0, rows, blocks)

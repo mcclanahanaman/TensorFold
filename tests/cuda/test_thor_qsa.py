@@ -176,6 +176,70 @@ def test_select_rows_lists_tensorfolds_blocks_bit_for_bit(cap, rows):
         assert torch.equal(a.ids, b.ids), w
 
 
+@pytest.fixture
+def sel_on():
+    """THOR-K4-QSA-SEL's CUDA selection on for the test, whatever the switch says, and back after it."""
+
+    was = thor_qsa.S.sel
+    thor_qsa.set_sel(True)
+    yield
+    thor_qsa.set_sel(was)
+
+
+def _hard_scores(kind: str, rows: int, nb: int, g) -> torch.Tensor:
+    """Block scores that stress an exact selection: ties at the cut, zeros and -0.0, every bit pattern but NaN, ties
+    on both sides of block 32,768 (the CUDA selection's register tile)."""
+
+    if kind == "ties":
+        sc = torch.rand((rows, nb), generator=g, device=DEV)
+        sc = torch.where(torch.rand(sc.shape, generator=g, device=DEV) < 0.3, (sc * 8).floor() / 8, sc)
+        sc[:, ::7] = 0.0
+        sc[:, 3::11] = -0.0
+    elif kind == "flat":                                    # one value: the lowest 512 blocks
+        sc = torch.full((rows, nb), 0.75, device=DEV)
+    elif kind == "few":                                     # three values: ties in every digit
+        sc = torch.randint(0, 3, (rows, nb), generator=g, device=DEV).float() * 0.25
+    elif kind == "zeros":                                   # mostly zeros and -0.0: the cut among them, or not
+        sc = torch.zeros((rows, nb), device=DEV)
+        sc[:, 5::97] = torch.rand(sc[:, 5::97].shape, generator=g, device=DEV) + 0.5
+        sc[:, 2::13] = -0.0
+    elif kind == "bits":                                    # random 32-bit patterns: negatives, infinities, denormals
+        sc = (torch.randint(0, 2**32, (rows, nb), generator=g, device=DEV) - 2**31).to(torch.int32).view(torch.float32)
+        sc = torch.where(torch.isnan(sc), torch.full_like(sc, -1.5), sc)
+    else:                                                   # "edge": the cut's ties straddle block 32,768
+        sc = torch.full((rows, nb), 0.5, device=DEV)
+        sc[:, 32700:] = 1.0
+        sc[:, 11:4400:11] = 2.0                             # 399 blocks above the cut
+    return sc
+
+
+@pytest.mark.parametrize("kind", ["ties", "flat", "few", "zeros", "bits", "edge"])
+@pytest.mark.parametrize("cap,rows", [(2100, 256), (4096, 64), (9000, 256), (40000, 96), (131072, 32), (131200, 16),
+                                      (262144, 8)])
+def test_cuda_select_lists_tensorfolds_blocks_bit_for_bit(sel_on, cap, rows, kind):
+    """THOR-K4-QSA-SEL: the CUDA radix select against TensorFold's selection on the same scores: dense
+    and sparse rows in one block, ties at the cut, zeros and -0.0, every bit pattern, rows of more than one
+    32,768-block tile (the full 262,144-key window)."""
+
+    g = torch.Generator(device=DEV).manual_seed(cap * 7 + rows)
+    pos0 = torch.tensor([cap - rows], dtype=torch.int32, device=DEV)
+    a = attn_mod.AttnScratch(rows, 24, 256, cap, DEV, budget=2048, ratio=4)
+    b = attn_mod.AttnScratch(rows, 24, 256, cap, DEV, budget=2048, ratio=4)
+    blocks = -(-cap // 4)
+    sc = _hard_scores(kind, rows, a.nb, g)
+    a.scores.copy_(sc)
+    b.scores.copy_(sc)
+    attn_mod._launch_select(a, pos0, rows, blocks)
+    assert int(a.sparse.sum()) > 0
+    for variant in (0, 2):                                 # 2: a 13-bit first digit (tuning builds)
+        b.ids.zero_()
+        b.nk.zero_()
+        b.sparse.zero_()
+        thor_qsa.select(b, pos0, rows, blocks, variant=variant)
+        assert torch.equal(a.sparse, b.sparse) and torch.equal(a.nk, b.nk), variant
+        assert torch.equal(a.ids, b.ids), variant
+
+
 def test_tensor_core_scores_select_tensorfolds_blocks():
     g = torch.Generator(device=DEV).manual_seed(5)
     rows, cap = 256, 12000

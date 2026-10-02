@@ -188,7 +188,8 @@ class FlashNextEngine:
             shadow = thor_qsa.shadow_bytes(self.max_len, w.cfg.kv_heads, w.cfg.head_dim) if bits == 8 else 0
             print("[tensorfold] Thor (sm_110): sparse-attention prompt kernels: tensor-core block scores, attention on "
                   + (f"a bf16 shadow of each layer's 8-bit cache ({shadow / 2**30:.2f} GiB)" if bits == 8 else
-                     "the bf16 cache") + f" ({thor_qsa.ENV}=0 keeps TensorFold's)", flush=True)
+                     "the bf16 cache") + (", CUDA block selection" if thor_qsa.S.sel else "")
+                  + f" ({thor_qsa.ENV}=0 keeps TensorFold's, {thor_qsa.ENV_SEL}=0 the Triton selection)", flush=True)
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
