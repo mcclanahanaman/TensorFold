@@ -15,8 +15,10 @@ if not thor_gdn.available():
 
 from test_flashnext_forward import V, _model, _state  # noqa: E402
 from test_flashnext_gdn_io import _chain_windows, _front, _inputs  # noqa: E402
+from test_flashnext_prompt_cache import _engine_shim, _generate  # noqa: E402
 
 from tensorfold.cuda.kernels import gdn as tf_gdn  # noqa: E402
+from tensorfold.cuda.markers import MIN_GAP  # noqa: E402
 from tensorfold.cuda.streams import Stream  # noqa: E402
 from tensorfold.engine.exact_sampling import Sampling  # noqa: E402
 from tensorfold.families.qwen4_exp.cuda import gdn, gdn_io  # noqa: E402
@@ -251,3 +253,75 @@ def test_packed_passes_end_pieces_on_the_grid_and_keep_each_prompts_solo_run(tho
             while dec.live():
                 dec.finish(dec.round())
             assert s.cached == (entry_end(p) or 0) and s.out == fresh(q, smp), (len(p), q[-2:])
+
+
+def _forked(seed: int) -> tuple[list[int], list[int]]:
+    """Two prompts sharing their first 300 tokens: a message start at 300 (off the grid), then 40 and 25 more."""
+
+    g = torch.Generator().manual_seed(seed)
+    shared = torch.randint(1, V, (300,), generator=g).tolist()
+    one, two = torch.randint(1, V, (40,), generator=g).tolist(), torch.randint(1, V, (25,), generator=g).tolist()
+    return shared + one, shared + two
+
+
+def _at_300(ids) -> list[int]:
+    return [300] if len(ids) > 300 else []
+
+
+def test_message_starts_move_back_to_the_grid_below_the_limit(monkeypatch):
+    """TensorFold 0.6.1's message-start keep points on this path: below LIMIT the last multiple of 64 at or before
+    each, past it as given; those under ``lo`` or at or past ``end`` dropped; none when the prompt keeps nothing."""
+
+    assert thor_gdn.stops([300, 700, 1000], 256, 960) == [256, 640]
+    assert thor_gdn.stops([300, 310, 270], 256, 960) == [256]
+    assert thor_gdn.stops([300], 300, 960) == [] and thor_gdn.stops([300], 256, None) == []
+    monkeypatch.setattr(thor_gdn, "LIMIT", 128)
+    assert thor_gdn.stops([100, 300, 1000], 64, 960) == [64, 300]
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
+def test_message_start_keeps_resume_a_fork_as_fresh_in_packed_passes(thor, kv_dtype):
+    """The concurrent decoder with message points: the first prompt keeps the start (on the grid below LIMIT) and its
+    end; a second prompt sharing the prefix to the start resumes there (a spare lane's copy) and emits its fresh run."""
+
+    w = _model(5)
+    one, two = _forked(21)
+    stop = thor_gdn.stops([300], MIN_GAP, entry_end(one))
+    assert stop == ([256] if thor_gdn.LIMIT > 300 else [300])
+
+    def fresh(prompt):
+        e = Engine(w, capacity=1024, max_rows=8, prefill_rows=64, kv_dtype=kv_dtype)
+        return serial_decode(e, prefill(e, prompt, None), 10, None).tokens
+
+    dec = MultiDecoder(w, slots=2, capacity=1024, depth=3, confidence=0.3, kv_dtype=kv_dtype, prefill_rows=192,
+                       points=_at_300)
+    for p in (one, two):
+        s = Stream(list(p), 10, None)
+        dec.admit(s)
+        while dec.live():
+            dec.finish(dec.round())
+        assert s.out == fresh(p), len(p)
+        assert s.cached == (stop[0] if p is two else 0)
+    assert stop[0] in {len(k[0]) for k in dec.kept}
+
+
+def test_the_serial_engine_keeps_message_starts_on_the_grid(thor):
+    """The serial engine with message points: the start's state kept (on the grid below LIMIT), and a prompt sharing the
+    prefix to it resumes there and replies as a fresh engine does."""
+
+    w = _model(5)
+    one, two = _forked(22)
+    stop = thor_gdn.stops([300], MIN_GAP, entry_end(one))
+
+    def engine(points=None):
+        e = _engine_shim(w, points)
+        e.e = Engine(w, capacity=1024, max_rows=8, prefill_rows=64)      # prompt chunks on the grid
+        return e
+
+    mine = engine(_at_300)
+    first, _ = _generate(mine, one, None)
+    assert first == _generate(engine(), one, None)[0]
+    assert stop[0] in [len(ids) for ids, _ in mine.cache]
+    second, stats = _generate(mine, two, None)
+    assert stats["cached"] == stop[0] and second == _generate(engine(), two, None)[0]
+
