@@ -3,7 +3,7 @@ same requests in the same order, so fresh servers of different builds (stock Ten
 switches off or on) compare on the same prompts in one session.
 
     python tools/thor/serve_ab.py BASE_URL OUT.json [--label NAME] [--seed S] [--prefill 8192,32768,131072]
-        [--repeat 2] [--followups 16384,32768,61440] [--decode 256] [--streams 3]
+        [--repeat 2] [--followups 16384,32768,61440] [--decode 256] [--streams 3 | 2,3,4]
 
 In this order, every request counted (no warm-up exclusion), thinking off, greedy:
 - prefill: for each --prefill length, --repeat new synthetic prompts (prefill_ttft.py's text; one --seed gives the same
@@ -13,10 +13,12 @@ In this order, every request counted (no warm-up exclusion), thinking off, greed
   tokens, then the next turn (that message, the reply as the server sent it, a short new user message), one token out:
   the next turn's TTFT and the server's cached-token count (where it resumed: TensorFold keeps a prompt's state at its
   last assistant start, which the next turn shares);
-- decode: one stream (a short prompt, --decode tokens, end tokens ignored), then --streams at once (other prompts): each
-  stream's decode tok/s from the server's figures (tokens after the first over its decode time), and all
-  streams' tokens after their first over the wall time from the earliest first token to the last end; each stream's
-  MTP acceptance and tokens a round (the server's ``speculative`` figures), which near-tie flips can move.
+- decode: one stream (a short prompt, --decode tokens, end tokens ignored), then for each --streams count in turn that
+  many at once (other prompts, one each): each stream's decode tok/s from the server's figures (tokens after the first
+  over its decode time), and all streams' tokens after their first over the wall time from the earliest first token to
+  the last end; each stream's MTP acceptance and tokens a round (the server's ``speculative`` figures), which near-tie
+  flips can move. ``decode.by_streams`` holds every count; ``decode.many`` is the 3-stream entry (or the last count),
+  as before.
 Each reply's token hash (the server's ``token_sha``) is kept: two builds gave the same greedy text where they match.
 Standard library only.
 """
@@ -41,6 +43,7 @@ DECODE_PROMPTS = (
     "Explain, step by step and with examples, how a compiler turns source code into machine code.",
     "Describe the water cycle in depth, covering evaporation, condensation, precipitation and runoff.",
     "Tell a long story about a lighthouse keeper who finds a map in a bottle.",
+    "Explain how a modern airliner stays in the air, from lift and thrust to the autopilot and the landing.",
 )
 
 
@@ -117,7 +120,7 @@ def main() -> None:
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--followups", default="16384,32768,61440")
     ap.add_argument("--decode", type=int, default=256)
-    ap.add_argument("--streams", type=int, default=3)
+    ap.add_argument("--streams", default="3", help="concurrent decode streams: one count or several, e.g. 2,3,4")
     args = ap.parse_args()
     base = args.base.rstrip("/")
     model = model_id(base)
@@ -154,29 +157,35 @@ def main() -> None:
           f"tok/s, client {(one['completion_tokens'] - 1) / (one['end'] - one['first']):.1f} tok/s after the first; "
           f"MTP acceptance {one['acceptance']}, {one['tokens_per_round']} tokens a round; sha {one['token_sha']}",
           flush=True)
-    rows: list = [None] * args.streams
+    counts = [int(v) for v in args.streams.split(",") if v]
+    if any(not 1 <= c < len(DECODE_PROMPTS) for c in counts):
+        raise SystemExit(f"--streams counts are 1 .. {len(DECODE_PROMPTS) - 1} (one prompt each)")
+    report["decode"]["by_streams"] = {}
 
-    def go(i: int) -> None:
-        rows[i] = chat(base, model, [{"role": "user", "content": DECODE_PROMPTS[1 + i % (len(DECODE_PROMPTS) - 1)]}],
-                       args.decode, ignore_eos=True)
+    def go(i: int, rows: list) -> None:
+        rows[i] = chat(base, model, [{"role": "user", "content": DECODE_PROMPTS[1 + i]}], args.decode, ignore_eos=True)
 
-    threads = [threading.Thread(target=go, args=(i,)) for i in range(args.streams)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    if any(r is None for r in rows):
-        raise SystemExit("a decode stream failed")
-    wall = max(r["end"] for r in rows) - min(r["first"] for r in rows)
-    agg = sum(r["completion_tokens"] - 1 for r in rows) / wall if wall > 0 else None
-    report["decode"]["many"] = {"streams": [public(r) for r in rows], "wall_tok_s": agg,
-                                "server_sum_tok_s": sum(r["server_decode_tok_s"] or 0 for r in rows)}
-    each = " / ".join(f"{r['server_decode_tok_s'] or 0:.1f}" for r in rows)
-    accepted = " / ".join(f"{r['acceptance'] or 0:.3f}" for r in rows)
-    print(f"{tag} decode {args.streams} streams: server {each} tok/s (sum "
-          f"{report['decode']['many']['server_sum_tok_s']:.1f}), wall {agg:.1f} tok/s; MTP acceptance {accepted}",
-          flush=True)
-    save()
+    for count in counts:
+        rows: list = [None] * count
+        threads = [threading.Thread(target=go, args=(i, rows)) for i in range(count)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        if any(r is None for r in rows):
+            raise SystemExit("a decode stream failed")
+        wall = max(r["end"] for r in rows) - min(r["first"] for r in rows)
+        agg = sum(r["completion_tokens"] - 1 for r in rows) / wall if wall > 0 else None
+        entry = {"streams": [public(r) for r in rows], "wall_tok_s": agg,
+                 "server_sum_tok_s": sum(r["server_decode_tok_s"] or 0 for r in rows)}
+        report["decode"]["by_streams"][str(count)] = entry
+        if count == 3 or "many" not in report["decode"] or 3 not in counts:
+            report["decode"]["many"] = entry
+        each = " / ".join(f"{r['server_decode_tok_s'] or 0:.1f}" for r in rows)
+        accepted = " / ".join(f"{r['acceptance'] or 0:.3f}" for r in rows)
+        print(f"{tag} decode {count} streams: server {each} tok/s (sum {entry['server_sum_tok_s']:.1f}), wall "
+              f"{agg or 0:.1f} tok/s; MTP acceptance {accepted}", flush=True)
+        save()
 
 
 if __name__ == "__main__":
