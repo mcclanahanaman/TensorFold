@@ -184,6 +184,15 @@ class FlashNextEngine:
                   f"({str(thor_gdn.S.dtype).replace('torch.', '')} q/k/v, fp32 state, 64-row chunks; kept points and "
                   f"prompt pieces on the 64-row grid), ready in {time.perf_counter() - began:.1f}s "
                   f"({thor_gdn.ENV}=0 keeps TensorFold's chain)", flush=True)
+        from . import thor_hc
+
+        if quant_method(read_config(model_dir)) == "modelopt" and thor_hc.available():
+            began = time.perf_counter()              # Thor, NVFP4 checkpoints: compiled and checked before the caches
+            thor_hc.prepare(w)
+            print(f"[tensorfold] Thor (sm_110): prompt hyper-connections "
+                  + ("fused, TensorFold's bits" if thor_hc.S.active else "on TensorFold's kernels")
+                  + f" ({thor_hc.S.note}), ready in {time.perf_counter() - began:.1f}s "
+                  f"({thor_hc.ENV}=0 keeps TensorFold's)", flush=True)
         if thor_qsa.available() and thor_qsa.prepare(bits):
             shadow = thor_qsa.shadow_bytes(self.max_len, w.cfg.kv_heads, w.cfg.head_dim) if bits == 8 else 0
             print("[tensorfold] Thor (sm_110): sparse-attention prompt kernels: tensor-core block scores, attention on "

@@ -18,7 +18,7 @@ from tensorfold.cuda.nvfp4 import thor_dense
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
-from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_qsa
+from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_hc, thor_qsa
 from . import image_rows
 from .hc_check import fuser as _hc_fuser
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
@@ -65,6 +65,9 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
             _readout_plain(hc, b, h, R, eps, streams, low, inject_out[:R] if hc.inject else None, normed=True)
             return
     glue.hc_writeback(h[:R], h[:R], b.pss[:R], streams, mode, branch=branch, inject=inject_prev, y=y, wts=wts)
+    if b.prefill and thor_hc.use(hc):           # Jetson Thor's prompt read-out (thor_hc): fused, the same bits
+        thor_hc.readout(hc, b, h, R, eps, streams, low, inject_out[:R] if hc.inject else None)
+        return
     _readout(hc, b, h, R, eps, streams, low, inject_out[:R] if hc.inject else None)
 
 

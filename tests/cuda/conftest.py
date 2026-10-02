@@ -37,17 +37,19 @@ def _give_back_gpu_memory():
 
 @pytest.fixture(autouse=True)
 def _thor_paths_off_after():
-    """Jetson Thor's chunked DeltaNet prompt chain (thor_gdn) and sparse-attention prompt kernels (thor_qsa) are
-    process-wide once an engine prepares them: both are off again after each test, so the next one starts from
-    TensorFold's kernels (an engine built by one test, with its cache width, does not choose the next test's path)."""
+    """Jetson Thor's chunked DeltaNet prompt chain (thor_gdn), sparse-attention prompt kernels (thor_qsa) and fused
+    prompt hyper-connections (thor_hc) are process-wide once an engine prepares them: all are off again after each
+    test, so the next one starts from TensorFold's kernels (an engine built by one test, with its cache width, does
+    not choose the next test's path)."""
 
     yield
     if not _cuda():
         return
     try:
         from tensorfold.cuda.kernels import thor_gdn
-        from tensorfold.families.qwen4_exp.cuda import thor_qsa
+        from tensorfold.families.qwen4_exp.cuda import thor_hc, thor_qsa
     except ImportError:
         return
     thor_gdn.set_active(False)
     thor_qsa.set_active(False)
+    thor_hc.set_active(False)
