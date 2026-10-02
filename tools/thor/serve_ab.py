@@ -14,7 +14,7 @@ In this order, every request counted (no warm-up exclusion), thinking off, greed
   the next turn's TTFT and the server's cached-token count (where it resumed: TensorFold keeps a prompt's state at its
   last assistant start, which the next turn shares);
 - decode: one stream (a short prompt, --decode tokens, end tokens ignored), then --streams at once (other prompts): each
-  stream's decode tok/s as the server reports it (tokens after the first over the time after its prefill), and all
+  stream's decode tok/s from the server's figures (tokens after the first over its decode time), and all
   streams' tokens after their first over the wall time from the earliest first token to the last end; each stream's
   MTP acceptance and tokens a round (the server's ``speculative`` figures), which near-tie flips can move.
 Each reply's token hash (the server's ``token_sha``) is kept: two builds gave the same greedy text where they match.
@@ -86,14 +86,21 @@ def chat(base: str, model: str, messages: list[dict], max_tokens: int, *, ignore
     first = first if first is not None else end
     prompt = int(usage.get("prompt_tokens") or 0)
     cached = int((usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+    n = int(usage.get("completion_tokens") or 0)
     ttft = first - t0
+    # the CUDA server's stats block (prefill_s, decode_s, rounds, drafted, accepted), or the Mac server's runtime and
+    # speculative blocks
+    decode_s, rounds, drafted = stats.get("decode_s"), stats.get("rounds"), stats.get("drafted")
+    decode = stats.get("tokens_per_second") if decode_s is None else (n - 1) / decode_s if decode_s else None
+    acceptance = spec.get("acceptance_rate") if drafted is None else stats.get("accepted", 0) / drafted if drafted \
+        else None
+    per_round = spec.get("tokens_per_round") if rounds is None else (n - 1) / rounds if rounds else None
     return {"t0": t0, "first": first, "end": end, "ttft_s": round(ttft, 4), "total_s": round(end - t0, 4),
-            "prompt_tokens": prompt, "cached": cached, "completion_tokens": int(usage.get("completion_tokens") or 0),
+            "prompt_tokens": prompt, "cached": cached, "completion_tokens": n,
             "tok_s": round((prompt - cached) / ttft, 1) if prompt and ttft > 0 else None,
-            "server_ttft_s": stats.get("time_to_first_token"), "server_prefill_s": stats.get("prefill_seconds"),
-            "server_decode_tok_s": stats.get("tokens_per_second"), "token_sha": stats.get("token_sha"),
-            "drafts": stats.get("drafts"), "acceptance": spec.get("acceptance_rate"),
-            "tokens_per_round": spec.get("tokens_per_round"), "text": "".join(pieces)}
+            "server_prefill_s": stats.get("prefill_s", stats.get("prefill_seconds")), "server_decode_tok_s": decode,
+            "token_sha": stats.get("token_sha"), "drafts": stats.get("drafts"), "acceptance": acceptance,
+            "tokens_per_round": per_round, "text": "".join(pieces)}
 
 
 def public(row: dict) -> dict:
