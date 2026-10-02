@@ -3,8 +3,10 @@ ratios, same-reply-token checks, and a one-run ledger of the headline numbers. W
 decode.by_streams the decode metrics are emitted per stream count, and each follow-up target's first-turn
 TTFT becomes a "first turn ... s" metric.
 
-Reads DIR/ab_<config>_<round>.json (serve_ab.py) and DIR/nat_<config>_<round>.json (natural_prefill.py); a
-missing file simply contributes no metrics for that run. Writes the {'summary': ..., 'same_tokens': ...} JSON,
+Reads DIR/ab_<config>_<round>.json (serve_ab.py), DIR/nat_<config>_<round>.json (natural_prefill.py),
+DIR/mem_<config>_<round>.json (serve_digest.py) and DIR/gbc_<config>_<round>.json (thor_divergence.py
+compare's rows, each config's probes against the baseline's); a missing file simply contributes no metrics
+for that run. Writes the {'summary': ..., 'same_tokens': ...} JSON,
 the markdown table and the one-run ledger to the files given on the command line, and prints the table.
 
     python tools/thor/ab_table.py DIR [--configs stock,off,on] [--rounds 1,2] [--baseline stock]
@@ -21,7 +23,10 @@ from pathlib import Path
 
 LEDGER_KEYS = [("prefill_8k", "prefill 8k"), ("prefill_32k", "prefill 32k"), ("prefill_128k", "prefill 128k"),
                ("decode_1", "decode 1 tok/s"), ("decode_3", "decode 3 wall tok/s"),
-               ("users_4", "decode 4 wall tok/s"), ("followup_s", "follow-up 60k s")]
+               ("users_4", "decode 4 wall tok/s"), ("followup_s", "follow-up 60k s"),
+               ("kv_gib", "kv room GiB")]
+
+COUNT_METRICS = ("pass rows", "full-window streams", "window tokens", "G-B probes equal", "G-B probes")
 
 
 def load(path: Path):
@@ -29,8 +34,11 @@ def load(path: Path):
     return json.loads(path.read_text()) if path.exists() else None
 
 
-def run_metrics(ab, nat):
-    """The ordered {metric: value} of one run: the serve_ab.py report ab and the natural_prefill.py report nat."""
+def run_metrics(ab, nat, mem=None, gbc=None):
+    """The ordered {metric: value} of one run: the serve_ab.py report ab, the natural_prefill.py report nat, the
+    serve_digest.py memory dict mem and the thor_divergence.py compare rows gbc (this config's probes against the
+    baseline's). None inputs contribute nothing, and so does every mem value that is None.
+    """
     m = {}
     if ab:
         prefill = ab.get("prefill") or []
@@ -84,6 +92,16 @@ def run_metrics(ab, nat):
                     if r.get("kind") == kind and r.get("tok_s") is not None]
             if vals:
                 m[f"natural {tokens // 1024}k {kind}"] = st.mean(vals)
+    if mem:
+        for name, key in (("pass rows", "pass_rows"), ("kv room GiB", "kv_room_gib"),
+                          ("usable kv GiB", "usable_kv_gib"), ("full-window streams", "full_window_streams"),
+                          ("window tokens", "stream_window"), ("startup estimate GiB", "startup_estimate_gib"),
+                          ("planned peak GiB", "planned_peak_gib"), ("workspace GiB", "workspace_gib")):
+            if mem.get(key) is not None:
+                m[name] = mem[key]
+    if gbc is not None:
+        m["G-B probes equal"] = sum(1 for row in gbc if row.get("equal"))
+        m["G-B probes"] = len(gbc)
     return m
 
 
@@ -145,6 +163,17 @@ def fmt(v):
     return "-" if v is None else f"{v:.3f}" if abs(v) < 10 else f"{v:.0f}"
 
 
+def cell(name, v):
+    """A by-run cell: null as '-', two decimals for the GiB metrics, whole numbers for the counts, else fmt()."""
+    if v is None:
+        return "-"
+    if name.endswith(" GiB"):
+        return f"{v:.2f}"
+    if name in COUNT_METRICS:
+        return f"{v:.0f}"
+    return fmt(v)
+
+
 def markdown_table(summary, keys, configs, rounds, baseline):
     """The markdown table: a column per run (configs then rounds), then a ratio column per non-baseline config."""
     cols = [f"{c} r{r}" for c in configs for r in rounds] + [f"{c}/{baseline}" for c in configs if c != baseline]
@@ -152,7 +181,7 @@ def markdown_table(summary, keys, configs, rounds, baseline):
              "|" + "|".join(["-" * 10] * (len(cols) + 1)) + "|"]
     for k in keys:
         s = summary[k]
-        cells = [fmt(s["by_run"][f"{c} r{r}"]) for c in configs for r in rounds]
+        cells = [cell(k, s["by_run"][f"{c} r{r}"]) for c in configs for r in rounds]
         cells += [fmt(s["ratio"].get(c)) for c in configs if c != baseline]
         lines.append("| " + k + " | " + " | ".join(cells) + " |")
     return "\n".join(lines)
@@ -168,7 +197,7 @@ def ledger_run(arg, configs, rounds):
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="A/B result tables for serve_ab.py and natural_prefill.py reports.")
-    p.add_argument("dir", type=Path, help="directory with the ab_*/nat_* <config>_<round>.json reports")
+    p.add_argument("dir", type=Path, help="directory with the ab_*/nat_*/mem_*/gbc_* <config>_<round>.json reports")
     p.add_argument("--configs", default="stock,off,on", help="comma-separated configs, in table order")
     p.add_argument("--rounds", default="1,2", help="comma-separated rounds, in table order")
     p.add_argument("--baseline", default="stock", help="config the ratios are taken against")
@@ -184,7 +213,9 @@ def main(argv=None) -> int:
     for c in configs:
         for r in rounds:
             ab = load(args.dir / f"ab_{c}_{r}.json")
-            rows[(c, r)] = run_metrics(ab, load(args.dir / f"nat_{c}_{r}.json"))
+            rows[(c, r)] = run_metrics(ab, load(args.dir / f"nat_{c}_{r}.json"),
+                                       load(args.dir / f"mem_{c}_{r}.json"),
+                                       load(args.dir / f"gbc_{c}_{r}.json"))
             hashes[(c, r)] = run_shas(ab)
     summary = build_summary(rows, configs, rounds, args.baseline)
     same = same_tokens(hashes, configs, rounds, args.baseline)
