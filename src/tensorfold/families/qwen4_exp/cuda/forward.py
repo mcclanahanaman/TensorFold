@@ -18,7 +18,7 @@ from tensorfold.cuda.nvfp4 import thor_dense
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
-from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_hc, thor_qsa
+from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_glue, thor_hc, thor_qsa
 from . import image_rows
 from .hc_check import fuser as _hc_fuser
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
@@ -57,7 +57,7 @@ def hc_block(hc: HC, b: Buffers, R: int, eps: float, streams: int, low: int, mod
              inject_out, h: torch.Tensor, branch=None, y=None, wts=None) -> None:
     """Write the pending branch back into the streams h (in place), then the hyper-connection's read-out: b.mixed [R, D] (+ group sums), and its inject gates into ``inject_out``."""
 
-    if b.prefill and R > FUSED_ROWS and isinstance(hc.down, qmm.Q4):
+    if b.prefill and R > FUSED_ROWS and isinstance(hc.down, qmm.Q4) and not isinstance(y, thor_glue.Rows):
         fused = _hc_fuser(h.device)
         if fused is not None:
             fused(h[:R], b.pss[:R], hc.scale, b.normed[:R], b.xs_normed[:R], streams, eps, mode,
@@ -397,7 +397,9 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> tuple:
     m = layer.moe
     if getattr(m.experts, "kernel", "qmm") == "nvfp4":      # an NVFP4 checkpoint: the FP4 experts
         buf = b.moe
-        nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg))
+        nvfp4_moe.moe(b.mixed[:R], b.xs_mixed[:R], m.router, m.experts, buf, _MoECfg(w.cfg), unscattered=w.comm is None)
+        if buf.kept is not None:                        # Jetson Thor's prompt passes: the slots where the experts left them
+            return 2, buf.kept, buf.wts[:R]
     elif w.x3 is not None:                              # an EXL3 pack: each expert at its own width, one GPU
         return _exl3_moe(m, w, b, R)
     else:

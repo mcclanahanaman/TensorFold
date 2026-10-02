@@ -287,8 +287,11 @@ def _gemm(fw, w, sf, alpha, act_in, out, tiles, scr, experts: int, gated: bool, 
                          enable_pdl=False, tactic=t)
 
 
-def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_k: int, scr: Scratch) -> None:
+def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_k: int, scr: Scratch, *,
+        scatter: bool = True) -> None:
     """x [R, D] bf16 -> y [R, slots, D] bf16: each routed pair's output in its slot; the shared slot is left alone.
+    ``scatter=False``: the outputs stay in their permuted rows, ``scr.hidden[scr.pos[pair]]`` (a pair = row x slots +
+    slot), until the next call; y is not written (its shape still gives the slots).
 
     ``plan``: the call's pairs grouped by expert (``tensorfold.cuda.experts.route`` with ``tactic(rows)``'s tile), the
     shared expert (id E) in the last slot. No host sync: the grid and the shapes follow ``rows`` alone.
@@ -309,16 +312,16 @@ def run(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_
     if plan.tile != tile:
         raise ValueError(f"the plan was routed with items of {plan.tile} pairs; this call's tile is {tile}")
     if scr.graphs is None or torch.cuda.is_current_stream_capturing():
-        _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms)
+        _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms, scatter)
         return
     key = (ex.w1.data_ptr(), ex.w2.data_ptr(), rows, top_k, x.data_ptr(), x.stride(0), y.data_ptr(), tuple(y.shape),
-           y.dtype, plan.members.data_ptr(), plan.items.data_ptr(), plan.counts.data_ptr(), tile)
+           y.dtype, plan.members.data_ptr(), plan.items.data_ptr(), plan.counts.data_ptr(), tile, scatter)
     graph = scr.graphs.get(key)
     if graph is not None:
         graph.replay()
         return
-    _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms)        # this call's outputs; it builds what it reaches
-    scr.graphs[key] = _record(lambda: _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms))
+    _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms, scatter)        # this call's outputs; it builds what it reaches
+    scr.graphs[key] = _record(lambda: _launch(x, ex, plan, y, rows, top_k, scr, tile, gemms, scatter))
 
 
 def _record(launch) -> torch.cuda.CUDAGraph:
@@ -337,7 +340,7 @@ def _record(launch) -> torch.cuda.CUDAGraph:
 
 
 def _launch(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, top_k: int, scr: Scratch, tile: int,
-            gemms: tuple) -> None:
+            gemms: tuple, scatter: bool = True) -> None:
     from tensorfold.cuda import experts as grouped
 
     fw = _fi()
@@ -346,15 +349,16 @@ def _launch(x: torch.Tensor, ex: ThorExperts, plan, y: torch.Tensor, rows: int, 
     s = max_tiles(rows * top_k, ex.count, tile) * tile
     tiles = s // tile
     grid = (grouped.max_items(rows * nslots, ex.count + 1, tile),)
-    tiles_k, gather, scatter = _glue()
+    tiles_k, gather, scatter_k = _glue()
     tiles_k[grid](plan.members, plan.items, plan.counts, scr.tile_expert, scr.tile_limit, scr.tiles, scr.pos,
                   -(-rows // tile), T=tile, num_warps=1)
     gather[(rows,)](x, x.stride(0), scr.pos, scr.hidden, TOPK=top_k, KP=1 << (top_k - 1).bit_length(), SLOTS=nslots,
                     D=ex.dims, BD=_COPY, num_warps=4)
     _gemm(fw, ex.w1, ex.w1_sf, ex.w1_alpha, scr.hidden[:s], scr.inter[:s], tiles, scr, ex.count, True, g1)
     _gemm(fw, ex.w2, ex.w2_sf, ex.w2_alpha, scr.inter[:s], scr.hidden[:s], tiles, scr, ex.count, False, g2)
-    scatter[grid](scr.hidden, plan.members, plan.items, scr.tiles, y.view(-1, ex.dims), T=tile, D=ex.dims,
-                  BD=_COPY, num_warps=4)
+    if scatter:
+        scatter_k[grid](scr.hidden, plan.members, plan.items, scr.tiles, y.view(-1, ex.dims), T=tile, D=ex.dims,
+                        BD=_COPY, num_warps=4)
 
 
 _WARM: set = set()

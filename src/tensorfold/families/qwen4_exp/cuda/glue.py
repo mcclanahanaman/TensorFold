@@ -108,6 +108,8 @@ def hc_writeback(h: torch.Tensor, hout: torch.Tensor, pss: torch.Tensor, streams
                  y: torch.Tensor | None = None, wts: torch.Tensor | None = None, block: int = 256) -> None:
     """mode 3: ``branch`` is the gathered partials [world, R, D] fp32 (contiguous); mode 4: a matmul's K slices [SK, R, D] fp32."""
 
+    if y is not None and not isinstance(y, torch.Tensor):    # mode 2 slots kept in the experts' rows (thor_glue.Rows)
+        return y.writeback(h, hout, pss, streams, mode, inject, wts)
     rows, wide = h.shape
     d = wide // streams
     top = (wts.shape[1] - 1) if wts is not None else 1

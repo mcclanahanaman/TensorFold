@@ -229,6 +229,15 @@ class FlashNextEngine:
                   + ("fused, TensorFold's bits" if thor_hc.S.active else "on TensorFold's kernels")
                   + f" ({thor_hc.S.note}), ready in {time.perf_counter() - began:.1f}s "
                   f"({thor_hc.ENV}=0 keeps TensorFold's)", flush=True)
+        from . import thor_glue
+
+        if quant_method(read_config(model_dir)) == "modelopt" and thor_glue.available():
+            began = time.perf_counter()              # Thor's routed experts: the prompt glue, checked like thor_hc's
+            thor_glue.prepare(w)
+            print(f"[tensorfold] Thor (sm_110): prompt expert glue "
+                  + ("without the scatter, TensorFold's bits" if thor_glue.S.active else "on TensorFold's kernels")
+                  + f" ({thor_glue.S.note}), ready in {time.perf_counter() - began:.1f}s "
+                  f"({thor_glue.ENV}=0 keeps TensorFold's)", flush=True)
         started = time.perf_counter()
         if self.concurrent:
             self.multi.warm()

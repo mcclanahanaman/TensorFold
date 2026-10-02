@@ -14,7 +14,7 @@ import torch
 from tensorfold.cuda.nvfp4 import experts as nvx
 from tensorfold.cuda.nvfp4 import thor_experts as thor
 
-from . import nvfp4
+from . import nvfp4, thor_glue
 
 
 @dataclass
@@ -68,12 +68,12 @@ def routed_dense(routed, e: int, which: str) -> torch.Tensor:
     return (thor.dense if isinstance(routed, thor.ThorExperts) else nvx.dense)(routed, e, which)
 
 
-def _shared(lin, x: torch.Tensor, prompt: bool, f32: bool) -> torch.Tensor:
+def _shared(lin, x: torch.Tensor, prompt: bool, f32: bool, out: torch.Tensor | None = None) -> torch.Tensor:
     """The shared expert's matmul: bf16 weights on the FP4 kernel's exact tables, MXFP8 ones on the lane matmul."""
 
     if isinstance(lin, nvfp4.FP4):
-        return nvfp4.matmul(x, lin, f32=f32)
-    return lin.prefill(x) if prompt else lin(x)
+        return nvfp4.matmul(x, lin, f32=f32, out=out)
+    return lin.prefill(x, out) if prompt else lin(x, out)
 
 
 def expert4_from_bf16(gate: torch.Tensor, up: torch.Tensor, down: torch.Tensor) -> Expert4:
@@ -127,8 +127,13 @@ def moe4_from_experts(gate: list, up: list, down: list, shared: tuple) -> MoE4:
     return moe4_from_checkpoint(stack(gate), stack(up), stack(down), shared)
 
 
-def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg) -> None:
-    """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases."""
+def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, buf, cfg, *,
+        unscattered: bool = False) -> None:
+    """Route rows x [R, D] and run their experts into buf (the shared ``moe`` contract); ``xs`` unused: no biases.
+
+    ``unscattered`` (one GPU): a Thor prompt pass (thor_glue) may leave the routed outputs in the experts' permuted rows
+    and the shared expert's in a block of its own; ``buf.kept`` then holds them for the write-back (a ``thor_glue.Rows``,
+    valid until the next call), else it is None and buf.y holds every slot."""
 
     from tensorfold.cuda import moe as moe_mod
 
@@ -138,13 +143,21 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, 
     moe_mod.router(x, router_rows, buf.logits[:rows])
     moe_mod.select(buf.logits[:rows], buf, top_k, ex.routed, thor.tactic(rows)[0] if on_thor else nvx.PREFILL_TILE)
     prompt = buf.y.dtype != torch.float32                  # a prompt's buffers keep bf16 slots
+    keep = on_thor and unscattered and prompt and buf.plan.prefill and thor_glue.S.active
+    buf.kept = None
     if on_thor:
         scratch = getattr(buf, "thor", None)
         if scratch is None:
             raise RuntimeError("these buffers were built without the Thor experts' scratch (attach_thor at load)")
-        thor.run(x, routed, buf.plan, buf.y, rows, top_k, scratch)
+        thor.run(x, routed, buf.plan, buf.y, rows, top_k, scratch, scatter=not keep)
     else:
         nvx.gate_up(x, routed, buf.plan, buf.act.view(-1, ex.width), rows, skip=ex.routed)
+    if keep:                     # the same SwiGLU in one kernel; the down projection into y's (unused) first rows
+        thor_glue.swiglu(_shared(ex.shared.gu, x, prompt, False), ex.width, buf.act[:rows, top_k])
+        shared = buf.y.view(-1, ex.dims)[:rows]
+        _shared(ex.shared.down, buf.act[:rows, top_k], prompt, False, out=shared)
+        buf.kept = thor_glue.Rows(scratch.hidden, scratch.pos, shared, buf.slots)
+        return buf
     buf.act[:rows, top_k] = ex.shared_act(x, prompt)
     if not on_thor:
         nvx.down(buf.act.view(-1, ex.width), routed, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed)
