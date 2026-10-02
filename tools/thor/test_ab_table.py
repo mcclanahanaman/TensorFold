@@ -134,3 +134,94 @@ def test_ledger_metrics_of_one_run(out):
     _run(out, "--ledger", str(out / "ledger.json"), "--ledger-run", "on:1")
     led = json.loads((out / "ledger.json").read_text())
     assert led == {"prefill_8k": 2100.0, "decode_1": 41.0, "decode_3": 76.0, "followup_s": 0.14}
+
+
+# --- card tk-ab-decode: decode at several stream counts (serve_ab.py --streams 2,3,4) and the follow-ups' first turns
+
+
+def _ab_streams(by: dict, one_sha: str, first_ttft: list) -> dict:
+    """A serve_ab.py report with ``decode.by_streams`` ({count: [(tok_s, acceptance, sha), ...]}, wall = 10 x count)
+    and follow-ups whose first turns carry ``ttft_s`` ([(target, ttft), ...])."""
+
+    by_streams = {str(n): {"wall_tok_s": 10.0 * n, "server_sum_tok_s": sum(v for v, _, _ in rows),
+                           "streams": [{"server_decode_tok_s": v, "acceptance": a, "token_sha": h}
+                                       for v, a, h in rows]} for n, rows in by.items()}
+    many = by_streams.get("3") or by_streams[str(max(by))]
+    return {"prefill": [{"target": 8192, "round": 0, "tok_s": 1000.0, "token_sha": "p"}],
+            "followups": [{"target": t, "first": {"ttft_s": s, "token_sha": f"f{t}"},
+                           "next": {"ttft_s": 0.2, "prompt_tokens": t + 100, "cached": t}} for t, s in first_ttft],
+            "decode": {"one": {"server_decode_tok_s": 40.0, "acceptance": 0.6, "token_sha": one_sha},
+                       "many": many, "by_streams": by_streams}}
+
+
+@pytest.fixture
+def streams_out(tmp_path: Path) -> Path:
+    by = {4: [(20.0, 0.5, "d"), (21.0, 0.7, "e"), (22.0, None, "f"), (23.0, 0.9, "g")],
+          2: [(30.0, 0.4, "a"), (31.0, 0.6, "b")],
+          3: [(25.0, None, "a"), (26.0, None, "b"), (27.0, None, "c")]}
+    first = [(16384, 8.0), (61440, 37.0), (16384, 10.0)]
+    (tmp_path / "ab_stock_1.json").write_text(json.dumps(_ab_streams(by, "o", first)))
+    by_on = {n: [(v + 1.0, a, h) for v, a, h in rows] for n, rows in by.items()}
+    by_on[4][3] = (24.0, 0.9, "x")                                  # one of the 4-stream replies differs
+    (tmp_path / "ab_on_1.json").write_text(json.dumps(_ab_streams(by_on, "o", [(16384, 4.0), (61440, 18.5),
+                                                                                (16384, 5.0)])))
+    return tmp_path
+
+
+def _run_streams(out: Path, *extra: str) -> dict:
+    args = [str(out), "--configs", "stock,on", "--rounds", "1", "--baseline", "stock",
+            "--json", str(out / "t.json"), "--markdown", str(out / "t.md"), *extra]
+    assert ab_table.main(args) == 0
+    return json.loads((out / "t.json").read_text())
+
+
+def test_decode_by_stream_count_replaces_the_single_many_entry(streams_out):
+    s = _run_streams(streams_out)["summary"]
+    keys = list(s)
+    decode = [k for k in keys if k.startswith("decode ")]
+    assert decode == ["decode 1 tok/s", "decode 1 MTP acceptance",
+                      "decode 2 wall tok/s", "decode 2 server sum", "decode 2 MTP acceptance",
+                      "decode 3 wall tok/s", "decode 3 server sum",
+                      "decode 4 wall tok/s", "decode 4 server sum", "decode 4 MTP acceptance"]
+    assert s["decode 2 wall tok/s"]["by_run"]["stock r1"] == pytest.approx(20.0)
+    assert s["decode 4 server sum"]["by_run"]["stock r1"] == pytest.approx(86.0)
+    assert s["decode 4 server sum"]["by_run"]["on r1"] == pytest.approx(90.0)
+    assert s["decode 4 MTP acceptance"]["by_run"]["stock r1"] == pytest.approx(0.7)      # (0.5 + 0.7 + 0.9) / 3
+    assert s["decode 2 MTP acceptance"]["by_run"]["stock r1"] == pytest.approx(0.5)
+    assert s["decode 4 server sum"]["ratio"]["on"] == pytest.approx(90.0 / 86.0)
+
+
+def test_first_turn_ttft_of_each_follow_up_target(streams_out):
+    s = _run_streams(streams_out)["summary"]
+    assert s["first turn 16k s"]["by_run"] == {"stock r1": pytest.approx(9.0), "on r1": pytest.approx(4.5)}
+    assert s["first turn 60k s"]["by_run"]["on r1"] == pytest.approx(18.5)
+    assert s["first turn 60k s"]["ratio"]["on"] == pytest.approx(18.5 / 37.0)
+    keys = list(s)
+    assert keys.index("first turn 16k s") < keys.index("follow-up 16k s") < keys.index("first turn 60k s")
+    assert "first turn 16k s" not in _run(_legacy_out(streams_out))["summary"]   # first turns without ttft_s
+
+
+def _legacy_out(streams_out: Path) -> Path:
+    """The tk-ab-table fixture's reports (first turns without ttft_s, decode without by_streams) in a sub-folder."""
+
+    sub = streams_out / "legacy"
+    sub.mkdir()
+    shas = [f"h{i}" for i in range(8)]
+    for c in ("stock", "on"):
+        for r in (1, 2):
+            ab = _ab({8192: [1000.0, 1100.0]}, [(16384, 0.20, 16500, 16440)], (40.0, 0.6),
+                     [(30.0, 0.5), (31.0, 0.5), (32.0, 0.5)], 75.0, shas[:7])
+            (sub / f"ab_{c}_{r}.json").write_text(json.dumps(ab))
+    return sub
+
+
+def test_same_reply_tokens_follow_the_stream_counts_in_order(streams_out):
+    same = _run_streams(streams_out)["same_tokens"]
+    # prefill 1 + first turns 3 + decode.one 1 + streams 2 + 3 + 4 (counts in ascending order) = 14; one differs
+    assert same == {"on r1 vs stock r1": "13/14"}
+
+
+def test_ledger_takes_users_4_from_the_4_stream_wall_rate(streams_out):
+    _run_streams(streams_out, "--ledger", str(streams_out / "ledger.json"), "--ledger-run", "on:1")
+    led = json.loads((streams_out / "ledger.json").read_text())
+    assert led == {"prefill_8k": 1000.0, "decode_1": 40.0, "decode_3": 30.0, "users_4": 40.0, "followup_s": 0.2}

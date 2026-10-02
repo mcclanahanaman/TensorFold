@@ -1,5 +1,7 @@
 """A/B result tables for the serve_ab.py and natural_prefill.py reports: per-run metrics, per-config means and
-ratios, same-reply-token checks, and a one-run ledger of the headline numbers.
+ratios, same-reply-token checks, and a one-run ledger of the headline numbers. When a report carries
+decode.by_streams the decode metrics are emitted per stream count, and each follow-up target's first-turn
+TTFT becomes a "first turn ... s" metric.
 
 Reads DIR/ab_<config>_<round>.json (serve_ab.py) and DIR/nat_<config>_<round>.json (natural_prefill.py); a
 missing file simply contributes no metrics for that run. Writes the {'summary': ..., 'same_tokens': ...} JSON,
@@ -19,7 +21,7 @@ from pathlib import Path
 
 LEDGER_KEYS = [("prefill_8k", "prefill 8k"), ("prefill_32k", "prefill 32k"), ("prefill_128k", "prefill 128k"),
                ("decode_1", "decode 1 tok/s"), ("decode_3", "decode 3 wall tok/s"),
-               ("followup_s", "follow-up 60k s")]
+               ("users_4", "decode 4 wall tok/s"), ("followup_s", "follow-up 60k s")]
 
 
 def load(path: Path):
@@ -42,7 +44,11 @@ def run_metrics(ab, nat):
             m[f"prefill {t // 1024}k first"] = vals[0]
         followups = ab.get("followups") or []
         for t in sorted({f["target"] for f in followups}):
-            nxt = [f["next"] for f in followups if f["target"] == t]
+            rows_t = [f for f in followups if f["target"] == t]
+            first = [f["first"]["ttft_s"] for f in rows_t if f["first"].get("ttft_s") is not None]
+            if first:
+                m[f"first turn {t // 1024}k s"] = st.mean(first)
+            nxt = [f["next"] for f in rows_t]
             m[f"follow-up {t // 1024}k s"] = st.mean(x["ttft_s"] for x in nxt)
             m[f"follow-up {t // 1024}k filled"] = st.mean(x["prompt_tokens"] - x["cached"] for x in nxt)
             m[f"follow-up {t // 1024}k resumed at"] = st.mean(x["cached"] for x in nxt)
@@ -52,14 +58,25 @@ def run_metrics(ab, nat):
             m["decode 1 tok/s"] = one.get("server_decode_tok_s")
             if one.get("acceptance") is not None:
                 m["decode 1 MTP acceptance"] = one["acceptance"]
-        many = d.get("many")
-        if many is not None:
-            m["decode 3 wall tok/s"] = many.get("wall_tok_s")
-            m["decode 3 server sum"] = many.get("server_sum_tok_s")
-            acc = [s.get("acceptance") for s in many.get("streams") or []
-                   if s.get("acceptance") is not None]
-            if acc:
-                m["decode 3 MTP acceptance"] = st.mean(acc)
+        by_streams = d.get("by_streams")
+        if by_streams is not None:
+            for k in sorted(by_streams, key=int):
+                n, e = int(k), by_streams[k]
+                m[f"decode {n} wall tok/s"] = e["wall_tok_s"]
+                m[f"decode {n} server sum"] = e["server_sum_tok_s"]
+                acc = [s.get("acceptance") for s in e.get("streams") or []
+                       if s.get("acceptance") is not None]
+                if acc:
+                    m[f"decode {n} MTP acceptance"] = st.mean(acc)
+        else:
+            many = d.get("many")
+            if many is not None:
+                m["decode 3 wall tok/s"] = many.get("wall_tok_s")
+                m["decode 3 server sum"] = many.get("server_sum_tok_s")
+                acc = [s.get("acceptance") for s in many.get("streams") or []
+                       if s.get("acceptance") is not None]
+                if acc:
+                    m["decode 3 MTP acceptance"] = st.mean(acc)
     if nat:
         tokens = nat.get("tokens", 32768)
         for kind in ("cold", "warm"):
@@ -75,10 +92,13 @@ def run_shas(ab):
     if not ab:
         return None
     d = ab.get("decode") or {}
+    by = d.get("by_streams")
+    streams = ([s.get("token_sha") for k in sorted(by, key=int) for s in by[k].get("streams") or []]
+               if by is not None
+               else [s.get("token_sha") for s in (d.get("many") or {}).get("streams") or []])
     return ([r.get("token_sha") for r in ab.get("prefill") or []]
             + [f["first"].get("token_sha") for f in ab.get("followups") or []]
-            + [(d.get("one") or {}).get("token_sha")]
-            + [s.get("token_sha") for s in (d.get("many") or {}).get("streams") or []])
+            + [(d.get("one") or {}).get("token_sha")] + streams)
 
 
 def build_summary(rows, configs, rounds, baseline):
