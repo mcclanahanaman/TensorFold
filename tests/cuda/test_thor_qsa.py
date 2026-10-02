@@ -167,6 +167,23 @@ def test_sparse_prompts_keep_their_bits_on_this_path(thor_on, dtype, bits, sampl
             assert float((a.float() - b.float()).abs().max()) <= 0.05 * max(1.0, float(b.float().abs().max()))
 
 
+def test_a_4bit_cache_keeps_tensorfolds_kernels_after_an_8bit_engine_turned_the_path_on(thor_on):
+    """The path is process-wide: once an 8-bit engine has turned it on (its buffers with a shadow), a 4-bit cache's
+    prompt passes still run TensorFold's kernels (the shadow stages 8-bit codes only), with TensorFold's bits."""
+
+    w = _model()
+    prompt = [(37 * i + 11) % V for i in range(2600)]            # rows past 2,051 keys are sparse
+    assert thor_on(8) and thor_qsa.use()
+    e = Engine(w, capacity=4096, max_rows=8, prefill_rows=512, kv_dtype="int4")
+    assert e.pbuf.thor_shadow is not None                         # buffers built while the 8-bit path was on
+    first = prefill(e, prompt, None)
+    got = _state(e)
+    thor_qsa.set_active(False)
+    tf_e = Engine(w, capacity=4096, max_rows=8, prefill_rows=512, kv_dtype="int4")
+    assert prefill(tf_e, prompt, None) == first
+    assert all(torch.equal(a, b) for a, b in zip(got, _state(tf_e)))
+
+
 def test_whole_and_block_staging_give_the_same_bits():
     """A segment stages its whole context or block by block; the attention reads the same values either way."""
 

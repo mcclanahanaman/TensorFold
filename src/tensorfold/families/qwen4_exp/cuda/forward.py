@@ -293,7 +293,8 @@ def attn_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: in
             if b.attn.qsa:
                 attn_mod.qsa_pool(ikc, pooled, pos, a.ik_scale, w.inv_freq, c.eps, b.attn, a1 - a0, rope=rope,
                                   delta=delta, length=length, sections=sections)
-            thor = thor_qsa.use() and (bits == 0 or b.thor_shadow is not None)    # Thor (sm_110): see thor_qsa
+            # Thor (sm_110), see thor_qsa: a bf16 cache, or an 8-bit one through the buffers' shadow; never a 4-bit one
+            thor = thor_qsa.use() and (bits == 0 or bits == 8 and b.thor_shadow is not None)
             whole = thor and bits and a1 - a0 > ATT_ROWS          # several row blocks: the 8-bit cache staged once
             if whole:
                 thor_qsa.stage_all(cache, b.thor_shadow, host_pos + a1 - a0)
