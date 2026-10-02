@@ -1,7 +1,8 @@
 """A/B result tables for the serve_ab.py and natural_prefill.py reports: per-run metrics, per-config means and
 ratios, same-reply-token checks, and a one-run ledger of the headline numbers. When a report carries
 decode.by_streams the decode metrics are emitted per stream count, and each follow-up target's first-turn
-TTFT becomes a "first turn ... s" metric.
+TTFT becomes a "first turn ... s" metric. A target with a second prefill request also gets a
+"prefill <k>k second" metric (its second request on the same server: the stall watch).
 
 Reads DIR/ab_<config>_<round>.json (serve_ab.py), DIR/nat_<config>_<round>.json (natural_prefill.py),
 DIR/mem_<config>_<round>.json (serve_digest.py) and DIR/gbc_<config>_<round>.json (thor_divergence.py
@@ -50,6 +51,8 @@ def run_metrics(ab, nat, mem=None, gbc=None):
             vals = [r["tok_s"] for r in prefill if r["target"] == t]
             m[f"prefill {t // 1024}k"] = st.mean(vals)
             m[f"prefill {t // 1024}k first"] = vals[0]
+            if len(vals) >= 2:
+                m[f"prefill {t // 1024}k second"] = vals[1]
         followups = ab.get("followups") or []
         for t in sorted({f["target"] for f in followups}):
             rows_t = [f for f in followups if f["target"] == t]

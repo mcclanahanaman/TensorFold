@@ -16,6 +16,8 @@ DEFAULT_PAIRS = [
     ("select_tf_ms", "select_new_ms"),
     ("rows_thor_ms", "rows_new_ms"),
     ("rows_tf_ms", "rows_new_ms"),
+    ("select_tf_ms", "select_sel_ms"),
+    ("select_new_ms", "select_sel_ms"),
 ]
 FIELDS = [
     ("attn_tf_ms", 3),
@@ -27,8 +29,9 @@ FIELDS = [
     ("rows_new_ms", 3),
 ]
 HEADER = ("| prompt | p0 | layers | attn tf ms | attn r19 ms | attn new ms | select tf ms | select new ms "
-          "| rows r19 ms | rows new ms | attn r19/new | select tf/new | err new/tf max | select equal |")
-SEPARATOR = "|---" * (3 + len(FIELDS) + 4)
+          "| rows r19 ms | rows new ms | attn r19/new | select tf/new | err new/tf max | select equal "
+          "| select sel ms | select tf/sel | sel equal |")
+SEPARATOR = "|---" * 17
 
 
 def _num(v):
@@ -108,6 +111,9 @@ def markdown(summary, sp):
             cells.append(_cell(speed.get("select_tf_ms/select_new_ms"), 2))
             cells.append(_cell(row.get("err_ratio_new_max"), 2))
             cells.append(_cell(row.get("select_new_equal"), 0))
+            cells.append(_cell(row.get("select_sel_ms"), 3))
+            cells.append(_cell(speed.get("select_tf_ms/select_sel_ms"), 2))
+            cells.append(_cell(row.get("select_sel_equal"), 0))
             lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
