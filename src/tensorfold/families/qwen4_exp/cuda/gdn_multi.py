@@ -30,7 +30,8 @@ class Scratch:
 class Tables:
     """A round's device tables: rows' streams and conv taps, layers' conv and state pointers, chains, pending rows."""
 
-    def __init__(self, w, scratch: Scratch, segs: Sequence, pending: Sequence[Sequence[int]]) -> None:
+    def __init__(self, w, scratch: Scratch, segs: Sequence, pending: Sequence[Sequence[int]],
+                 width: int | None = None) -> None:
         n, rows = len(segs), segs[-1][2]
         lin = scratch.lin
         taps = np.arange(4)[None, :]
@@ -41,7 +42,7 @@ class Tables:
             win[a0:a1] = np.where(j < 3, j, a0 + j)            # < 3: a conv state row, else window row tap - 3
             sid[a0:a1] = s
         entries, starts, slots, most = shared.plan_host([list(range(-1, a1 - a0 - 1)) for _, a0, a1 in segs])
-        width = max([len(rows_) for rows_ in pending] + [1])
+        width = max([len(rows_) for rows_ in pending] + [1, width or 0])      # a decode graph's: its widest
         held = np.zeros((n, width), dtype=np.int32)             # each stream's last-round kept rows, not yet folded
         for s, rows_ in enumerate(pending):
             held[s, :len(rows_)] = rows_

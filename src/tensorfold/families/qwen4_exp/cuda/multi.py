@@ -24,6 +24,7 @@ from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapsho
 from .mtp import mtp_compute, mtp_stage
 from .prompt_plan import keeps_pool, pass_limit
 from .state import ENDS, Buffers, State
+from . import thor_graphs
 from ..cuda import CONFIDENCE, DEPTH
 
 FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
@@ -64,6 +65,8 @@ class MultiDecoder:
         self.mbuf = Buffers(w, rows, capacity) if w.mtp is not None else None
         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
+        # Thor (sm_110): a round's forwards replay CUDA graphs (thor_graphs; TENSORFOLD_THOR_DECODE_GRAPH=0: eager)
+        self.graphs = thor_graphs.DecodeGraphs(depth + 1) if thor_graphs.available() else None
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
         # slots start small and grow with their stream's context, up to the window, while the gate has room
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
@@ -471,13 +474,18 @@ class MultiDecoder:
                 ended += self._failed(pieces, exc)
                 pieces = []
         held = [self.held.pop(s.sid, []) for s in live]
-        tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, held)
-        self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
+        graphs = None if pieces else self.graphs         # a round that shares its experts with a pass stays eager
+        tables = self.buf.gdn_tables = gdn_multi.Tables(self.w, self.gdn, segs, held,
+                                                        width=None if graphs is None else graphs.width)
+        step = self.buf.attn_step = attn_multi.Step(self.w, segs, mtp=False)
         try:
             if pieces:                                 # the window and the pass: each layer's experts once for both
                 pends = self._end_rows(pieces, psegs)
                 logits, heads = compute_mixed(self.w, segs, self.buf, psegs, self.pbuf, ends=pends, cuts=cuts)
                 heads = heads[:len(pends)].clone() if pends else None
+            elif graphs is not None:
+                logits = graphs.run("verify", segs, self.buf, lambda: compute(self.w, segs, self.buf), step=step,
+                                    tables=tables)
             else:
                 logits = compute(self.w, segs, self.buf)
         finally:
@@ -568,8 +576,10 @@ class MultiDecoder:
     def _mtp(self, segs: list) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
 
-        self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
+        step = self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
         try:
+            if self.graphs is not None:
+                return self.graphs.run("mtp", segs, self.mbuf, lambda: mtp_compute(self.w, segs, self.mbuf), step=step)
             return mtp_compute(self.w, segs, self.mbuf)
         finally:
             self.mbuf.attn_step = None

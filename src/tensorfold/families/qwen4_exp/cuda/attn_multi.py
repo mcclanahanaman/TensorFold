@@ -111,6 +111,7 @@ class Step:
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
         self.most = max(counts)
+        self.context = None             # a decode graph's key bound (thor_graphs.bucket); None: this step's own keys
         self.vision = any(st.image_positions is not None for st, _, _ in segs)
         self.vision_ptrs = self.ptrs[0]
         if self.vision:
@@ -147,8 +148,9 @@ def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:
         for (st, a0, a1), end in zip(step.segs, step.ends):
             if end // sc.ratio > top:                # this stream has sparse rows: its own select
                 _, _, pooled, pos, _ = _caches(layer, st, mtp)
-                attn_mod.qsa_rows(b.iq[a0:a1], pooled, pos, _rows_from(sc, a0), a1 - a0, context=end)
-    keys = max(step.ends)
+                attn_mod.qsa_rows(b.iq[a0:a1], pooled, pos, _rows_from(sc, a0), a1 - a0,
+                                  context=end if step.context is None else step.context)
+    keys = max(step.ends) if step.context is None else step.context
     if sc.qsa:
         keys = min(keys, (top + 1) * sc.ratio - 1)
     chunks = min(sc.nch, triton.cdiv(keys, CHUNK))
