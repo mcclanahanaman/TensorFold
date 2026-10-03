@@ -33,9 +33,9 @@ with a prompt pass stays eager):
 - an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
   them by the picks' width), so a chain step is one replay and one read of host memory.
 
-Graphs are opt-in (``TENSORFOLD_THOR_DECODE_GRAPH=1``; unset or 0 keeps every round eager, as before); ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N``
-graphs only forwards of at most N streams (``_CAP``: the most graphs kept). Events go to stderr as
-``[thor-graph] {json}`` lines (``tools/thor/graph_stats.py`` digests them).
+Graphs are on by default on Thor (THOR-DEC-1 G-D ruling, 2026-10-03; ``TENSORFOLD_THOR_DECODE_GRAPH=0`` keeps every
+round eager, the r37 path and the kill switch); ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N`` graphs only forwards of at
+most N streams (``_CAP``: the most graphs kept). Events go to stderr as ``[thor-graph] {json}`` lines (``tools/thor/graph_stats.py`` digests them).
 """
 
 from __future__ import annotations
@@ -77,7 +77,7 @@ MIB = float(1 << 20)
 
 
 def _off() -> bool:
-    return os.environ.get(ENV, "0").strip().lower() in ("0", "off", "false", "no")
+    return os.environ.get(ENV, "1").strip().lower() in ("0", "off", "false", "no")   # on by default (DEC-1 G-D)
 
 
 def _flag(name: str, default: str) -> bool:

@@ -170,3 +170,17 @@ def test_prerecord_after_the_gate_charges_the_room(monkeypatch):
     assert g.captures == {"verify": 2, "mtp": DEPTH + 1}, g.captures
     assert len(charged) == 1 and 0 <= charged[0] < 1 << 30
     assert dec.memory_gate.room == (64 << 30) - charged[0]
+
+
+def test_graphs_default_on_for_one_stream(monkeypatch):
+    """THOR-DEC-1 G-D ruling: graphs are on unless TENSORFOLD_THOR_DECODE_GRAPH is 0 (the r37 path, the kill switch),
+    for forwards of one stream by default."""
+
+    monkeypatch.delenv(thor_graphs.ENV, raising=False)
+    assert not thor_graphs._off()
+    assert thor_graphs.STREAMS == 1
+    for value in ("0", "off", "false", "no"):
+        monkeypatch.setenv(thor_graphs.ENV, value)
+        assert thor_graphs._off()
+    monkeypatch.setenv(thor_graphs.ENV, "1")
+    assert not thor_graphs._off()

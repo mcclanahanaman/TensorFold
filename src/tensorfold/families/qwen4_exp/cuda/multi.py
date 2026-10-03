@@ -65,7 +65,7 @@ class MultiDecoder:
         self.mbuf = Buffers(w, rows, capacity) if w.mtp is not None else None
         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
-        # Thor (sm_110): a round's forwards may replay CUDA graphs (thor_graphs; opt-in, TENSORFOLD_THOR_DECODE_GRAPH=1)
+        # Thor (sm_110): a round's forwards may replay CUDA graphs (thor_graphs; on by default, TENSORFOLD_THOR_DECODE_GRAPH=0: off)
         self.slots = slots
         head = w.head if w.draft_head is None else w.draft_head
         self.draft_n = head.n                            # the draft head's columns (the picks' widest top-k)
