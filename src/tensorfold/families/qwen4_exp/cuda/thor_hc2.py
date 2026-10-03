@@ -291,25 +291,26 @@ def _up_mma(a_bufs, w_bufs, acc, ready, empty, acc_ready, acc_empty, M, D: gl.co
 
 
 @gluon.jit
-def _normed(h_s, st: gl.constexpr, rinv, SCALE, dd, D: gl.constexpr, q: gl.constexpr):
+def _mix_term(acc_s, hv, PSS, SCALE, rows, dd, st: gl.constexpr, M, eps, D: gl.constexpr, S: gl.constexpr,
+              NC: gl.constexpr, q: gl.constexpr):
+    """Stream st's term of glue._hc_mix: bf16(bf16(sigmoid(up)) * normed), normed as glue._hc_normed stores it."""
+
+    rinv = _rinv(PSS, rows, M, st, eps, D, S, NC)
     sc = gl.load(SCALE + st * D + dd).to(gl.float32)
-    return (h_s.index(st).load(q).to(gl.float32) * rinv[:, None] * sc[None, :]).to(gl.bfloat16)
-
-
-@gluon.jit
-def _mix_term(acc_s, nv, q: gl.constexpr):
+    nv = (hv.to(gl.float32) * rinv[:, None] * sc[None, :]).to(gl.bfloat16).to(gl.float32)
     up = acc_s.load(q).to(gl.bfloat16).to(gl.float32)
-    return (_gsig(up) * nv.to(gl.float32)).to(gl.bfloat16).to(gl.float32)
+    return (_gsig(up) * nv).to(gl.bfloat16).to(gl.float32)
 
 
 @gluon.jit
 def _up_mix(acc, h_s, o_s, acc_ready, acc_empty, h_ready, h_empty, o_desc, PSS, SCALE, M, eps, D: gl.constexpr,
             S: gl.constexpr, NC: gl.constexpr, DB: gl.constexpr, num_warps: gl.constexpr):
-    """A tile: the four normed streams from h (before the projections are ready, so h's buffer is free early), then
-    glue._hc_mix's sum in stream order from 0 and its rounding."""
+    """A tile: h's four blocks into registers (its buffer freed for the next tile's), then glue._hc_mix's sum in stream
+    order from 0 and its rounding (hcf2-p3: faster than normalizing before the projections are ready)."""
 
     NDT: gl.constexpr = D // DB
-    q: gl.constexpr = get_tmem_reg_layout(gl.float32, (_BM, DB), TensorMemoryLayout((_BM, DB), col_stride=1), num_warps)
+    q: gl.constexpr = get_tmem_reg_layout(gl.float32, (_BM, DB), TensorMemoryLayout((_BM, DB), col_stride=1),
+                                          num_warps)
     ntiles = gl.cdiv(M, _BM) * NDT
     tc = 0
     for t in range(gl.program_id(0), ntiles, gl.num_programs(0)):
@@ -317,24 +318,20 @@ def _up_mix(acc, h_s, o_s, acc_ready, acc_empty, h_ready, h_empty, o_desc, PSS, 
         d0 = (t % NDT) * DB
         rows = off_m + gl.arange(0, _BM, gl.SliceLayout(1, q))
         dd = d0 + gl.arange(0, DB, gl.SliceLayout(0, q))
-        r0 = _rinv(PSS, rows, M, 0, eps, D, S, NC)
-        r1 = _rinv(PSS, rows, M, 1, eps, D, S, NC)
-        r2 = _rinv(PSS, rows, M, 2, eps, D, S, NC)
-        r3 = _rinv(PSS, rows, M, 3, eps, D, S, NC)
         mbarrier.wait(h_ready, tc & 1)
-        n0 = _normed(h_s, 0, r0, SCALE, dd, D, q)
-        n1 = _normed(h_s, 1, r1, SCALE, dd, D, q)
-        n2 = _normed(h_s, 2, r2, SCALE, dd, D, q)
-        n3 = _normed(h_s, 3, r3, SCALE, dd, D, q)
+        h0 = h_s.index(0).load(q)
+        h1 = h_s.index(1).load(q)
+        h2 = h_s.index(2).load(q)
+        h3 = h_s.index(3).load(q)
         fence_async_shared()
         mbarrier.arrive(h_empty, count=1)
         b = tc % 2
         mbarrier.wait(acc_ready.index(b), (tc // 2) & 1)
         total = gl.zeros([_BM, DB], gl.float32, q)
-        total += _mix_term(acc.index(b * 4 + 0), n0, q)
-        total += _mix_term(acc.index(b * 4 + 1), n1, q)
-        total += _mix_term(acc.index(b * 4 + 2), n2, q)
-        total += _mix_term(acc.index(b * 4 + 3), n3, q)
+        total += _mix_term(acc.index(b * 4 + 0), h0, PSS, SCALE, rows, dd, 0, M, eps, D, S, NC, q)
+        total += _mix_term(acc.index(b * 4 + 1), h1, PSS, SCALE, rows, dd, 1, M, eps, D, S, NC, q)
+        total += _mix_term(acc.index(b * 4 + 2), h2, PSS, SCALE, rows, dd, 2, M, eps, D, S, NC, q)
+        total += _mix_term(acc.index(b * 4 + 3), h3, PSS, SCALE, rows, dd, 3, M, eps, D, S, NC, q)
         mbarrier.arrive(acc_empty.index(b), count=1)
         tma.store_wait(pendings=0)
         o_s.store((total / S).to(gl.bfloat16))
