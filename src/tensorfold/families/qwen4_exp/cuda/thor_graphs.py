@@ -22,7 +22,13 @@ with a prompt pass stays eager):
 - ``prerecord`` records the one-stream keys of short contexts at startup, on a free slot reset after, so requests
   never pay a recording and the graphs' memory is taken before the memory gate measures the room; other keys then
   stay eager (``TENSORFOLD_THOR_DECODE_GRAPH_LAZY=1`` records them on their second forward, as before;
-  ``TENSORFOLD_THOR_DECODE_GRAPH_STARTUP=0`` records every key that way).
+  ``TENSORFOLD_THOR_DECODE_GRAPH_STARTUP=0`` records every key that way). ``TENSORFOLD_THOR_DECODE_GRAPH_ROWS``
+  (``2-7`` or ``3,4,5``) picks the verification windows recorded: on Thor a graph executable holds driver memory of
+  its own, about 20 MiB a verification forward;
+- a one-stream verification forward always writes DeltaNet scratch half 0 (``gdn_multi.normalize`` copies last
+  round's pending rows to half 1 first, exact copies), so one graph a window size serves both parities;
+- an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
+  them by the picks' width), so a chain step is one replay and one read of host memory.
 
 Graphs are opt-in (``TENSORFOLD_THOR_DECODE_GRAPH=1``; unset or 0 keeps every round eager, as before); ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N``
 graphs only forwards of at most N streams (``_CAP``: the most graphs kept). Events go to stderr as
@@ -45,12 +51,15 @@ from typing import Callable, Sequence
 
 import torch
 
+from . import gdn_multi
+
 ENV = "TENSORFOLD_THOR_DECODE_GRAPH"
 CAP_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_CAP"
 STREAMS_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_STREAMS"
 SPIN_ENV = "TENSORFOLD_THOR_DECODE_SPIN"
 STARTUP_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_STARTUP"
 LAZY_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_LAZY"
+ROWS_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_ROWS"
 CAPABILITY = (11, 0)
 SCHED_MASK, SCHED_SPIN = 0x07, 0x01  # CU_CTX_SCHED_MASK, CU_CTX_SCHED_SPIN
 CAP = 256                   # graphs kept, verification and MTP together
@@ -114,6 +123,16 @@ def settle() -> None:
     ev.record()
     while not ev.query():
         pass
+
+
+def _rows(spec: str, width: int) -> list[int]:
+    """``ROWS_ENV``'s verification windows: ``a-b`` and/or comma-separated sizes, kept within 2..``width``."""
+
+    out: set[int] = set()
+    for part in [p.strip() for p in spec.split(",") if p.strip()]:
+        lo, _, hi = part.partition("-")
+        out.update(range(int(lo), int(hi or lo) + 1))
+    return sorted(r for r in out if 2 <= r <= width)
 
 
 def bucket(end: int) -> int:
@@ -184,6 +203,8 @@ class DecodeGraphs:
         self.tails: list[torch.Tensor] = []         # the graphs' n-gram conv tails, a stream's copied in before a replay
         self.startup = _flag(STARTUP_ENV, "1")      # prerecord the one-stream short-context keys at startup
         self.lazy = _flag(LAZY_ENV, "0")            # after prerecord, record other keys on their second forward too
+        self.rows = _rows(os.environ.get(ROWS_ENV, "") or f"2-{width}", width)   # verification windows prerecorded
+        self.hist: dict[str, list[int]] = {}        # one-stream forwards by kind and rows: [forwards, replays]
         self.fixed = False                          # prerecord ran: unrecorded keys stay eager unless ``lazy``
         self.graphs: OrderedDict[tuple, _Entry] = OrderedDict()
         self.seen: dict[tuple, int] = {}
@@ -195,7 +216,8 @@ class DecodeGraphs:
         self.failed: set[str] = set()
         self.calls = 0
         self._emit({"event": "on", "cap": self.cap, "min_seen": self.min_seen, "streams": self.streams,
-                    "startup": self.startup, "lazy": self.lazy, "ple": self.ple, "free_mib": _free_mib()})
+                    "startup": self.startup, "lazy": self.lazy, "rows": self.rows, "ple": self.ple,
+                    "free_mib": _free_mib()})
 
     @staticmethod
     def _emit(event: dict) -> None:
@@ -206,10 +228,11 @@ class DecodeGraphs:
         return {"event": "stats", "forwards": dict(self.forwards), "replays": dict(self.replays),
                 "captures": dict(self.captures), "evictions": 0, "capture_s": round(self.capture_s, 4),
                 "graph_mib": round(self.graph_mib, 1),
-                "graphs": len(self.graphs), "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1),
+                "graphs": len(self.graphs), "hist": dict(self.hist),
+                "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1),
                 "free_mib": _free_mib()}
 
-    def key(self, kind: str, segs: Sequence, b, step, tables) -> tuple:
+    def key(self, kind: str, segs: Sequence, b, step, tables, extra: tuple = ()) -> tuple:
         """Everything this forward's launches take from the host (see the module docstring)."""
 
         sc = b.attn
@@ -224,13 +247,13 @@ class DecodeGraphs:
                 sig += (pos.data_ptr(),) + ((st.mtp_pooled.data_ptr(),) if mtp else
                                             tuple(p.data_ptr() for p in st.pooled))
             per.append(sig)
-        k = (kind, tuple(per), bool(step.vision), step.context)
+        k = (kind, tuple(per), bool(step.vision), step.context) + tuple(extra)
         if tables is not None:
             k += (tables.cur, bool(tables.folds), tables.plan.slots, tables.plan.max_rows, tables.held.shape[1])
         return k
 
     def run(self, kind: str, segs: Sequence, b, fn: Callable[[], torch.Tensor], *, step,
-            tables=None) -> torch.Tensor:
+            tables=None, extra: tuple = ()) -> torch.Tensor:
         """``fn()``'s forward (it reads ``b``'s step and tables, which hold ``step`` and ``tables``): this round's
         replay of the graph recorded for its launch structure, or an eager run."""
 
@@ -240,13 +263,18 @@ class DecodeGraphs:
             self._emit(self.stats())
         if len(segs) > self.streams:                # eager as before (the widest fold table changes no bits)
             return fn()
+        if tables is not None and tables.cur:       # one parity a graph: this round writes half 0
+            gdn_multi.normalize(tables)
         step.context = bucket(max(step.ends))
-        key = self.key(kind, segs, b, step, tables)
+        key = self.key(kind, segs, b, step, tables, extra)
+        h = self.hist.setdefault(f"{kind}{segs[-1][2]}" if len(segs) == 1 else f"{kind}x{len(segs)}", [0, 0])
+        h[0] += 1
         entry = self.graphs.get(key)
         if entry is not None:
             self._load(entry, kind, segs, step, tables)
             entry.graph.replay()
             self.replays[kind] = self.replays.get(kind, 0) + 1
+            h[1] += 1
             return entry.out
         if self.fixed and not self.lazy:            # the startup set holds the replayed keys; the rest stay eager
             return fn()
@@ -338,10 +366,11 @@ class DecodeGraphs:
                     "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1), "free_mib": free1})
         return _Entry(graph, out, twin_step, twin_tables)
 
-    def prerecord(self, dec) -> None:
+    def prerecord(self, dec, mtp_fn: Callable | None = None) -> None:
         """Record the one-stream keys of short contexts now (``dec``: the ``MultiDecoder``, every slot free): a
-        verification window of 2..``width`` rows at both DeltaNet scratch parities with last round's rows folding in,
-        and an MTP step of 1..``width`` rows, at the first context bucket. Each forward runs eagerly once on a free
+        verification window of each ``rows`` size (scratch half 0, last round's rows folding in) and an MTP step of
+        1..``width`` rows (``mtp_fn(segs)``: the step's forward and picks, keyed by ``dec.picks_key``), at the first
+        context bucket. Each forward runs eagerly once on a free
         slot (it compiles its launches), is recorded, then replays once (the graph's upload); the slot and the scratch
         parity are reset after. A first round (nothing folds in), a one-row verification, a sparse or image stream
         and a longer context stay eager unless ``lazy``."""
@@ -356,22 +385,23 @@ class DecodeGraphs:
         w, st = dec.w, dec.free[-1]
         torch.cuda.synchronize()
         t0, free0, res0 = time.perf_counter(), _free_mib(), torch.cuda.memory_reserved()
-        made = 0
+        made, mem = 0, {"verify": [0.0, 0.0, 0.0], "mtp": [0.0, 0.0, 0.0]}     # free MiB lost: eager, capture, upload
         try:
-            for rows in range(2, self.width + 1):
-                for parity in (0, 1):
-                    segs = stage(w, dec.buf, [(st, [0] * rows)])
-                    dec.gdn.parity = parity
-                    tables = dec.buf.gdn_tables = Tables(w, dec.gdn, segs, [[0]], width=self.width)
-                    step = dec.buf.attn_step = Step(w, segs, mtp=False)
-                    made += self._prerecord("verify", segs, dec.buf, step, tables,
-                                            lambda segs=segs: compute(w, segs, dec.buf))
+            for rows in self.rows:
+                segs = stage(w, dec.buf, [(st, [0] * rows)])
+                dec.gdn.parity = 0
+                tables = dec.buf.gdn_tables = Tables(w, dec.gdn, segs, [[0]], width=self.width)
+                step = dec.buf.attn_step = Step(w, segs, mtp=False)
+                made += self._prerecord("verify", segs, dec.buf, step, tables,
+                                        lambda segs=segs: compute(w, segs, dec.buf), mem)
             if dec.mbuf is not None:
                 for rows in range(1, self.width + 1):
                     segs = mtp_stage(w, dec.mbuf, [(st, [0] * rows, dec.buf.streams[:rows])])
                     step = dec.mbuf.attn_step = Step(w, segs, mtp=True)
-                    made += self._prerecord("mtp", segs, dec.mbuf, step, None,
-                                            lambda segs=segs: mtp_compute(w, segs, dec.mbuf))
+                    fn = (lambda segs=segs: mtp_compute(w, segs, dec.mbuf)) if mtp_fn is None else \
+                        (lambda segs=segs: mtp_fn(segs))
+                    made += self._prerecord("mtp", segs, dec.mbuf, step, None, fn, mem,
+                                            extra=() if mtp_fn is None else dec.picks_key)
         finally:
             dec.buf.gdn_tables = dec.buf.attn_step = None
             if dec.mbuf is not None:
@@ -380,21 +410,33 @@ class DecodeGraphs:
             st.reset(w)
             torch.cuda.synchronize()
         self.fixed = True
+        held = _free_mib()
+        torch.cuda.empty_cache()                    # the warm-ups' cached blocks back to the driver (graphs keep theirs)
         self._emit({"event": "startup", "graphs": made, "s": round(time.perf_counter() - t0, 3),
-                    "graph_mib": round(free0 - _free_mib(), 1),
+                    "graph_mib": round(free0 - _free_mib(), 1), "released_mib": round(_free_mib() - held, 1),
+                    "phase_mib": {k: [round(x, 1) for x in v] for k, v in mem.items()},
                     "pool_mib": round((torch.cuda.memory_reserved() - res0) / MIB, 1), "free_mib": _free_mib()})
 
-    def _prerecord(self, kind: str, segs: Sequence, b, step, tables, fn: Callable[[], torch.Tensor]) -> int:
+    def _prerecord(self, kind: str, segs: Sequence, b, step, tables, fn: Callable[[], torch.Tensor], mem: dict,
+                   extra: tuple = ()) -> int:
         step.context = bucket(max(step.ends))
-        key = self.key(kind, segs, b, step, tables)
+        key = self.key(kind, segs, b, step, tables, extra)
         if key in self.graphs or kind in self.failed:
             return 0
+        f0 = _free_mib()
         fn()                                        # eagerly first: every launch shape compiled before the capture
+        torch.cuda.synchronize()
+        f1 = _free_mib()
         entry = self._record(kind, b, step, tables, fn, segs)
         if entry is None:
             return 0
         self.graphs[key] = entry
+        f2 = _free_mib()
         entry.graph.replay()                        # the upload, now rather than in a request
+        torch.cuda.synchronize()
+        f3 = _free_mib()
+        for i, lost in enumerate((f0 - f1, f1 - f2, f2 - f3)):
+            mem[kind][i] += lost
         return 1
 
 

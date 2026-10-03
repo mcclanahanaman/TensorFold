@@ -61,6 +61,7 @@ class Tables:
         self.plan = shared.Plan(i32[5 * rows:8 * rows].view(rows, 3), i32[8 * rows:at], slots, most)
         self.held, self.held_counts = i32[at:at + n * width].view(n, width), i32[at + n * width:]
         self.folds = bool(counts.any())
+        self.span = max([max(rows_) + 1 for rows_ in pending if len(rows_)] or [0])   # last round's rows they reach
         self.conv, self.state = i64[:lin * n].view(lin, n), i64[lin * n:].view(lin, n)
         self.scratch, self.segs, self.cur = scratch, list(segs), scratch.parity
 
@@ -77,6 +78,20 @@ def block(g, li: int, t: Tables, p: torch.Tensor, eps: float, out: torch.Tensor,
                if t.folds else None)
     y = shared.tree(q, k, v, gt, beta, t.plan, table=t.state[li], pending=pending)
     gdn_io.back(y, p, g.norm, eps, out, xs)
+
+
+def normalize(t: Tables) -> None:
+    """Make this round write scratch half 0, as a decode graph's one parity does (THOR-DEC-1): last round wrote its
+    rows to half 0, so the pending ones are copied to half 1 first, where the fold reads them. Exact copies; a round
+    already writing half 0 is unchanged."""
+
+    if not t.cur:
+        return
+    sc, n = t.scratch, t.span
+    if t.folds and n:
+        for buf in (sc.k, sc.v, sc.g, sc.beta):
+            buf[1, :, :n].copy_(buf[0, :, :n])
+    t.cur = 0
 
 
 def keep(t: Tables, kept: Sequence[int]) -> list[list[int]]:

@@ -98,7 +98,7 @@ def _sequential(w, prompts, counts, *, graphs: bool, capacity: int):
     dec = MultiDecoder(w, slots=len(prompts), capacity=capacity, depth=DEPTH, confidence=0.3)
     dec.graphs = thor_graphs.DecodeGraphs(DEPTH + 1) if graphs else None
     if graphs:
-        dec.graphs.prerecord(dec)
+        dec._prerecord()
     dec.buf.logits.zero_()
     dec.mbuf.logits.zero_()
     outs, rounds, slots = [], [], []
@@ -125,9 +125,16 @@ def test_startup_graphs_serve_any_slot():
     _same_rounds(on_rounds, off_rounds)
     assert len(set(slots)) > 1, "the requests shared one slot"
     assert g.fixed and not g.failed
-    # verification windows of 2..DEPTH+1 rows at two parities, MTP steps of 1..DEPTH+1 rows: nothing recorded later
-    assert g.captures == {"verify": 2 * DEPTH, "mtp": DEPTH + 1}, g.captures
+    # verification windows of 2..DEPTH+1 rows (one DeltaNet parity), MTP steps of 1..DEPTH+1 rows with their greedy
+    # picks: nothing recorded later
+    assert g.captures == {"verify": DEPTH, "mtp": DEPTH + 1}, g.captures
     assert g.replays.get("verify", 0) > 0 and g.replays.get("mtp", 0) > 0, (g.replays, g.forwards)
+
+
+def test_rows_spec():
+    assert thor_graphs._rows("2-7", 7) == [2, 3, 4, 5, 6, 7]
+    assert thor_graphs._rows("3,5-6,9", 7) == [3, 5, 6]
+    assert thor_graphs._rows("1-2", 7) == [2]
 
 
 def test_bucket():

@@ -66,6 +66,11 @@ class MultiDecoder:
         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
         # Thor (sm_110): a round's forwards may replay CUDA graphs (thor_graphs; opt-in, TENSORFOLD_THOR_DECODE_GRAPH=1)
+        self.slots = slots
+        head = w.head if w.draft_head is None else w.draft_head
+        self.draft_n = head.n                            # the draft head's columns (the picks' widest top-k)
+        self.pins: dict[int, torch.Tensor] = {}          # picks width -> pinned host rows a graphed MTP step writes
+        self.picks_key = (1,)                            # the startup MTP graphs' picks width (greedy streams)
         self.graphs = thor_graphs.DecodeGraphs(depth + 1, ple={     # which forwards read the streams' n-gram conv tails
             "verify": any(layer.ple is not None for layer in w.layers),
             "mtp": w.mtp is not None and w.mtp.layer.ple is not None}) if thor_graphs.available() else None
@@ -76,7 +81,7 @@ class MultiDecoder:
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
         if self.graphs is not None:     # Thor: one-stream short-context graphs now, before the gate measures the room
-            self.graphs.prerecord(self)
+            self._prerecord()
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
         # the mapped n-gram tables are not held back (they barely fit on a Spark); lookups page from disk instead
         live = free
@@ -93,6 +98,12 @@ class MultiDecoder:
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+
+    def _prerecord(self) -> None:
+        """Thor: record the one-stream short-context graphs (MTP steps with greedy picks) on a free slot now."""
+
+        self._pin(1)
+        self.graphs.prerecord(self, mtp_fn=lambda segs: self._pick_dev(mtp_compute(self.w, segs, self.mbuf), 1))
 
     def _busy(self) -> set[int]:
         return {id(s.st) for s in [*self.streams.values(), *self.filling]}
@@ -555,12 +566,14 @@ class MultiDecoder:
                 st.mtp_drafted = 0
         windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
         segs = mtp_stage(self.w, self.mbuf, windows)
-        logits = self._mtp(segs)
+        # Thor graphs: each MTP step's graph also holds its picks' reductions and their copy to pinned host memory
+        k = self._k([s.sampling for s, _, _ in todo]) if self.graphs is not None else None
+        logits = self._mtp(segs, k)
         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
             st.set_mtp_len(st.mtp_len + len(keep))
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
         for j in range(self.depth):
-            picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active])
+            picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active], k)
             nxt = []
             for (s, row), (d, p) in zip(active, picks):
                 low = self.confidence > 0 and p < self.confidence
@@ -573,35 +586,69 @@ class MultiDecoder:
                 return
             windows = [(s.st, [d], self.mbuf.streams[row:row + 1]) for s, row, d in nxt]
             segs = mtp_stage(self.w, self.mbuf, windows)
-            logits = self._mtp(segs)
+            k = self._k([s.sampling for s, _, _ in nxt]) if self.graphs is not None else None
+            logits = self._mtp(segs, k)
             for s, _, _ in nxt:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1
             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
 
-    def _mtp(self, segs: list) -> torch.Tensor:
-        """An MTP step over every drafting stream, its attention one launch a kernel for all of them."""
+    def _mtp(self, segs: list, k: int | None = None) -> torch.Tensor:
+        """An MTP step over every drafting stream, its attention one launch a kernel for all of them; with ``k`` (Thor
+        graphs) the step also reduces its picks ``k`` wide and queues them to pinned host memory (``_picks`` reads)."""
 
         step = self.mbuf.attn_step = attn_multi.Step(self.w, segs, mtp=True)
         try:
             if self.graphs is not None:
+                if k is not None:
+                    self._pin(k)
+                    return self.graphs.run("mtp", segs, self.mbuf,
+                                           lambda: self._pick_dev(mtp_compute(self.w, segs, self.mbuf), k), step=step,
+                                           extra=(k,))
                 return self.graphs.run("mtp", segs, self.mbuf, lambda: mtp_compute(self.w, segs, self.mbuf), step=step)
             return mtp_compute(self.w, segs, self.mbuf)
         finally:
             self.mbuf.attn_step = None
 
-    def _picks(self, logits: torch.Tensor, positions: list[int], samplings: list) -> list[tuple[int, float]]:
-        """Each row's keyed draft and its probability at temperature 1, one read-back (drafts change speed only)."""
+    def _k(self, samplings: list) -> int:
+        """The picks' top-k width for these streams (one for greedy streams)."""
 
-        row = logits.float()
         k = max([int(s.top_k) + MARGIN for s in samplings if s is not None and s.temperature > 0 and s.top_k] or [1])
-        k = min(k, row.shape[1])
+        return min(k, self.draft_n)
+
+    def _pin(self, k: int) -> None:
+        if k not in self.pins:                           # before any capture that writes it; never reallocated
+            self.pins[k] = torch.empty((self.slots, 2 * k + 3), dtype=torch.float32, pin_memory=True)
+
+    @staticmethod
+    def _reduce(logits: torch.Tensor, k: int) -> torch.Tensor:
+        row = logits.float()
         vals, idx = torch.topk(row, k, dim=-1, sorted=False)
         top, col = row.max(dim=-1, keepdim=True)
         lse = torch.logsumexp(row, dim=-1, keepdim=True)
-        got = torch.cat([vals, idx.float(), top, col.float(), lse], dim=1)
-        thor_graphs.settle()
-        got = got.cpu().numpy()
+        return torch.cat([vals, idx.float(), top, col.float(), lse], dim=1)
+
+    def _pick_dev(self, logits: torch.Tensor, k: int) -> torch.Tensor:
+        """The picks' reductions and their copy to pinned host memory, queued (a graph may hold both)."""
+
+        got = self._reduce(logits, k)
+        self.pins[k][:got.shape[0]].copy_(got, non_blocking=True)
+        return got
+
+    def _picks(self, logits: torch.Tensor, positions: list[int], samplings: list,
+               k: int | None = None) -> list[tuple[int, float]]:
+        """Each row's keyed draft and its probability at temperature 1, one read-back (drafts change speed only);
+        with ``k`` the MTP step already queued the reductions to ``pins[k]``."""
+
+        if k is None:
+            k = self._k(samplings)
+            got = self._reduce(logits, k)
+            thor_graphs.settle()
+            got = got.cpu().numpy()
+        else:
+            thor_graphs.settle()
+            torch.cuda.current_stream().synchronize()
+            got = self.pins[k][:len(positions)].numpy()
         out = []
         for i, (pos, smp) in enumerate(zip(positions, samplings)):
             g = got[i]
