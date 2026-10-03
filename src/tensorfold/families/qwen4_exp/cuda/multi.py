@@ -96,8 +96,10 @@ class MultiDecoder:
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+        thor_graphs.mem_probe(self, "gate")              # diagnostics (TENSORFOLD_THOR_MEM_PROBE=<trigger path>)
         if self.graphs is not None:     # Thor: one-stream short-context graphs, recorded after the gate measured the room
             self.memory_gate.room -= self._prerecord()      # the room pays the graphs' own memory (THOR-DEC-1)
+            thor_graphs.mem_probe(self, "prerecord")
 
     def _prerecord(self) -> int:
         """Thor: record the one-stream short-context graphs (MTP steps with greedy picks) on a free slot now; the

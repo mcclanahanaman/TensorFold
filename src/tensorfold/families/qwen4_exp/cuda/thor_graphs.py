@@ -48,6 +48,7 @@ import gc
 import json
 import os
 import sys
+import threading
 import time
 from collections import OrderedDict
 from typing import Callable, Sequence
@@ -63,6 +64,8 @@ SPIN_ENV = "TENSORFOLD_THOR_DECODE_SPIN"
 STARTUP_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_STARTUP"
 LAZY_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_LAZY"
 ROWS_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_ROWS"
+CAPTURE_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_CAPTURE"   # diagnostics: 0 = prerecord's eager warm-ups only, no graphs
+MEM_ENV = "TENSORFOLD_THOR_MEM_PROBE"   # diagnostics: a trigger file path; [thor-mem] breakdowns at startup and on it
 CAPABILITY = (11, 0)
 SCHED_MASK, SCHED_SPIN = 0x07, 0x01  # CU_CTX_SCHED_MASK, CU_CTX_SCHED_SPIN
 CAP = 256                   # graphs kept, verification and MTP together
@@ -206,6 +209,7 @@ class DecodeGraphs:
         self.tails: list[torch.Tensor] = []         # the graphs' n-gram conv tails, a stream's copied in before a replay
         self.startup = _flag(STARTUP_ENV, "1")      # prerecord the one-stream short-context keys at startup
         self.lazy = _flag(LAZY_ENV, "0")            # after prerecord, record other keys on their second forward too
+        self.capture = _flag(CAPTURE_ENV, "1")      # prerecord records graphs (0: its eager warm-ups only; diagnostics)
         self.rows = _rows(os.environ.get(ROWS_ENV, "") or f"2,{width}", width)   # verification windows prerecorded
         self.hist: dict[str, list[int]] = {}        # one-stream forwards by kind and rows: [forwards, replays]
         self.fixed = False                          # prerecord ran: unrecorded keys stay eager unless ``lazy``
@@ -433,6 +437,9 @@ class DecodeGraphs:
         fn()                                        # eagerly first: every launch shape compiled before the capture
         torch.cuda.synchronize()
         f1 = _free_mib()
+        if not self.capture:                        # diagnostics: the warm-up alone, every forward stays eager
+            mem[kind][0] += f0 - f1
+            return 0
         entry = self._record(kind, b, step, tables, fn, segs)
         if entry is None:
             return 0
@@ -449,3 +456,66 @@ class DecodeGraphs:
 def _free_mib() -> float:
     free, _ = torch.cuda.mem_get_info()
     return round(free / MIB, 1)
+
+
+_MEM: list = []                                     # diagnostics: [the decoder, the trigger path]
+
+
+def mem_probe(dec, tag: str) -> None:
+    """Diagnostics (``TENSORFOLD_THOR_MEM_PROBE=<path>``): a ``[thor-mem]`` breakdown of the process's memory now (the
+    driver's free memory, MemAvailable, torch's segments by pool, pinned host memory, the gate's room and held bytes);
+    the first call also starts a thread that emits one, tagged with the file's text, whenever ``<path>`` appears."""
+
+    path = os.environ.get(MEM_ENV, "")
+    if not path:
+        return
+    if not _MEM:
+        _MEM.extend([dec, path])
+        threading.Thread(target=_mem_watch, args=(path,), daemon=True, name="thor-mem").start()
+    _MEM[0] = dec
+    _mem_emit(tag)
+
+
+def _mem_watch(path: str) -> None:
+    while True:
+        time.sleep(0.5)
+        try:
+            with open(path) as f:
+                tag = f.read().strip() or "probe"
+            os.remove(path)
+        except OSError:
+            continue
+        _mem_emit(tag)
+
+
+def _mem_emit(tag: str) -> None:
+    event: dict = {"event": "mem", "tag": tag, "t": round(time.time(), 3)}
+    try:
+        pools: dict[str, list[int]] = {}
+        for seg in torch.cuda.memory_snapshot():
+            pid = tuple(seg.get("segment_pool_id", (0, 0)) or (0, 0))
+            p = pools.setdefault("default" if pid == (0, 0) else "graph", [0, 0, 0])
+            p[0] += int(seg["total_size"])
+            p[1] += int(seg["allocated_size"])
+            p[2] += 1
+        m = {r.split()[0].rstrip(":"): int(r.split()[1]) for r in open("/proc/meminfo")}
+        own = {r.split(":")[0]: int(r.split()[1]) for r in open("/proc/self/status")
+               if r.startswith(("VmRSS", "RssAnon", "RssFile", "RssShmem"))}
+        host = getattr(torch.cuda, "host_memory_stats", None)
+        h = {k: v for k, v in (host() if host is not None else {}).items() if "bytes" in k and k.endswith("current")}
+        dec = _MEM[0]
+        gate = getattr(dec, "memory_gate", None)
+        event.update({
+            "free_mib": _free_mib(), "memavail_mib": round(m["MemAvailable"] / 1024, 1),
+            "memfree_mib": round(m["MemFree"] / 1024, 1), "cached_mib": round(m.get("Cached", 0) / 1024, 1),
+            "torch_mib": {k: [round(v[0] / MIB, 1), round(v[1] / MIB, 1), v[2]] for k, v in pools.items()},
+            "pinned_mib": {k: round(v / MIB, 2) for k, v in h.items()},
+            "pins_kib": round(sum(t.numel() * t.element_size() for t in getattr(dec, "pins", {}).values()) / 1024, 1),
+            "rss_mib": {k: round(v / 1024, 1) for k, v in own.items()},
+            "room_mib": round(gate.room / MIB, 1) if gate is not None else None,
+            "held_mib": round(gate.held / MIB, 1) if gate is not None else None,
+            "kept": len(getattr(dec, "kept", ())), "streams": len(getattr(dec, "streams", ())),
+            "graphs": len(dec.graphs.graphs) if getattr(dec, "graphs", None) is not None else 0})
+    except Exception as exc:                        # diagnostics never break serving
+        event["error"] = repr(exc)[:200]
+    print("[thor-mem] " + json.dumps(event, separators=(",", ":")), file=sys.stderr, flush=True)
