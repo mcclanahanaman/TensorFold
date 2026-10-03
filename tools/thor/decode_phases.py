@@ -2,6 +2,7 @@
 
     python tools/thor/decode_phases.py OUT.json --model MODEL [--label L] [--users 1,4] [--types prose,code]
         [--groups 2] [--new 400] [--nsys u1:20:40,u4:20:40] [--sparkdash tools/thor/_ext/decode0/sparkdash_port.py]
+        [--cpu] [--sched auto|spin|yield|blocking]
 
 The engine is built as ``tensorfold serve MODEL --backend cuda --kv-dtype int8 --parallel 4`` builds it
 (``prefill_profile.build_engine``; the Thor switches come from the environment). The requests are sparkDash's decode
@@ -21,13 +22,20 @@ launches untouched), each phase's host time and its GPU span between CUDA events
 counters (forwards, replays, captures, capture seconds) are read per round from ``MultiDecoder.graphs``. ``--nsys``
 brackets decode rounds [A, B) of the first group of U users with cudaProfilerStart/Stop (after a device sync), and
 every phase is an NVTX range, so ``nsys --capture-range=cudaProfilerApi`` attributes kernels to phases.
+
+``--cpu`` samples the host CPU at a round's start and right after the sample and first picks read-backs: the CPU the
+thread runs on, its ``scaling_cur_freq`` and a fixed pure-Python loop's time (the host's effective speed); the
+report's ``cpu`` holds the governor, frequency limits and idle states. ``--sched`` sets the CUDA primary context's
+scheduling flag before torch starts CUDA (the driver's wait in a synchronize: spin, yield or blocking sleep).
 """
 
 from __future__ import annotations
 
 import argparse
+import ctypes
 import importlib.util
 import json
+import os
 import statistics
 import sys
 import time
@@ -38,6 +46,84 @@ import torch
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 PHASES = ("stage", "tables", "verify", "sample", "commit", "mtp_stage", "mtp", "picks")
+SCHED = {"auto": 0, "spin": 1, "yield": 2, "blocking": 4}
+PROBE_N = 2000                                      # the CPU probe's loop: ~50 us at full clock
+SYS_CPU = Path("/sys/devices/system/cpu")
+
+
+def _read(p: Path) -> str:
+    try:
+        return p.read_text().strip()
+    except OSError as exc:
+        return f"<{type(exc).__name__}>"
+
+
+def cpu_info() -> dict:
+    """The host CPUs' frequency policy and idle states, read once."""
+
+    keys = ("scaling_driver", "scaling_governor", "scaling_min_freq", "scaling_max_freq", "cpuinfo_min_freq",
+            "cpuinfo_max_freq", "scaling_cur_freq")
+    cpus = sorted((d for d in SYS_CPU.glob("cpu[0-9]*")), key=lambda d: int(d.name[3:]))
+    idle = sorted((SYS_CPU / "cpu0" / "cpuidle").glob("state*"))
+    return {"online": _read(SYS_CPU / "online"), "affinity": sorted(os.sched_getaffinity(0)),
+            "cpus": [{"cpu": int(d.name[3:]), **{k: _read(d / "cpufreq" / k) for k in keys}} for d in cpus],
+            "idle": [{k: _read(s / k) for k in ("name", "latency", "residency", "disable")} for s in idle]}
+
+
+class Cpu:
+    """The calling thread's CPU, that CPU's current frequency and a fixed loop's time, at a moment of the round."""
+
+    def __init__(self) -> None:
+        self.libc = ctypes.CDLL(None)
+        self.fds: dict[int, int] = {}
+        self.rows: list = []
+
+    def sample(self, at: str) -> None:
+        t = time.perf_counter_ns()
+        x = 0
+        for i in range(PROBE_N):
+            x += i
+        probe = (time.perf_counter_ns() - t) / 1e3
+        cpu = int(self.libc.sched_getcpu())
+        fd = self.fds.get(cpu)
+        if fd is None:
+            try:
+                fd = os.open(SYS_CPU / f"cpu{cpu}" / "cpufreq" / "scaling_cur_freq", os.O_RDONLY)
+            except OSError:
+                fd = -1
+            self.fds[cpu] = fd
+        try:
+            khz = int(os.pread(fd, 32, 0)) if fd >= 0 else 0
+        except (OSError, ValueError):
+            khz = 0
+        self.rows.append((at, cpu, khz, probe))
+
+    def take(self) -> list:
+        out, self.rows = self.rows, []
+        return out
+
+
+def _cu():
+    return ctypes.CDLL("libcuda.so.1")
+
+
+def set_sched(name: str) -> dict:
+    """The primary context's scheduling flag, set before torch creates the context."""
+
+    cu = _cu()
+    dev = ctypes.c_int()
+    rc = [cu.cuInit(0), cu.cuDeviceGet(ctypes.byref(dev), 0)]
+    fn = getattr(cu, "cuDevicePrimaryCtxSetFlags_v2", None) or cu.cuDevicePrimaryCtxSetFlags
+    rc.append(fn(dev, SCHED[name]))
+    return {"set": name, "rc": rc}
+
+
+def ctx_state() -> dict:
+    cu = _cu()
+    dev, flags, active = ctypes.c_int(), ctypes.c_uint(), ctypes.c_int()
+    rc = [cu.cuDeviceGet(ctypes.byref(dev), 0),
+          cu.cuDevicePrimaryCtxGetState(dev, ctypes.byref(flags), ctypes.byref(active))]
+    return {"flags": flags.value, "active": active.value, "rc": rc}
 
 
 class Timer:
@@ -46,6 +132,8 @@ class Timer:
     def __init__(self) -> None:
         self.depth = 0
         self.rows: list = []          # (phase, host seconds, start event, end event)
+        self.hooks: dict = {}         # phase -> callable(phase), run after the call (outside its timing)
+        self.hooked: set = set()      # phases already hooked this round (first call only)
 
     def wrap(self, phase: str, fn):
         def timed(*args, **kwargs):
@@ -64,6 +152,10 @@ class Timer:
                 torch.cuda.nvtx.range_pop()
                 self.depth -= 1
                 self.rows.append((phase, host, e0, e1))
+                hook = self.hooks.get(phase)
+                if hook is not None and phase not in self.hooked:
+                    self.hooked.add(phase)
+                    hook(phase)
         return timed
 
     def take(self) -> dict:
@@ -76,6 +168,7 @@ class Timer:
             got[1] += e0.elapsed_time(e1)
             got[2] += 1
         self.rows = []
+        self.hooked = set()
         return out
 
 
@@ -131,6 +224,17 @@ def summarize(rounds: list) -> dict:
                   "gpu_ms": mean([r["phases"].get(p, [0, 0, 0])[1] for r in rounds])}
     for k in ("replays", "captures", "capture_s"):
         out[k] = sum(r.get("graph", {}).get(k, 0) for r in rounds)
+    at = {}
+    for r in rounds:
+        for name, cpu, khz, probe in r.get("cpu", []):
+            got = at.setdefault(name, {"khz": [], "probe_us": [], "cpus": set()})
+            got["khz"].append(khz)
+            got["probe_us"].append(probe)
+            got["cpus"].add(cpu)
+    if at:
+        out["cpu"] = {name: {"khz": mean(v["khz"]), "khz_min": min(v["khz"]), "probe_us": mean(v["probe_us"]),
+                             "probe_p50_us": statistics.median(v["probe_us"]), "cpus": sorted(v["cpus"]),
+                             "n": len(v["khz"])} for name, v in at.items()}
     return out
 
 
@@ -147,7 +251,10 @@ def main(argv=None) -> int:
     ap.add_argument("--kv-dtype", default="int8")
     ap.add_argument("--nsys", default="")
     ap.add_argument("--sparkdash", type=Path, default=HERE / "_ext" / "decode0" / "sparkdash_port.py")
+    ap.add_argument("--cpu", action="store_true", help="sample the host CPU at round start and after read-backs")
+    ap.add_argument("--sched", choices=sorted(SCHED), default=None)
     a = ap.parse_args(argv)
+    sched = set_sched(a.sched) if a.sched else None
 
     spec = importlib.util.spec_from_file_location("sparkdash_port", a.sparkdash)
     sd = importlib.util.module_from_spec(spec)
@@ -162,6 +269,12 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     engine = pp.build_engine(a.model, a.parallel, a.kv_dtype)
     print(f"[phases] engine up in {time.perf_counter() - t0:.0f}s", flush=True)
+    host = {"sched": sched, "ctx": ctx_state(), "spin": os.environ.get("TENSORFOLD_THOR_DECODE_SPIN", ""),
+            **cpu_info()}
+    c0 = host["cpus"][0] if host["cpus"] else {}
+    print(f"[phases] host: ctx {host['ctx']} sched {sched} spin {host['spin']!r} governor "
+          f"{c0.get('scaling_governor')} driver {c0.get('scaling_driver')} freq {c0.get('scaling_min_freq')}-"
+          f"{c0.get('scaling_max_freq')} kHz, idle {[s['name'] for s in host['idle']]}", flush=True)
     tok = Tokenizer.from_file(str(a.model / "tokenizer.json"))
     template = ChatTemplate(a.model)
 
@@ -175,8 +288,11 @@ def main(argv=None) -> int:
         windows[int(u.lstrip("u"))] = (int(lo), int(hi))
     timer = Timer()
     install(timer)
+    cpu = Cpu() if a.cpu else None
+    if cpu is not None:
+        timer.hooks = {"sample": cpu.sample, "picks": cpu.sample}
     multi = engine.multi
-    report = {"label": a.label, "model": str(a.model), "new": a.new, "groups": []}
+    report = {"label": a.label, "model": str(a.model), "new": a.new, "host": host, "groups": []}
     profiling = False
     for users in [int(u) for u in a.users.split(",") if u]:
         for kind in [t for t in a.types.split(",") if t]:
@@ -199,6 +315,8 @@ def main(argv=None) -> int:
                     rows = sum(1 + len(s.drafts) for s in streams if not s.done and len(s.out) >= 1)
                     e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                     torch.cuda.nvtx.range_push(f"round u{users}" if decoding else f"fill u{users}")
+                    if cpu is not None and decoding:
+                        cpu.sample("start")
                     e0.record()
                     t = time.perf_counter()
                     done = multi.round()
@@ -208,6 +326,7 @@ def main(argv=None) -> int:
                     wall = time.perf_counter() - t
                     torch.cuda.nvtx.range_pop()
                     phases = timer.take()
+                    taken = cpu.take() if cpu is not None else []
                     if not decoding:
                         fill_s += wall
                         continue
@@ -215,7 +334,7 @@ def main(argv=None) -> int:
                     span = e0.elapsed_time(e1)
                     rounds.append({"wall_ms": wall * 1e3, "span_ms": span,
                                    "gap_ms": span - sum(v[1] for v in phases.values()), "phases": phases,
-                                   "rows": rows,
+                                   "rows": rows, "cpu": taken,
                                    "graph": {k: after[k] - before.get(k, 0) for k in after}})
                     r += 1
                     if profiling and win and r >= win[1]:
@@ -245,6 +364,9 @@ def main(argv=None) -> int:
                       f"{sm['verify']['host_ms']:.2f}, mtp gpu {sm['mtp']['gpu_ms']:.2f} x{sm['mtp_steps']:.2f}, "
                       f"gap {sm['gap_ms']:.2f}, captures {sm['captures']} ({sm['capture_s']:.2f} s), "
                       f"replays {sm['replays']}", flush=True)
+                for name, c in sm.get("cpu", {}).items():
+                    print(f"[phases]   cpu@{name}: {c['khz'] / 1e3:.0f} MHz (min {c['khz_min'] / 1e3:.0f}), probe "
+                          f"{c['probe_us']:.1f} us (p50 {c['probe_p50_us']:.1f}), cpus {c['cpus']}", flush=True)
                 a.out.write_text(json.dumps(report))
     a.out.write_text(json.dumps(report))
     return 0
