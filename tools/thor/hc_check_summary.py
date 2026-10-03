@@ -1,5 +1,7 @@
 """tools/thor/hc_check_summary.py: hc_check.py kernels' per-call rows -> per prompt and row count M, over layers.
 
+thor_hc2's columns (THOR-HC-FUSE-2) go in a second table when present.
+
 Usage: python tools/thor/hc_check_summary.py HC_CHECK.json [--json FILE] [--markdown FILE]
 """
 
@@ -36,7 +38,7 @@ def summarize(rows: list) -> dict:
         errors = [row[k] for row in group for k in row if k.endswith("_error")]
         if errors:
             stats["errors"] = errors
-        for key in ("equal_act", "equal_inject", "equal_mixed"):
+        for key in ("equal_act", "equal_inject", "equal_mixed", "equal_act2", "equal_mixed2"):
             usable = [row[key] for row in group if key in row and row[key] is not None]
             stats[key] = all(usable) if usable else None
         for x in ("act", "mixed"):
@@ -53,6 +55,8 @@ def summarize(rows: list) -> dict:
                     stats[key] = fun(usable)
         if _num(stats.get("ms_r25")) and _num(stats.get("ms_new")) and stats["ms_new"] > 0:
             stats["speedup"] = stats["ms_r25"] / stats["ms_new"]
+        if _num(stats.get("ms_new")) and _num(stats.get("ms_new2")) and stats["ms_new2"] > 0:
+            stats["speedup2"] = stats["ms_new"] / stats["ms_new2"]
         out.setdefault(prompt, {})[m] = stats
     return out
 
@@ -63,6 +67,31 @@ def _flag(v):
 
 def _cell(v, spec):
     return "-" if v is None else format(v, spec)
+
+
+HEADER2 = ("| prompt | M | calls | act2 equal | mixed2 equal | new ms | new2 ms | new2 down ms "
+           "| new2 upmix ms | speedup2 |")
+
+
+def markdown2(summary: dict) -> str:
+    """Render the thor_hc2 columns as a second table, one row per (prompt, M) with second-path data."""
+    lines = [HEADER2, "|" + "---|" * 10]
+    found = False
+    for prompt, rows in summary.items():
+        for m, stats in rows.items():
+            act2 = stats.get("equal_act2")
+            if act2 is None and not _num(stats.get("ms_new2")):
+                continue
+            found = True
+            cells = [str(prompt), str(m), str(stats.get("calls", 0)), _flag(act2),
+                     _flag(stats.get("equal_mixed2"))]
+            cells += [_cell(stats.get(key), ".3f")
+                      for key in ("ms_new", "ms_new2", "ms_new2_down_act", "ms_new2_upmix")]
+            cells.append(_cell(stats.get("speedup2"), ".2f"))
+            lines.append("| " + " | ".join(cells) + " |")
+    if not found:
+        return ""
+    return "\n".join(lines) + "\n"
 
 
 def markdown(summary: dict) -> str:
@@ -91,13 +120,17 @@ def main(argv=None) -> int:
     if isinstance(data, dict):
         rows = data.get("rows", [])
         upmix = data.get("upmix")
+        fuse2 = data.get("fuse2")
     else:
-        rows, upmix = data, None
+        rows, upmix, fuse2 = data, None, None
     summary = summarize(rows)
     if args.json_out:
-        payload = json.dumps({"upmix": upmix, "summary": summary}, indent=1) + "\n"
+        payload = json.dumps({"upmix": upmix, "fuse2": fuse2, "summary": summary}, indent=1) + "\n"
         Path(args.json_out).write_text(payload, encoding="utf-8")
     text = markdown(summary)
+    text2 = markdown2(summary)
+    if text2:
+        text += "\n" + text2
     if args.markdown_out:
         Path(args.markdown_out).write_text(text, encoding="utf-8")
     print(text, end="")
