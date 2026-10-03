@@ -18,7 +18,7 @@ with a prompt pass stays eager):
   first forward runs eagerly (and compiles every launch shape its graph holds), a later one records the graph, which
   runs nothing, and replays it once. At most ``cap`` graphs are kept; past that, new keys stay eager.
 
-``TENSORFOLD_THOR_DECODE_GRAPH=0`` keeps every round eager, as before; ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N``
+Graphs are opt-in (``TENSORFOLD_THOR_DECODE_GRAPH=1``; unset or 0 keeps every round eager, as before); ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N``
 graphs only forwards of at most N streams (``_CAP``: the most graphs kept). Events go to stderr as
 ``[thor-graph] {json}`` lines (``tools/thor/graph_stats.py`` digests them).
 """
@@ -54,7 +54,7 @@ MIB = float(1 << 20)
 
 
 def _off() -> bool:
-    return os.environ.get(ENV, "1").strip().lower() in ("0", "off", "false", "no")
+    return os.environ.get(ENV, "0").strip().lower() in ("0", "off", "false", "no")
 
 
 @functools.lru_cache(maxsize=None)
@@ -66,14 +66,14 @@ def available(device: int = 0) -> bool:
 
 @functools.lru_cache(maxsize=None)
 def spinning(device: int = 0) -> str:
-    """How the host waits for the GPU in decode on sm_110 with ``TENSORFOLD_THOR_DECODE_SPIN=1`` (THOR-DEC-1).
+    """How the host waits for the GPU in decode on sm_110 (THOR-DEC-1; ``TENSORFOLD_THOR_DECODE_SPIN=0``: sleeps).
 
     A synchronize that sleeps lets the governor clock the waiting core down to its floor (972 MHz on Thor), and every
     host phase of a round then runs about 2x slower. ``"ctx"``: the CUDA context's waits spin (its scheduling flag,
     set here once); ``"poll"``: the driver refused the flag, so ``settle`` polls an event before the decode
     read-backs; ``""``: off. Host only: the GPU's work and its bits are unchanged."""
 
-    on = os.environ.get(SPIN_ENV, "0").strip().lower() in ("1", "on", "true", "yes")
+    on = os.environ.get(SPIN_ENV, "1").strip().lower() not in ("0", "off", "false", "no")
     if not (on and torch.cuda.is_available() and torch.cuda.get_device_capability(device) == CAPABILITY):
         return ""
     torch.cuda.init()
