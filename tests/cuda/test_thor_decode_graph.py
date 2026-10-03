@@ -92,6 +92,44 @@ def test_one_stream_replays_most_rounds():
     assert g.replays["verify"] >= g.forwards["verify"] // 2, (g.replays, g.forwards)
 
 
+def _sequential(w, prompts, counts, *, graphs: bool, capacity: int):
+    """One greedy request at a time (each alone in its rounds), graphs recorded at startup; the slot each one used."""
+
+    dec = MultiDecoder(w, slots=len(prompts), capacity=capacity, depth=DEPTH, confidence=0.3)
+    dec.graphs = thor_graphs.DecodeGraphs(DEPTH + 1) if graphs else None
+    if graphs:
+        dec.graphs.prerecord(dec)
+    dec.buf.logits.zero_()
+    dec.mbuf.logits.zero_()
+    outs, rounds, slots = [], [], []
+    for prompt, count in zip(prompts, counts):
+        s = Stream(prompt, count, None)
+        dec.admit(s)
+        while dec.live():
+            dec.finish(dec.round())
+            rounds.append((dec.buf.logits.clone(), dec.mbuf.logits.clone()))
+        outs.append(list(s.out))
+        slots.append(id(s.st))
+    return outs, rounds, dec.graphs, slots
+
+
+def test_startup_graphs_serve_any_slot():
+    """Graphs recorded at startup on one free slot (slot-free keys, each stream's n-gram conv tail copied in) replay
+    for requests on other slots with the eager rounds' bits; keys outside the startup set stay eager."""
+
+    w = _model()
+    prompts, counts = PROMPTS[:3], [40, 33, 48]
+    off_out, off_rounds, _, _ = _sequential(w, prompts, counts, graphs=False, capacity=1024)
+    on_out, on_rounds, g, slots = _sequential(w, prompts, counts, graphs=True, capacity=1024)
+    assert on_out == off_out
+    _same_rounds(on_rounds, off_rounds)
+    assert len(set(slots)) > 1, "the requests shared one slot"
+    assert g.fixed and not g.failed
+    # verification windows of 2..DEPTH+1 rows at two parities, MTP steps of 1..DEPTH+1 rows: nothing recorded later
+    assert g.captures == {"verify": 2 * DEPTH, "mtp": DEPTH + 1}, g.captures
+    assert g.replays.get("verify", 0) > 0 and g.replays.get("mtp", 0) > 0, (g.replays, g.forwards)
+
+
 def test_bucket():
     assert thor_graphs.bucket(1) == 8192 and thor_graphs.bucket(8192) == 8192
     assert thor_graphs.bucket(8193) == 16384 and thor_graphs.bucket(40000) == 65536

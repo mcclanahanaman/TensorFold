@@ -66,13 +66,17 @@ class MultiDecoder:
         self.pbuf = Buffers(w, prefill_rows + (rows if self.converged else 0), capacity, prefill=True)
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
         # Thor (sm_110): a round's forwards may replay CUDA graphs (thor_graphs; opt-in, TENSORFOLD_THOR_DECODE_GRAPH=1)
-        self.graphs = thor_graphs.DecodeGraphs(depth + 1) if thor_graphs.available() else None
+        self.graphs = thor_graphs.DecodeGraphs(depth + 1, ple={     # which forwards read the streams' n-gram conv tails
+            "verify": any(layer.ple is not None for layer in w.layers),
+            "mtp": w.mtp is not None and w.mtp.layer.ple is not None}) if thor_graphs.available() else None
         thor_graphs.spinning()                           # Thor: host waits spin (TENSORFOLD_THOR_DECODE_SPIN=0: off)
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
         # slots start small and grow with their stream's context, up to the window, while the gate has room
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
+        if self.graphs is not None:     # Thor: one-stream short-context graphs now, before the gate measures the room
+            self.graphs.prerecord(self)
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
         # the mapped n-gram tables are not held back (they barely fit on a Spark); lookups page from disk instead
         live = free
