@@ -67,6 +67,7 @@ class MultiDecoder:
         self.gdn = gdn_multi.Scratch(w, rows)            # every stream's DeltaNet rows, one launch a step
         # Thor (sm_110): a round's forwards replay CUDA graphs (thor_graphs; TENSORFOLD_THOR_DECODE_GRAPH=0: eager)
         self.graphs = thor_graphs.DecodeGraphs(depth + 1) if thor_graphs.available() else None
+        thor_graphs.spinning()                           # Thor: host waits spin (TENSORFOLD_THOR_DECODE_SPIN=1)
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
         # slots start small and grow with their stream's context, up to the window, while the gate has room
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
@@ -496,6 +497,7 @@ class MultiDecoder:
             if s.sid in grammars:
                 s.constraint.mask(logits[a0:a1], grammars[s.sid])
         positions = [[st.pos + 1 + r for r in range(a1 - a0)] for st, a0, a1 in segs]
+        thor_graphs.settle()                             # Thor switch: the host polls through the forward (DEC-1)
         sampled = sample_streams(logits, starts, positions, [s.sampling for s in live])
         paths = [accept(tokens, list(range(-1, len(tokens) - 1)), rows, s.count - len(s.out), self._ends(s))
                  for s, (_, tokens), rows in zip(live, windows, sampled)]
@@ -593,7 +595,9 @@ class MultiDecoder:
         vals, idx = torch.topk(row, k, dim=-1, sorted=False)
         top, col = row.max(dim=-1, keepdim=True)
         lse = torch.logsumexp(row, dim=-1, keepdim=True)
-        got = torch.cat([vals, idx.float(), top, col.float(), lse], dim=1).cpu().numpy()
+        got = torch.cat([vals, idx.float(), top, col.float(), lse], dim=1)
+        thor_graphs.settle()
+        got = got.cpu().numpy()
         out = []
         for i, (pos, smp) in enumerate(zip(positions, samplings)):
             g = got[i]

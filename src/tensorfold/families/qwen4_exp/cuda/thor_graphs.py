@@ -26,6 +26,7 @@ graphs only forwards of at most N streams (``_CAP``: the most graphs kept). Even
 from __future__ import annotations
 
 import copy
+import ctypes
 import dataclasses
 import functools
 import gc
@@ -41,10 +42,12 @@ import torch
 ENV = "TENSORFOLD_THOR_DECODE_GRAPH"
 CAP_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_CAP"
 STREAMS_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_STREAMS"
+SPIN_ENV = "TENSORFOLD_THOR_DECODE_SPIN"
 CAPABILITY = (11, 0)
+SCHED_MASK, SCHED_SPIN = 0x07, 0x01  # CU_CTX_SCHED_MASK, CU_CTX_SCHED_SPIN
 CAP = 256                   # graphs kept, verification and MTP together
 MIN_SEEN = 2                # a key's forwards before its graph is recorded (the first runs eagerly)
-STREAMS = 4                 # the most streams a graphed forward holds (more stay eager)
+STREAMS = 1                 # the most streams a graphed forward holds (more stay eager: their keys rarely repeat)
 SEEN_MAX = 1 << 14          # keys counted before the counts start over
 STATS_EVERY = 512           # forwards between stats events
 MIB = float(1 << 20)
@@ -59,6 +62,46 @@ def available(device: int = 0) -> bool:
     """sm_110 and not switched off: decided once."""
 
     return not _off() and torch.cuda.is_available() and torch.cuda.get_device_capability(device) == CAPABILITY
+
+
+@functools.lru_cache(maxsize=None)
+def spinning(device: int = 0) -> str:
+    """How the host waits for the GPU in decode on sm_110 with ``TENSORFOLD_THOR_DECODE_SPIN=1`` (THOR-DEC-1).
+
+    A synchronize that sleeps lets the governor clock the waiting core down to its floor (972 MHz on Thor), and every
+    host phase of a round then runs about 2x slower. ``"ctx"``: the CUDA context's waits spin (its scheduling flag,
+    set here once); ``"poll"``: the driver refused the flag, so ``settle`` polls an event before the decode
+    read-backs; ``""``: off. Host only: the GPU's work and its bits are unchanged."""
+
+    on = os.environ.get(SPIN_ENV, "0").strip().lower() in ("1", "on", "true", "yes")
+    if not (on and torch.cuda.is_available() and torch.cuda.get_device_capability(device) == CAPABILITY):
+        return ""
+    torch.cuda.init()
+    mode = "poll"
+    try:
+        cu = ctypes.CDLL("libcuda.so.1")
+        flags = ctypes.c_uint()
+        if cu.cuCtxGetFlags(ctypes.byref(flags)) == 0 and \
+                cu.cuCtxSetFlags(ctypes.c_uint((flags.value & ~SCHED_MASK) | SCHED_SPIN)) == 0 and \
+                cu.cuCtxGetFlags(ctypes.byref(flags)) == 0 and flags.value & SCHED_MASK == SCHED_SPIN:
+            mode = "ctx"
+    except (OSError, AttributeError):
+        pass
+    print("[thor-graph] " + json.dumps({"event": "spin", "mode": mode}, separators=(",", ":")), file=sys.stderr,
+          flush=True)
+    return mode
+
+
+def settle() -> None:
+    """Before a decode read-back: busy-wait until the current stream's queued work is done, when the context's own
+    waits could not be made to spin (``spinning() == "poll"``)."""
+
+    if spinning() != "poll":
+        return
+    ev = torch.cuda.Event()
+    ev.record()
+    while not ev.query():
+        pass
 
 
 def bucket(end: int) -> int:
