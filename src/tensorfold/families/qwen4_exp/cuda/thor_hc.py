@@ -28,7 +28,9 @@ against the kernels it replaces on this device before turning the path on; tools
 prompts against TensorFold's kernels and fp64.
 
 ``TENSORFOLD_THOR_HC_FUSE=0`` keeps TensorFold's read-out; decode windows always keep it; any other GPU never reaches
-this module.
+this module. Where ``prepare`` finds them bit-equal too, prompt passes of at least ``thor_hc2.MIN_ROWS`` rows run these
+two steps as warp-specialized Gluon kernels (``thor_hc2``, THOR-HC-FUSE-2; ``TENSORFOLD_THOR_HC_FUSE2=0`` keeps the
+Triton kernels here).
 """
 
 from __future__ import annotations
@@ -65,7 +67,26 @@ class _State:
     ready = False           # ``prepare``'s check passed on this device
     active = False          # prompt hyper-connections take this path (``prepare`` turns it on)
     upmix = False           # the up projection and the mix in one kernel (``prepare``'s check passed for it too)
+    fuse2 = False           # thor_hc2's warp-specialized kernels for large prompt passes (``prepare``'s check passed)
     note = ""               # what ``prepare`` found
+
+
+_HC2 = None                 # the thor_hc2 module, once imported (sm_110 with TENSORFOLD_THOR_HC_FUSE2 on)
+
+
+def _hc2():
+    """thor_hc2, or None where it is switched off or this Triton has no Gluon (any failure keeps the Triton kernels)."""
+
+    global _HC2
+    if _HC2 is None:
+        _HC2 = False
+        if os.environ.get("TENSORFOLD_THOR_HC_FUSE2", "1").strip().lower() not in ("0", "off", "false", "no"):
+            try:
+                from . import thor_hc2
+                _HC2 = thor_hc2
+            except Exception:       # noqa: BLE001
+                _HC2 = False
+    return _HC2 or None
 
 
 S = _State()
@@ -308,12 +329,37 @@ def readout(hc, b, h: torch.Tensor, R: int, eps: float, streams: int, low: int, 
     """``forward._readout_b16`` for a prompt pass: b.act, ``inject`` and b.mixed[:R] with the same bits; b.normed,
     the group sums and (with the fused up projection) b.up are not written."""
 
-    down_act(h[:R], b.pss[:R], hc.scale, hc.down.b, b.act[:R], inject, streams, low, eps)
+    two = S.fuse2 and _fits2(hc, R, h.shape[1], streams, low, inject)
+    if two:
+        _HC2.down_act(h[:R], b.pss[:R], hc.scale, hc.down.b, b.act[:R], inject, streams, low, eps,
+                      _split(hc.down.b))
+    else:
+        down_act(h[:R], b.pss[:R], hc.scale, hc.down.b, b.act[:R], inject, streams, low, eps)
     if S.upmix:
-        upmix(b.act[:R], hc.up.weight, h[:R], b.pss[:R], hc.scale, b.mixed[:R], streams, eps)
+        if two:
+            _HC2.upmix(b.act[:R], hc.up.weight, h[:R], b.pss[:R], hc.scale, b.mixed[:R], streams, eps)
+        else:
+            upmix(b.act[:R], hc.up.weight, h[:R], b.pss[:R], hc.scale, b.mixed[:R], streams, eps)
         return
     _up_ref(b.act[:R], hc.up, b.up[:R])
     mix(b.up[:R], h[:R], b.pss[:R], hc.scale, b.mixed[:R], streams, eps)
+
+
+def _split(down) -> int:
+    from .bf16 import split_k
+
+    return split_k(down.n, down.k)
+
+
+def _fits2(hc, rows: int, wide: int, streams: int, low: int, inject, any_rows: bool = False) -> bool:
+    """Whether thor_hc2's kernels take this read-out (its shape; at least MIN_ROWS rows unless ``any_rows``)."""
+
+    hc2 = _hc2()
+    if hc2 is None:
+        return False
+    used = low + streams if inject is not None else low
+    return hc2.fits(max(rows, hc2.MIN_ROWS) if any_rows else rows, wide, streams, low, (wide // streams) // 256, used,
+                    _split(hc.down.b))
 
 
 @torch.no_grad()
@@ -355,6 +401,17 @@ def check(hc, rows: int, eps: float, streams: int, low: int, device, seed: int =
     out = {"rows": rows, "act": same(act0, act1), "inject": same(inj0, inj1) if has_inj else None,
            "mix": same(mixed0, mixed1), "up_fused": same(up0, up2),
            "mix_fused": same(mixed0, mixed2) and same(mixed0, mixed3)}
+    if _fits2(hc, rows, wide, streams, low, inj0, any_rows=True):     # thor_hc2's kernels, whatever the row count
+        try:
+            act4, mixed4 = torch.empty_like(act0), torch.empty_like(mixed0)
+            inj4 = torch.empty_like(inj0) if has_inj else None
+            _HC2.down_act(h, pss, hc.scale, hc.down.b, act4, inj4, streams, low, eps, _split(hc.down.b))
+            _HC2.upmix(act0, hc.up.weight, h, pss, hc.scale, mixed4, streams, eps)
+            out["act2"] = same(act0, act4) and (same(inj0, inj4) if has_inj else True)
+            out["mix_fused2"] = same(mixed0, mixed4)
+        except Exception as exc:            # noqa: BLE001  (a failing thor_hc2 keeps thor_hc's Triton kernels)
+            out["act2"] = out["mix_fused2"] = False
+            out["hc2_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
     if not out["up_fused"]:
         diff = (up0.float() - up2.float()).abs()
         out["up_fused_mismatch"] = int((up0.view(torch.int16) != up2.view(torch.int16)).sum())
@@ -369,7 +426,7 @@ def prepare(w) -> bool:
     warm-up, which loads the prompt kernels (cuBLAS and Triton's) either way: the room is the same with the path on
     or off (hcf-m1: on, this check's kernels took 0.15 GiB of driver memory before the room was set)."""
 
-    S.ready = S.active = S.upmix = False
+    S.ready = S.active = S.upmix = S.fuse2 = False
     if not available():
         return False
     layer = w.layers[0]
@@ -396,4 +453,10 @@ def prepare(w) -> bool:
     S.upmix = fused
     S.note = "down + activation fused" + (", up + mix fused" if fused else
                                           f"; up on the dense path (fused up differs: {results[0]})")
+    two = [r for r in results if "act2" in r]
+    if two and len(two) == len(results) and all(r["act2"] and (r["mix_fused2"] or not fused) for r in two):
+        S.fuse2 = True
+        S.note += f", warp-specialized from {_HC2.MIN_ROWS} rows (TENSORFOLD_THOR_HC_FUSE2=0 keeps the Triton kernels)"
+    elif two:
+        S.note += f"; warp-specialized kernels differ, not used: {two[0]}"
     return True

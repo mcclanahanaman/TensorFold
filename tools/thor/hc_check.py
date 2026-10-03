@@ -18,10 +18,14 @@ it, on the same inputs: the write-back (checked against the served streams), the
 - their per-row relative errors against an fp64 read-out of the same streams (rinv, the down projection, SiLU, the
   gates, the up projection and the mix in float64) on --sample-rows rows spread over the M: mean (``err_*``) and
   maximum (``errmax_*``);
-- at M = the pass's rows, CUDA-event medians of 5 (``ms_*``): the write-back, each of TensorFold's kernels and its
-  read-out as a whole (``ms_r25``), each of thor_hc's and its read-out as a whole (``ms_new``).
+- with thor_hc2 on (THOR-HC-FUSE-2): its warp-specialized kernels on the same inputs at every M (``equal_act2``,
+  ``equal_mixed2``);
+- at M = the pass's rows, CUDA-event medians of 5 (``ms_*``, each 4 calls queued behind a sleeping kernel): the
+  write-back, each of TensorFold's kernels and its read-out as a whole (``ms_r25``), each of thor_hc's Triton kernels
+  and its read-out as a whole (``ms_new``), and thor_hc2's (``ms_new2_down_act``, ``ms_new2_upmix``, ``ms_new2``).
 
-Writes OUT_DIR/hc_check.json: {"upmix": the engine's choice, "note": thor_hc's startup note, "rows": [...]};
+Writes OUT_DIR/hc_check.json: {"upmix": the engine's choice, "fuse2": thor_hc2 on, "note": thor_hc's startup note,
+"rows": [...]};
 tools/thor/hc_check_summary.py tabulates it.
 """
 
@@ -43,17 +47,23 @@ PROMPTS = {"syn32k": (32768, False, 4242 + 32768), "nat32k": (32768, True, 51515
            "syn128k": (131072, False, 4242 + 131072), "nat128k": (131072, True, 525252)}
 
 
-def timed(fn, reps: int = 5) -> float:
+def timed(fn, reps: int = 5, calls: int = 4) -> float:
+    """GPU milliseconds a call: the median over ``reps`` of ``calls`` back-to-back calls queued behind a sleeping
+    kernel, so host launch time (larger for the Gluon kernels' TMA descriptors) never leaves the GPU idle inside the
+    measured window (THOR-HC-FUSE-2; before it, single calls between events)."""
+
     fn()
     torch.cuda.synchronize()
     out = []
     for _ in range(reps):
         a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda._sleep(3_000_000)
         a.record()
-        fn()
+        for _ in range(calls):
+            fn()
         b.record()
         b.synchronize()
-        out.append(a.elapsed_time(b))
+        out.append(a.elapsed_time(b) / calls)
     return statistics.median(out)
 
 
@@ -140,14 +150,15 @@ class Bench:
         normed, up0, up1 = torch.empty_like(hw), torch.empty_like(hw), torch.empty_like(hw)
         xs_n = torch.empty((R, wide // 32), dtype=f32, device=dev)
         dn = torch.empty((R, hc.down.n), dtype=f32, device=dev)
-        act0, act1 = (torch.empty((R, low), dtype=bf, device=dev) for _ in range(2))
+        act0, act1, act2 = (torch.empty((R, low), dtype=bf, device=dev) for _ in range(3))
         xs_a = torch.empty((R, low // 32), dtype=f32, device=dev)
-        inj0, inj1 = ((torch.empty((R, S), dtype=bf, device=dev) if inject else None) for _ in range(2))
-        mixed0, mixed1, mixed2 = (torch.empty((R, d), dtype=bf, device=dev) for _ in range(3))
+        inj0, inj1, inj2s = ((torch.empty((R, S), dtype=bf, device=dev) if inject else None) for _ in range(3))
+        mixed0, mixed1, mixed2, mixed3 = (torch.empty((R, d), dtype=bf, device=dev) for _ in range(4))
         xs_m = torch.empty((R, d // 32), dtype=f32, device=dev)
         for M in [m for m in self.sizes if m <= R]:
             hm, pm = hw[:M], pss[:M]
             i0, i1 = (inj0[:M] if inject else None), (inj1[:M] if inject else None)
+            i2 = inj2s[:M] if inject else None
 
             def r25_normed():
                 glue.hc_normed(hm, pm, hc.scale, normed[:M], xs_n[:M], S, eps)
@@ -184,7 +195,19 @@ class Bench:
                 for step in ((new_down, new_upmix) if th.S.upmix else (new_down, new_up, new_mixh)):
                     step()
 
-            for step in (r25, new_down, new_up, new_mixh, new_upmix):
+            two = th.S.fuse2 and th._fits2(hc, M, wide, S, low, i1, any_rows=True)     # thor_hc2 (HC-FUSE-2)
+
+            def new2_down():
+                th._HC2.down_act(hm, pm, hc.scale, hc.down.b, act2[:M], i2, S, low, eps, th._split(hc.down.b))
+
+            def new2_upmix():
+                th._HC2.upmix(act2[:M], up_w, hm, pm, hc.scale, mixed3[:M], S, eps)
+
+            def new2():
+                new2_down()
+                new2_upmix()
+
+            for step in (r25, new_down, new_up, new_mixh, new_upmix) + ((new2_down, new2_upmix) if two else ()):
                 step()
             mixed_new = mixed1[:M] if th.S.upmix else mixed2[:M]
             row = {**base, "M": int(M), "equal_h_served": served,
@@ -193,6 +216,9 @@ class Bench:
                    "equal_mixed": same(mixed_new, mixed0[:M]),
                    "equal_mixed_upmix": same(mixed1[:M], mixed0[:M]),
                    "equal_mixed_mixh": same(mixed2[:M], mixed0[:M])}
+            if two:
+                row["equal_act2"] = same(act2[:M], act0[:M]) and (same(i2, i0) if inject else True)
+                row["equal_mixed2"] = same(mixed3[:M], mixed0[:M])
             th.upmix(act1[:M], up_w, hm, pm, hc.scale, mixed2[:M], S, eps, up=up1[:M])   # the fused projection
             row["equal_up_fused"] = same(up1[:M], up0[:M])
             idx = torch.linspace(0, M - 1, min(self.sample_rows, M), device=dev).round().long().unique()
@@ -211,6 +237,8 @@ class Bench:
                            "r25_normed": r25_normed, "r25_down": r25_down, "r25_act": r25_act, "r25_up": r25_up,
                            "r25_mix": r25_mix, "r25": r25, "new_down_act": new_down, "new_up": new_up,
                            "new_mix": new_mixh, "new_upmix": new_upmix, "new": new}
+                if two:
+                    timings.update({"new2_down_act": new2_down, "new2_upmix": new2_upmix, "new2": new2})
                 for key, fn in timings.items():
                     try:
                         row[f"ms_{key}"] = timed(fn)
@@ -242,7 +270,8 @@ def kernels(args) -> None:
         bench.prompt = ""
         print(f"[hc] {name}: done, passes {sorted(bench.passes)} of {passes} ({got['tok_s']:.0f} tok/s with the "
               f"benches inside)", flush=True)
-    out = {"upmix": thor_hc.S.upmix, "note": thor_hc.S.note, "layers": bench.layers, "rows": bench.results}
+    out = {"upmix": thor_hc.S.upmix, "fuse2": thor_hc.S.fuse2, "note": thor_hc.S.note, "layers": bench.layers,
+           "rows": bench.results}
     (args.out / "hc_check.json").write_text(json.dumps(out, indent=1))
 
 
