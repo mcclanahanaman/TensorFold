@@ -56,6 +56,12 @@ def test_summarize_keeps_the_best_time_and_any_mismatch() -> None:
     assert u["speedup"] == round(0.040 / 0.050, 3) and u["equal_new"] is True
 
 
+def test_failed_measurements_are_skipped() -> None:
+    bench = _bench()
+    bench["rows"].append({"kernel": "down", "path": "ws", "M": 128, "error": "Traceback ..."})
+    assert hs.summarize(bench, base="r31", new="ws") == hs.summarize(_bench(), base="r31", new="ws")
+
+
 def test_a_missing_path_leaves_its_columns_empty() -> None:
     rows = hs.summarize(_bench(), base="r31", new="ws")
     d128 = rows[0]
@@ -73,7 +79,7 @@ def test_markdown_lists_one_line_a_kernel_and_size() -> None:
     assert lines[3] == (f"| down | 4096 | 1.285 | 0.650 | {1.285 / 0.650:.3f} | "
                         f"{hs.bytes_model('down', 4096) / 1.285e6:.1f} | {hs.bytes_model('down', 4096) / 0.650e6:.1f} "
                         f"| no |")
-    assert lines[2].endswith("| - | - | - | - |")
+    assert lines[2] == f"| down | 128 | 0.100 | - | - | {hs.bytes_model('down', 128) / 0.100e6:.1f} | - | - |"
 
 
 def test_the_command_line_writes_json_and_markdown(tmp_path: Path) -> None:
