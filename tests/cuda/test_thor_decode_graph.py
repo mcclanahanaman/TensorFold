@@ -113,10 +113,11 @@ def _sequential(w, prompts, counts, *, graphs: bool, capacity: int):
     return outs, rounds, dec.graphs, slots
 
 
-def test_startup_graphs_serve_any_slot():
+def test_startup_graphs_serve_any_slot(monkeypatch):
     """Graphs recorded at startup on one free slot (slot-free keys, each stream's n-gram conv tail copied in) replay
     for requests on other slots with the eager rounds' bits; keys outside the startup set stay eager."""
 
+    monkeypatch.setenv(thor_graphs.ROWS_ENV, f"2-{DEPTH + 1}")     # every verification window, not only the default
     w = _model()
     prompts, counts = PROMPTS[:3], [40, 33, 48]
     off_out, off_rounds, _, _ = _sequential(w, prompts, counts, graphs=False, capacity=1024)
@@ -140,3 +141,32 @@ def test_rows_spec():
 def test_bucket():
     assert thor_graphs.bucket(1) == 8192 and thor_graphs.bucket(8192) == 8192
     assert thor_graphs.bucket(8193) == 16384 and thor_graphs.bucket(40000) == 65536
+
+
+def test_prerecord_after_the_gate_charges_the_room(monkeypatch):
+    """Startup graphs are recorded after the memory gate measured the room, and the room is charged with exactly what
+    prerecord reports as the graphs' own memory (captures and uploads); by default the verification windows recorded
+    are two rows and the widest."""
+
+    from tensorfold.families.qwen4_exp.cuda import multi
+
+    monkeypatch.setenv(thor_graphs.ENV, "1")
+    monkeypatch.delenv(thor_graphs.ROWS_ENV, raising=False)
+    monkeypatch.setattr(multi, "torch_live", lambda torch, available: (lambda: 64 << 30))
+    charged, pre = [], thor_graphs.DecodeGraphs.prerecord
+
+    def prerecord(self, *a, **k):
+        charged.append(pre(self, *a, **k))
+        return charged[-1]
+
+    monkeypatch.setattr(thor_graphs.DecodeGraphs, "prerecord", prerecord)
+    thor_graphs.available.cache_clear()
+    try:
+        dec = MultiDecoder(_model(), slots=2, capacity=1024, depth=DEPTH, confidence=0.3)
+    finally:
+        thor_graphs.available.cache_clear()
+    g = dec.graphs
+    assert g is not None and g.fixed and not g.failed and g.rows == [2, DEPTH + 1]
+    assert g.captures == {"verify": 2, "mtp": DEPTH + 1}, g.captures
+    assert len(charged) == 1 and 0 <= charged[0] < 1 << 30
+    assert dec.memory_gate.room == (64 << 30) - charged[0]

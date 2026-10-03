@@ -80,8 +80,6 @@ class MultiDecoder:
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
-        if self.graphs is not None:     # Thor: one-stream short-context graphs now, before the gate measures the room
-            self._prerecord()
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
         # the mapped n-gram tables are not held back (they barely fit on a Spark); lookups page from disk instead
         live = free
@@ -98,12 +96,16 @@ class MultiDecoder:
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+        if self.graphs is not None:     # Thor: one-stream short-context graphs, recorded after the gate measured the room
+            self.memory_gate.room -= self._prerecord()      # the room pays the graphs' own memory (THOR-DEC-1)
 
-    def _prerecord(self) -> None:
-        """Thor: record the one-stream short-context graphs (MTP steps with greedy picks) on a free slot now."""
+    def _prerecord(self) -> int:
+        """Thor: record the one-stream short-context graphs (MTP steps with greedy picks) on a free slot now; the
+        bytes their captures and uploads took, which the memory gate's room is charged (the eager warm-ups before each
+        capture take the decode path's first-use memory, which eager decoding also takes at its first requests)."""
 
         self._pin(1)
-        self.graphs.prerecord(self, mtp_fn=lambda segs: self._pick_dev(mtp_compute(self.w, segs, self.mbuf), 1))
+        return self.graphs.prerecord(self, mtp_fn=lambda segs: self._pick_dev(mtp_compute(self.w, segs, self.mbuf), 1))
 
     def _busy(self) -> set[int]:
         return {id(s.st) for s in [*self.streams.values(), *self.filling]}

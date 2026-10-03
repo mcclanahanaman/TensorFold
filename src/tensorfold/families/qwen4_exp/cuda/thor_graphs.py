@@ -20,11 +20,14 @@ with a prompt pass stays eager):
 - every capture runs on one side stream into one pool: the caching allocator reuses a block only on the stream that
   freed it, so the captures share their temporaries instead of each keeping its own (THOR-DEC-1);
 - ``prerecord`` records the one-stream keys of short contexts at startup, on a free slot reset after, so requests
-  never pay a recording and the graphs' memory is taken before the memory gate measures the room; other keys then
-  stay eager (``TENSORFOLD_THOR_DECODE_GRAPH_LAZY=1`` records them on their second forward, as before;
+  never pay a recording. It runs after the memory gate measured the room, and the room is charged with the graphs'
+  own memory (their captures and uploads); the eager forward before each capture takes the decode path's first-use
+  memory, which eager decoding also takes at its first requests, after its gate. Other keys then stay eager
+  (``TENSORFOLD_THOR_DECODE_GRAPH_LAZY=1`` records them on their second forward, as before;
   ``TENSORFOLD_THOR_DECODE_GRAPH_STARTUP=0`` records every key that way). ``TENSORFOLD_THOR_DECODE_GRAPH_ROWS``
-  (``2-7`` or ``3,4,5``) picks the verification windows recorded: on Thor a graph executable holds driver memory of
-  its own, about 20 MiB a verification forward;
+  (default ``2,W``: two rows and the widest window ``W``, which carry most one-stream verifications; ``2-7`` or
+  ``3,4,5``) picks the verification windows recorded: on Thor a graph executable holds driver memory of its own, about
+  20 MiB a verification forward;
 - a one-stream verification forward always writes DeltaNet scratch half 0 (``gdn_multi.normalize`` copies last
   round's pending rows to half 1 first, exact copies), so one graph a window size serves both parities;
 - an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
@@ -203,7 +206,7 @@ class DecodeGraphs:
         self.tails: list[torch.Tensor] = []         # the graphs' n-gram conv tails, a stream's copied in before a replay
         self.startup = _flag(STARTUP_ENV, "1")      # prerecord the one-stream short-context keys at startup
         self.lazy = _flag(LAZY_ENV, "0")            # after prerecord, record other keys on their second forward too
-        self.rows = _rows(os.environ.get(ROWS_ENV, "") or f"2-{width}", width)   # verification windows prerecorded
+        self.rows = _rows(os.environ.get(ROWS_ENV, "") or f"2,{width}", width)   # verification windows prerecorded
         self.hist: dict[str, list[int]] = {}        # one-stream forwards by kind and rows: [forwards, replays]
         self.fixed = False                          # prerecord ran: unrecorded keys stay eager unless ``lazy``
         self.graphs: OrderedDict[tuple, _Entry] = OrderedDict()
@@ -366,14 +369,15 @@ class DecodeGraphs:
                     "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1), "free_mib": free1})
         return _Entry(graph, out, twin_step, twin_tables)
 
-    def prerecord(self, dec, mtp_fn: Callable | None = None) -> None:
+    def prerecord(self, dec, mtp_fn: Callable | None = None) -> int:
         """Record the one-stream keys of short contexts now (``dec``: the ``MultiDecoder``, every slot free): a
         verification window of each ``rows`` size (scratch half 0, last round's rows folding in) and an MTP step of
         1..``width`` rows (``mtp_fn(segs)``: the step's forward and picks, keyed by ``dec.picks_key``), at the first
         context bucket. Each forward runs eagerly once on a free
         slot (it compiles its launches), is recorded, then replays once (the graph's upload); the slot and the scratch
         parity are reset after. A first round (nothing folds in), a one-row verification, a sparse or image stream
-        and a longer context stay eager unless ``lazy``."""
+        and a longer context stay eager unless ``lazy``. Returns the graphs' own memory in bytes: the free memory their
+        captures and uploads took (the eager forwards' is the decode path's first-use memory), 0 if nothing ran."""
 
         from .attn_multi import Step
         from .forward import compute, stage
@@ -381,7 +385,7 @@ class DecodeGraphs:
         from .mtp import mtp_compute, mtp_stage
 
         if not self.startup or self.fixed or not dec.free:
-            return
+            return 0
         w, st = dec.w, dec.free[-1]
         torch.cuda.synchronize()
         t0, free0, res0 = time.perf_counter(), _free_mib(), torch.cuda.memory_reserved()
@@ -412,10 +416,12 @@ class DecodeGraphs:
         self.fixed = True
         held = _free_mib()
         torch.cuda.empty_cache()                    # the warm-ups' cached blocks back to the driver (graphs keep theirs)
+        own = max(0.0, sum(v[1] + v[2] for v in mem.values()))    # captures and uploads: the room is charged this
         self._emit({"event": "startup", "graphs": made, "s": round(time.perf_counter() - t0, 3),
                     "graph_mib": round(free0 - _free_mib(), 1), "released_mib": round(_free_mib() - held, 1),
-                    "phase_mib": {k: [round(x, 1) for x in v] for k, v in mem.items()},
+                    "phase_mib": {k: [round(x, 1) for x in v] for k, v in mem.items()}, "charged_mib": round(own, 1),
                     "pool_mib": round((torch.cuda.memory_reserved() - res0) / MIB, 1), "free_mib": _free_mib()})
+        return int(own * MIB)
 
     def _prerecord(self, kind: str, segs: Sequence, b, step, tables, fn: Callable[[], torch.Tensor], mem: dict,
                    extra: tuple = ()) -> int:
