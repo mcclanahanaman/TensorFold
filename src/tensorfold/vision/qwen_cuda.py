@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import functools
 import json
 import threading
 import math
@@ -19,6 +20,11 @@ WORKSPACE_BYTES = 4 * 1024**3
 # --vision-offload: the tower (about 0.9 GiB) visits the GPU per image, so the budget keeps room for it plus the
 # activations of the largest accepted image (measured peak about 1.2 GiB over idle on a 4,096-token image)
 OFFLOAD_WORKSPACE_BYTES = int(2.25 * 1024**3)
+FLOATS = ("BF16", "F16", "F32")
+# a quantized tower linear's tensors beside its weight (ModelOpt names); they are folded in at load, none stays resident
+SCALES = ("weight_scale", "weight_scale_2", "input_scale")
+ALGOS = {"mxfp8": "MXFP8", "nvfp4": "NVFP4", "fp8": "FP8"}      # quantized_layers' quant_algo for each scheme
+E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)   # FP4 values by code
 
 
 def rotary_frequencies(rotary: Any, config: dict, device: Any) -> None:
@@ -44,7 +50,7 @@ class EncodedVision:
 def vision_config(model_dir: str | Path) -> dict:
     raw = json.loads((Path(model_dir) / "config.json").read_text())
     config = raw.get("vision_config")
-    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen4_exp"):
+    if not isinstance(config, dict) or config.get("model_type") not in ("qwen3_5", "qwen3_5_vision", "qwen4_exp"):
         raise ValueError("CUDA vision requires a Qwen3.5-compatible vision checkpoint")
     if config.get("deepstack_visual_indexes"):
         raise ValueError("CUDA Qwen vision does not support deepstack image features")
@@ -76,15 +82,76 @@ def _vision_sources(model_dir):
     return vision_tensors(Path(model_dir), weights_path=Path(override) if override else None)
 
 
-def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
-    """Validate vision tensor headers before any model or accelerator allocation."""
+def _resident_bytes(name: str, info: dict) -> int:
+    """A tower tensor's bytes once loaded: weights as bf16 (a packed NVFP4 byte holds two), scales folded in."""
+    from tensorfold.cuda.capacity import SIZES
+
+    part = name.rsplit(".", 1)[-1]
+    if part in SCALES:
+        return 0
+    count = math.prod(info["shape"])
+    return count * 4 if part == "weight" and info["dtype"] == "U8" else count * max(2, SIZES[info["dtype"]])
+
+
+def _quantized_layers(model_dir) -> dict:
+    """config.json's ModelOpt quantized_layers entries for the tower, by local name ({} when it has none)."""
+    from tensorfold.cuda.nvfp4.format import config_block
+    from .qwen_checkpoint import vision_key
+
+    block = config_block(json.loads((Path(model_dir) / "config.json").read_text())) or {}
+    layers = block.get("quantized_layers") or {}
+    return {vision_key(k): v for k, v in layers.items() if isinstance(v, dict) and vision_key(k) is not None}
+
+
+def _schemes(tensors: dict, shapes: dict, listed: dict) -> dict[str, str]:
+    """Each quantized tower linear's scheme (mxfp8, nvfp4 or fp8) from its tensors, checked against the configured
+    [N, K], the scheme's stored shapes and the config's quantized_layers; floating-point linears are left out."""
+    from tensorfold.cuda.nvfp4.format import scheme
+
+    found = {}
+    for key, (n, k) in ((key, shape) for key, shape in shapes.items() if key.endswith(".weight") and len(shape) == 2):
+        name = key[:-len(".weight")]
+        parts = {p: (tensors[f"{name}.{p}"]["dtype"], tensors[f"{name}.{p}"]["shape"])
+                 for p in ("weight", *SCALES) if f"{name}.{p}" in tensors}
+        if "weight" not in parts:
+            continue                                     # the complete-tower check reports it
+        kind = scheme(parts)
+        algo = (listed.get(name) or {}).get("quant_algo")
+        if kind == "bf16":
+            if len(parts) > 1 or algo is not None:
+                raise ValueError(f"vision linear {name} stores floating-point weights but scales or a quant_algo")
+            continue
+        scalar = ("F32", None)
+        want = {"mxfp8": ({"weight": ("F8_E4M3", [n, k]), "weight_scale": ("U8", [n, k // 32])}, {}, 32),
+                "nvfp4": ({"weight": ("U8", [n, k // 2]), "weight_scale": ("F8_E4M3", [n, k // 16]),
+                           "weight_scale_2": scalar}, {"input_scale": scalar}, 16),
+                "fp8": ({"weight": ("F8_E4M3", [n, k]), "weight_scale": scalar}, {"input_scale": scalar}, 1)}.get(kind)
+        if want is None:
+            raise ValueError(f"unsupported vision weight storage {kind}: {name}")
+        required, optional, group = want
+        if k % group or set(required) - set(parts) or set(parts) - set(required) - set(optional):
+            raise ValueError(f"vision linear {name} does not hold a complete {kind} weight")
+        for part, (dtype, shape) in parts.items():
+            expect, size = {**required, **optional}[part]
+            if dtype != expect or (shape not in ([], [1]) if size is None else shape != size):
+                raise ValueError(f"vision tensor shapes differ from the checkpoint configuration: {name}.{part}")
+        if algo is not None and str(algo).upper() != ALGOS[kind]:
+            raise ValueError(f"vision linear {name} stores {kind} weights but the config lists {algo}")
+        found[name] = kind
+    return found
+
+
+def vision_layout(model_dir: str | Path) -> tuple[dict, int, dict[str, str]]:
+    """Validate vision tensor headers before any model or accelerator allocation: the configuration, the tower's
+    resident bytes (bf16 weights) and each quantized linear's scheme (see dequantized)."""
     from tensorfold.cuda.capacity import SIZES
     config = vision_config(model_dir)
     sources = _vision_sources(model_dir)
     tensors = {k: value[1] for k, value in sources.items()}
     for name, (path, info, begin) in sources.items():
         shape, offsets = info.get("shape", ()), info.get("data_offsets", ())
-        if (info.get("dtype") not in {"BF16", "F16", "F32"} or not shape
+        scalar = name.rsplit(".", 1)[-1] in SCALES and shape == []      # a per-tensor scale
+        if (info.get("dtype") not in SIZES or not isinstance(shape, list) or not (shape or scalar)
                 or any(type(d) is not int or d <= 0 for d in shape) or len(offsets) != 2
                 or any(type(d) is not int for d in offsets) or offsets[0] < 0
                 or offsets[1] - offsets[0] != math.prod(shape) * SIZES[info["dtype"]]
@@ -101,17 +168,83 @@ def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
                                     ("attn.proj", h, h), ("mlp.linear_fc1", mid, h), ("mlp.linear_fc2", h, mid)):
             shapes[f"blocks.{layer}.{part}.weight"] = [width] if inputs is None else [width, inputs]
             shapes[f"blocks.{layer}.{part}.bias"] = [width]
-    if set(tensors) != set(shapes) | {"patch_embed.proj.weight"}:
-        raise ValueError("checkpoint needs the complete unquantized Qwen vision tower; use its original MLX checkpoint")
-    if any(tensors[key]["shape"] != expected for key, expected in shapes.items()):
+    schemes = _schemes(tensors, shapes, _quantized_layers(model_dir))
+    scales = {f"{name}.{part}" for name in schemes for part in SCALES if f"{name}.{part}" in tensors}
+    if set(tensors) != set(shapes) | {"patch_embed.proj.weight"} | scales:
+        raise ValueError("checkpoint needs the complete Qwen vision tower with floating-point, MXFP8, NVFP4 or FP8 "
+                         "linears; use its original MLX checkpoint")
+    packed = {f"{name}.weight" for name in schemes}
+    if any(tensors[key]["shape"] != expected for key, expected in shapes.items() if key not in packed):
         raise ValueError("vision tensor shapes differ from the checkpoint configuration")
-    if any(v["dtype"] not in {"BF16", "F16", "F32"} for v in tensors.values()):
-        raise ValueError("CUDA vision requires floating-point vision weights")
+    if any(v["dtype"] not in FLOATS for key, v in tensors.items() if key not in packed and key not in scales):
+        raise ValueError("CUDA vision requires floating-point vision weights outside its quantized linears")
     h, p, t, channels = (config[k] for k in ("hidden_size", "patch_size", "temporal_patch_size", "in_channels"))
     shape = tensors["patch_embed.proj.weight"]["shape"]
     if shape not in ([h, t, p, p, channels], [h, channels, t, p, p]):
         raise ValueError("unsupported vision patch convolution layout")
-    return config, sum(math.prod(v["shape"]) * max(2, SIZES[v["dtype"]]) for v in tensors.values())
+    return config, sum(_resident_bytes(key, info) for key, info in tensors.items()), schemes
+
+
+def checkpoint_vision(model_dir: str | Path) -> tuple[dict, int]:
+    """Validate vision tensor headers before any model or accelerator allocation."""
+    config, resident, _ = vision_layout(model_dir)
+    return config, resident
+
+
+def dequantized(kind: str, parts: dict, device) -> tuple[Any, float]:
+    """A quantized tower linear's bf16 weight and the per-tensor fp32 scale it leaves out (1.0 for MXFP8).
+
+    MXFP8 values (e4m3 times an e8m0 power of two per 32 inputs) and NVFP4's code times e4m3 products (one scale per
+    16 inputs) have at most six significant bits, so bf16 holds them exactly; NVFP4's weight_scale_2 and FP8's
+    weight_scale stay one scalar the GEMM applies to its fp32 sums (_scaled_linear), so the tower computes with exactly
+    the checkpoint's values. Activation scales are unused: activations stay bf16. Raises unless every value is exact."""
+    import torch
+
+    weight = parts["weight"].to(device)
+    if kind == "nvfp4":
+        n, half = weight.shape
+        codes = torch.stack([weight & 0xF, weight >> 4], dim=-1).reshape(n, 2 * half)   # low nibble = even input
+        table = torch.tensor(E2M1, dtype=torch.float32, device=device)
+        values = table[codes.long()] * parts["weight_scale"].to(device).to(torch.float32).repeat_interleave(16, dim=1)
+        alpha = float(parts["weight_scale_2"].reshape(-1)[0].float())
+    elif kind == "mxfp8":
+        bits = parts["weight_scale"].to(device).view(torch.uint8).to(torch.int32)
+        # 2**(e - 127) as fp32 bits: the exponent field, or 2**-127's subnormal pattern for e = 0; 255 is NaN
+        power = torch.where(bits == 0, 1 << 22, bits << 23).view(torch.float32)
+        values = weight.to(torch.float32) * torch.where(bits == 255, math.nan, power).repeat_interleave(32, dim=1)
+        alpha = 1.0
+    elif kind == "fp8":
+        values, alpha = weight.to(torch.float32), float(parts["weight_scale"].reshape(-1)[0].float())
+    else:
+        raise ValueError(f"unsupported vision weight storage {kind}")
+    result = values.to(torch.bfloat16)
+    if (not (math.isfinite(alpha) and alpha > 0) or not bool(torch.isfinite(values).all())
+            or not torch.equal(result.to(torch.float32), values)):
+        raise ValueError(f"a {kind} vision weight does not load exactly as bf16 values and a positive scale")
+    return result, alpha
+
+
+@functools.lru_cache(maxsize=None)
+def _scaled_linear():
+    import torch
+
+    class ScaledLinear(torch.nn.Module):
+        """A tower linear whose stored weight leaves out a per-tensor fp32 scale: alpha * (x @ weight.T) + bias, alpha
+        applied to the GEMM's fp32 sums before its one rounding (torch.addmm), as a bf16 linear rounds once."""
+
+        def __init__(self, weight, bias, alpha: float):
+            super().__init__()
+            self.weight, self.bias, self.alpha = weight, bias, alpha
+
+        def forward(self, x):
+            rows = x.reshape(-1, x.shape[-1])
+            bias = rows.new_zeros(()) if self.bias is None else self.bias
+            return torch.addmm(bias, rows, self.weight.t(), alpha=self.alpha).reshape(*x.shape[:-1], -1)
+
+        def extra_repr(self) -> str:
+            return f"in_features={self.weight.shape[1]}, out_features={self.weight.shape[0]}, alpha={self.alpha!r}"
+
+    return ScaledLinear
 
 
 def weight_transform(base, enabled: bool, rank: int, offload: bool = False):
@@ -121,9 +254,7 @@ def weight_transform(base, enabled: bool, rank: int, offload: bool = False):
         if enabled and vision_key(name) is not None:
             if rank != 0 or offload or os.environ.get("TENSORFOLD_VISION_WEIGHTS"):
                 return 0, 0                     # offloaded: resident in host RAM between images
-            from tensorfold.cuda.capacity import SIZES
-
-            return math.prod(info["shape"]) * max(2, SIZES[info["dtype"]]), 0
+            return _resident_bytes(vision_key(name), info), 0
         return base(name, info)
     return transform
 
@@ -162,7 +293,7 @@ class QwenCudaVision:
         from .qwen_processing import QwenImageProcessor
         from .qwen_checkpoint import vision_key
 
-        self.config, self.weight_bytes = checkpoint_vision(model_dir)
+        self.config, self.weight_bytes, schemes = vision_layout(model_dir)
         self.frontend = QwenImageProcessor.from_directory(model_dir)
         raw = json.loads((Path(model_dir) / "config.json").read_text())
         self.image_token = int(raw["image_token_id"])
@@ -175,7 +306,7 @@ class QwenCudaVision:
         config._attn_implementation = "sdpa"
         with torch.device("meta"):
             tower = Qwen3_5VisionModel(config)
-        tensors = {}
+        tensors, stored = {}, {}
         by_file = {}
         for key, (path, info, begin) in _vision_sources(model_dir).items():
             by_file.setdefault(path, {})[key] = info
@@ -184,10 +315,26 @@ class QwenCudaVision:
                 names = {vision_key(name): name for name in source.keys()}
                 for key in selected:
                     value = source.get_tensor(names[key])
+                    if key.rpartition(".")[0] in schemes:      # a quantized linear's tensors: decoded below
+                        stored[key] = value
+                        continue
                     if key == "patch_embed.proj.weight" and value.shape[-1] == self.config["in_channels"]:
                         value = value.permute(0, 4, 1, 2, 3).contiguous()
                     tensors[key] = value.to(device=resident, dtype=torch.bfloat16)
+        alphas = {}
+        for name, kind in schemes.items():
+            parts = {key.rpartition(".")[2]: value for key, value in stored.items() if key.rpartition(".")[0] == name}
+            tensors[f"{name}.weight"], alphas[name] = dequantized(kind, parts, resident)
         tower.load_state_dict(tensors, strict=True, assign=True)
+        for name, alpha in alphas.items():
+            if alpha != 1.0:                    # the per-tensor scale rides the GEMM (exact weights, one rounding)
+                owner, _, leaf = name.rpartition(".")
+                linear = getattr(tower.get_submodule(owner), leaf)
+                setattr(tower.get_submodule(owner), leaf, _scaled_linear()(linear.weight, linear.bias, alpha))
+        if schemes:
+            counts = {kind: sum(1 for k in schemes.values() if k == kind) for kind in sorted(set(schemes.values()))}
+            print(f"[tensorfold] vision: {', '.join(f'{n} {k.upper()}' for k, n in counts.items())} tower linears "
+                  f"loaded exactly (bf16 values; per-tensor scales applied to the GEMM sums)", flush=True)
         rotary_frequencies(tower.rotary_pos_emb, self.config, resident)
         self.tower = tower.eval()
 

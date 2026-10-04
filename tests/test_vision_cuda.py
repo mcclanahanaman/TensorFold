@@ -222,3 +222,139 @@ def test_a_meta_built_tower_matches_a_normally_built_one_in_the_installed_transf
         want = built(pixels, grid_thw=grid, return_dict=True).pooler_output
         got = meta.eval()(pixels, grid_thw=grid, return_dict=True).pooler_output
     assert torch.equal(got, want)
+
+
+def _quantized_checkpoint(path, *, listed=None, damage=None):
+    """A depth-1 tower like Flash Next 7c4f1bc1's: MXFP8 attention, first MLP and merger linears, an NVFP4 second
+    MLP linear (fp32 weight_scale_2), floating-point norms, biases and embeddings; real, valid payload bytes."""
+    rng = np.random.default_rng(7)
+    h, mid, merged = 32, 64, 128
+    vision = {"model_type": "qwen3_5_vision", "hidden_size": h, "out_hidden_size": h, "depth": 1, "patch_size": 2,
+              "temporal_patch_size": 2, "spatial_merge_size": 2, "in_channels": 3, "intermediate_size": mid,
+              "num_heads": 2, "num_position_embeddings": 4}
+    linears = {"blocks.0.attn.qkv": ([3 * h, h], "mxfp8"), "blocks.0.attn.proj": ([h, h], "mxfp8"),
+               "blocks.0.mlp.linear_fc1": ([mid, h], "mxfp8"), "blocks.0.mlp.linear_fc2": ([h, mid], "nvfp4"),
+               "merger.linear_fc1": ([merged, merged], "mxfp8"), "merger.linear_fc2": ([h, merged], "mxfp8")}
+    layers = {f"model.visual.{name}": {"quant_algo": kind.upper(), "group_size": 32 if kind == "mxfp8" else 16}
+              for name, (_, kind) in linears.items()}
+    layers.update(listed or {})
+    config = {"model_type": "qwen4_exp", "vision_config": vision, "text_config": {
+        "hidden_size": h, "head_dim": 8, "rope_parameters": {"mrope_interleaved": True,
+        "mrope_section": [2, 1, 1], "partial_rotary_factor": 1}},
+        "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+                                "quantized_layers": layers}}
+    (path / "config.json").write_text(json.dumps(config))
+
+    def e4m3(shape):                     # e4m3 bytes without the NaN codes 0x7f / 0xff
+        b = rng.integers(0, 256, size=shape, dtype=np.uint8)
+        return np.where((b & 0x7F) == 0x7F, b - 1, b).astype(np.uint8)
+
+    data = {"patch_embed.proj.weight": ("BF16", rng.standard_normal([h, 2, 2, 2, 3]))}
+    for name, shape in {"patch_embed.proj.bias": [h], "pos_embed.weight": [4, h], "merger.norm.weight": [h],
+                        "merger.norm.bias": [h], "blocks.0.norm1.weight": [h], "blocks.0.norm1.bias": [h],
+                        "blocks.0.norm2.weight": [h], "blocks.0.norm2.bias": [h]}.items():
+        data[name] = ("BF16", rng.standard_normal(shape))
+    for name, ((n, k), kind) in linears.items():
+        data[f"{name}.bias"] = ("BF16", rng.standard_normal([n]))
+        if kind == "mxfp8":
+            data[f"{name}.weight"] = ("F8_E4M3", e4m3([n, k]))
+            data[f"{name}.weight_scale"] = ("U8", rng.integers(118, 128, size=[n, k // 32], dtype=np.uint8))
+        else:
+            data[f"{name}.weight"] = ("U8", rng.integers(0, 256, size=[n, k // 2], dtype=np.uint8))
+            data[f"{name}.weight_scale"] = ("F8_E4M3", rng.integers(0x20, 0x60, size=[n, k // 16], dtype=np.uint8))
+            data[f"{name}.weight_scale_2"] = ("F32", np.array(0.0123, dtype=np.float32).reshape([]))
+            data[f"{name}.input_scale"] = ("F32", np.array(0.5, dtype=np.float32).reshape([]))
+    if damage:
+        damage(data)
+    entries, blobs, offset = {}, [], 0
+    for name, (dtype, array) in data.items():
+        if dtype == "BF16":
+            raw = (np.asarray(array, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16).tobytes()
+        else:
+            raw = np.ascontiguousarray(array).tobytes()
+        entries["model.visual." + name] = {"dtype": dtype, "shape": list(np.shape(array)),
+                                           "data_offsets": [offset, offset + len(raw)]}
+        blobs.append(raw)
+        offset += len(raw)
+    head = json.dumps(entries).encode()
+    (path / "model.safetensors").write_bytes(struct.pack("<Q", len(head)) + head + b"".join(blobs))
+    return entries, data, linears
+
+
+def test_quantized_tower_headers_count_its_bf16_weights(tmp_path):
+    from tensorfold.vision.qwen_cuda import vision_layout
+
+    entries, _, linears = _quantized_checkpoint(tmp_path)
+    config, resident, schemes = vision_layout(tmp_path)
+    assert config["model_type"] == "qwen3_5_vision"
+    assert schemes == {name: kind for name, (_, kind) in linears.items()}
+    floats = sum(int(np.prod(e["shape"])) * 2 for name, e in entries.items()
+                 if not name.rsplit(".", 1)[0].removeprefix("model.visual.") in linears)
+    weights = sum(n * k * 2 for (n, k), _ in linears.values())
+    assert resident == floats + weights + sum(n * 2 for (n, _), _ in linears.values())   # + the bf16 biases
+    transform = weight_transform(lambda *args: (0, 0), True, 0)
+    assert sum(transform(name, e)[0] for name, e in entries.items()) == resident
+    assert checkpoint_vision(tmp_path) == (config, resident)
+
+
+@pytest.mark.parametrize("damage", ["no_scale_2", "scale_shape", "listed", "stray_scale", "nan_dtype"])
+def test_incomplete_or_mislabelled_quantized_towers_refuse_before_loading(tmp_path, damage):
+    fc2 = "blocks.0.mlp.linear_fc2"
+    listed = {f"model.visual.{fc2}": {"quant_algo": "MXFP8", "group_size": 32}} if damage == "listed" else None
+    edit = {"no_scale_2": lambda d: d.pop(f"{fc2}.weight_scale_2"),
+            "scale_shape": lambda d: d.update({f"{fc2}.weight_scale": ("F8_E4M3", np.zeros([32, 3], np.uint8))}),
+            "listed": None,
+            "stray_scale": lambda d: d.update({"blocks.0.norm1.weight_scale": ("U8", np.zeros([1], np.uint8))}),
+            "nan_dtype": lambda d: d.update({f"{fc2}.weight_scale_2": ("F16", np.zeros([], np.float16))})}[damage]
+    _quantized_checkpoint(tmp_path, listed=listed, damage=edit)
+    with pytest.raises(ValueError):
+        checkpoint_vision(tmp_path)
+
+
+def test_quantized_weights_decode_exactly_as_the_shared_reference_decoder(tmp_path):
+    torch = pytest.importorskip("torch")
+    from tensorfold.cuda.nvfp4.format import dequant
+    from tensorfold.vision.qwen_cuda import dequantized
+
+    _, data, linears = _quantized_checkpoint(tmp_path)
+    for name, (_, kind) in linears.items():
+        parts = {part.rsplit(".", 1)[1]: array for part, (_, array) in data.items() if part.startswith(name + ".")
+                 and part.rsplit(".", 1)[1] != "bias"}
+        tensors = {p: torch.from_numpy(np.ascontiguousarray(a)) for p, a in parts.items()}
+        if kind == "mxfp8":
+            tensors["weight"] = tensors["weight"].view(torch.float8_e4m3fn)
+        else:
+            tensors["weight_scale"] = tensors["weight_scale"].view(torch.float8_e4m3fn)
+        weight, alpha = dequantized(kind, tensors, "cpu")
+        want = dequant(kind, parts["weight"], parts["weight_scale"], 1.0)      # nvfp4: codes x e4m3, no global
+        assert weight.dtype == torch.bfloat16
+        assert torch.equal(weight.float(), torch.from_numpy(want))
+        assert alpha == (float(parts["weight_scale_2"]) if kind == "nvfp4" else 1.0)
+
+
+@pytest.mark.parametrize("kind", ["mxfp8", "nvfp4"])
+def test_nan_scales_refuse_at_load(kind):
+    torch = pytest.importorskip("torch")
+    from tensorfold.vision.qwen_cuda import dequantized
+
+    if kind == "mxfp8":
+        parts = {"weight": torch.zeros([4, 32], dtype=torch.uint8).view(torch.float8_e4m3fn),
+                 "weight_scale": torch.full([4, 1], 255, dtype=torch.uint8)}
+    else:
+        parts = {"weight": torch.full([4, 8], 0x11, dtype=torch.uint8),
+                 "weight_scale": torch.full([4, 1], 0x7F, dtype=torch.uint8).view(torch.float8_e4m3fn),
+                 "weight_scale_2": torch.tensor(0.5)}
+    with pytest.raises(ValueError):
+        dequantized(kind, parts, "cpu")
+
+
+def test_scaled_linear_scales_the_products_not_the_bias():
+    torch = pytest.importorskip("torch")
+    from tensorfold.vision.qwen_cuda import _scaled_linear
+
+    g = torch.Generator().manual_seed(3)
+    x, w, b = (torch.randn(s, generator=g, dtype=torch.float64) for s in ([5, 7, 16], [12, 16], [12]))
+    layer = _scaled_linear()(torch.nn.Parameter(w), torch.nn.Parameter(b), 0.0123)
+    got = layer(x)
+    assert got.shape == (5, 7, 12)
+    assert torch.allclose(got, 0.0123 * (x @ w.T) + b, rtol=1e-12, atol=1e-12)
