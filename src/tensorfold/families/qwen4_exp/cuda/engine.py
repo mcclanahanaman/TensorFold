@@ -217,6 +217,11 @@ class FlashNextEngine:
                 if not tables_read:
                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
                 locked = room >= size and table.lock()
+            from . import thor_dec2
+
+            if not locked and thor_dec2.available():   # Thor: the cached pages mapped too, so lookups never fault
+                print(f"[tensorfold] Thor (sm_110): {thor_dec2.map_tables(tables.values())} "
+                      f"({thor_dec2.ENV}=0: the lookups map them, as before)", flush=True)
         read_s = time.perf_counter() - started
         captured = self.e.graphs.warm(self.depth + 1) if self.e is not None and self.e.graphs is not None else 0
         from . import thor_hc

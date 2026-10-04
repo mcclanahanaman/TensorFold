@@ -18,7 +18,7 @@ from tensorfold.cuda.nvfp4 import thor_dense
 
 from . import attention as attn_mod
 from . import gdn as gdn_mod
-from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_glue, thor_hc, thor_qsa
+from . import attn_multi, bf16, gdn_io, gdn_multi, glue, nvfp4_moe, qmm, thor_dec2, thor_glue, thor_hc, thor_qsa
 from . import image_rows
 from .hc_check import fuser as _hc_fuser
 from .state import ATT_ROWS, CAND, Buffers, State, _MoECfg
@@ -529,6 +529,23 @@ def stage_ahead() -> bool:
     return os.environ.get(STAGE_AHEAD, "1").strip().lower() not in ("0", "off", "false", "no")
 
 
+def _gather(lookups: list) -> list:
+    """Each lookup's table rows; Thor DEC-2 (``thor_dec2.S.batch``): one gather a table for every stream, the same rows."""
+
+    if not thor_dec2.S.batch or len(lookups) < 2:
+        return [p.table.gather(ids) for p, ids, _ in lookups]
+    got, by = [None] * len(lookups), {}
+    for i, (p, _, _) in enumerate(lookups):
+        by.setdefault(id(p.table), (p.table, []))[1].append(i)
+    for table, idx in by.values():
+        rows = table.gather(np.concatenate([lookups[i][1].reshape(-1) for i in idx]))
+        at = 0
+        for i in idx:
+            got[i] = rows[at:at + lookups[i][1].size]
+            at += lookups[i][1].size
+    return got
+
+
 def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]) -> list[Seg]:
     """Host work before a forward (token ids, n-gram rows into static buffers); returns each stream's segment."""
 
@@ -551,7 +568,7 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
                 st.ple_last = (st.ple_history, toks)
                 lookups.append((p, ids, a0 * (ids.size // len(toks))))
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
-    ahead = [p.table.gather(ids) for p, ids, _ in lookups] if w.x3 is None and stage_ahead() else None
+    ahead = _gather(lookups) if w.x3 is None and stage_ahead() else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)

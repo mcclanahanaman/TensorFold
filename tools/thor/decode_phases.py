@@ -407,7 +407,8 @@ def main(argv=None) -> int:
                 if split is not None:
                     hs = row["host_split"]
                     print(f"[host] {a.label} u{users} {kind} g{g}: wall {hs['wall_ms']:.2f} forward {hs['forward_ms']:.2f} "
-                          f"no-forward {hs['idle_ms']:.2f} ms | " + " ".join(f"{n} {i:.2f}" for n, i, _, _ in hs["top"][:10]),
+                          f"no-forward {hs['idle_ms']:.2f} ms | " + " ".join(f"{n} {i:.2f}" for n, i, _, _ in hs["top"][:10])
+                          + "".join(f" | faults {n} {f}" for n, f in hs.get("faults", {}).items()),
                           flush=True)
                 for name, c in sm.get("cpu", {}).items():
                     print(f"[phases]   cpu@{name}: {c['khz'] / 1e3:.0f} MHz (min {c['khz_min'] / 1e3:.0f}), probe "

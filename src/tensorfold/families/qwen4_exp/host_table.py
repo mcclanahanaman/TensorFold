@@ -149,11 +149,17 @@ class HostTable:
 
         return _prefetch(self.words + self.scales + self.biases, workers)
 
+    def populate(self, workers: int = 8) -> int:
+        """Map every shard's cached pages into this process (bytes covered); see ``_populate``."""
+
+        return _populate(self.words + self.scales + self.biases, workers)
+
 
 class BF16Table:
     """bf16 n-gram shards (the NVFP4 checkpoint's): memory-mapped, gathered a lookup at a time as bf16 bits."""
 
     bits = 16
+    split = GATHER_SPLIT                         # rows a pool piece at least (Thor DEC-2 sets fewer)
 
     def __init__(self, files: list[tuple[Path, dict]]) -> None:
         self.values, starts = [], [0]
@@ -189,7 +195,7 @@ class BF16Table:
         def copy(f: int, at: np.ndarray) -> None:
             out[at] = self.values[f][local[at]]
 
-        _copy_rows(self._pool, shard, copy)
+        _copy_rows(self._pool, shard, copy, self.split)
         return out
 
     def lock(self) -> bool:
@@ -215,6 +221,11 @@ class BF16Table:
         """Read every shard once so the lookups hit the page cache (seconds taken); the pages stay evictable."""
 
         return _prefetch(self.values, workers)
+
+    def populate(self, workers: int = 8) -> int:
+        """Map every shard's cached pages into this process (bytes covered); see ``_populate``."""
+
+        return _populate(self.values, workers)
 
 
 class FP8Table(BF16Table):
@@ -293,6 +304,11 @@ class NVFP4Table(BF16Table):
     def prefetch(self, workers: int = 8) -> float:
         return _prefetch(self.values + self.scales, workers)
 
+    def populate(self, workers: int = 8) -> int:
+        """Map every shard's cached pages into this process (bytes covered); see ``_populate``."""
+
+        return _populate(self.values + self.scales, workers)
+
 
 def shard_keys(name: str, count: int, names) -> list[str]:
     """Resolve the flat and nested shard spellings used by MLX checkpoints."""
@@ -362,14 +378,14 @@ class ReadAhead:
         return ahead.result() if ahead is not None else self.table.gather(ids)
 
 
-def _copy_rows(pool: ThreadPoolExecutor, shard: np.ndarray, copy) -> None:
-    """``copy(f, at)`` for each shard's rows; a prompt chunk's (2 GATHER_SPLIT rows or more) split over the pool."""
+def _copy_rows(pool: ThreadPoolExecutor, shard: np.ndarray, copy, split: int = GATHER_SPLIT) -> None:
+    """``copy(f, at)`` for each shard's rows; a prompt chunk's (2 ``split`` rows or more) split over the pool."""
 
-    if GATHER_THREADS > 1 and shard.size >= 2 * GATHER_SPLIT:
+    if GATHER_THREADS > 1 and shard.size >= 2 * split:
         jobs = []
         for f in np.unique(shard):
             at = np.nonzero(shard == f)[0]
-            parts = max(1, min(GATHER_THREADS, len(at) // GATHER_SPLIT))
+            parts = max(1, min(GATHER_THREADS, len(at) // split))
             jobs += [(f, piece) for piece in np.array_split(at, parts)]
         list(pool.map(lambda job: copy(*job), jobs))
     else:
@@ -403,6 +419,38 @@ def _random_access(array: np.ndarray) -> None:
 
 
 PREFETCH_READ = 16 << 20        # bytes a prefetch read: a page fault under MADV_RANDOM reads one page, a read the span
+
+
+MADV_POPULATE_READ = 22         # Linux 5.14+: map a range's pages (reading any the page cache lacks), no fault a page
+
+
+def _populate(arrays: list[np.ndarray], workers: int = 8) -> int:
+    """Map every array's pages into this process (MADV_POPULATE_READ, PREFETCH_READ spans over ``workers`` threads), so
+    lookups find them mapped instead of taking a page fault each (bytes covered). Page tables only: the pages stay clean,
+    shared and evictable. Linux only; OSError where the kernel lacks it (before 5.14)."""
+
+    import ctypes
+    import sys
+
+    if not sys.platform.startswith("linux"):
+        raise OSError("MADV_POPULATE_READ is Linux's")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.madvise.argtypes = (ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    page = os.sysconf("SC_PAGE_SIZE")
+    spans = []
+    for arr in arrays:
+        lo, hi = arr.ctypes.data // page * page, arr.ctypes.data + arr.nbytes
+        spans += [(at, min(PREFETCH_READ, hi - at)) for at in range(lo, hi, PREFETCH_READ)]
+
+    def advise(span) -> None:
+        at, n = span
+        if libc.madvise(at, n, MADV_POPULATE_READ) != 0:     # ctypes drops the GIL: the spans map in parallel
+            err = ctypes.get_errno()
+            raise OSError(err, f"madvise(MADV_POPULATE_READ): {os.strerror(err)}")
+
+    with ThreadPoolExecutor(workers, thread_name_prefix="ngram-map") as pool:
+        list(pool.map(advise, spans))
+    return sum(arr.nbytes for arr in arrays)
 
 
 def _prefetch(arrays: list[np.ndarray], workers: int = 8) -> float:

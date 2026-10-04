@@ -12,6 +12,7 @@ Kernels, launches and bits are untouched; the wrappers cost about a microsecond 
 
 from __future__ import annotations
 
+import resource
 import time
 
 import torch
@@ -23,18 +24,22 @@ class Split:
         self.windows: list = []        # (event before the first launch, event after the last)
         self.t0 = 0.0
         self.e0 = None
+        self.faults: dict = {}         # name: [thread minor, thread major, process minor, process major]
 
     def begin(self) -> None:
         self.marks.clear()
         self.windows.clear()
+        self.faults.clear()
         self.e0 = torch.cuda.Event(enable_timing=True)
         self.e0.record()
         self.t0 = time.perf_counter()
 
-    def wrap(self, name: str, fn, forward: bool = False):
-        marks, windows, clock = self.marks, self.windows, time.perf_counter
+    def wrap(self, name: str, fn, forward: bool = False, faults: bool = False):
+        marks, windows, clock, counts = self.marks, self.windows, time.perf_counter, self.faults
 
         def wrapped(*args, **kwargs):
+            if faults:
+                f0 = _faults()
             marks.append((clock(), 1, name))
             if forward:
                 e0 = torch.cuda.Event(enable_timing=True)
@@ -47,6 +52,10 @@ class Split:
                     e1.record()
                     windows.append((e0, e1))
                 marks.append((clock(), -1, name))
+                if faults:
+                    got = counts.setdefault(name, [0, 0, 0, 0])
+                    for i, (a, b) in enumerate(zip(f0, _faults())):
+                        got[i] += b - a
         wrapped.__wrapped__ = fn
         return wrapped
 
@@ -82,14 +91,22 @@ class Split:
                 stack.pop()
         wall = (t1 - self.t0) * 1e3
         fwd = sum(min(b, t1) - max(a, self.t0) for a, b in merged if b > self.t0 and a < t1) * 1e3
-        return {"calls": calls, "wall_ms": wall, "forward_ms": fwd, "idle_ms": wall - fwd}
+        return {"calls": calls, "wall_ms": wall, "forward_ms": fwd, "idle_ms": wall - fwd,
+                "faults": {k: list(v) for k, v in self.faults.items()}}
 
 
-def _patch(split: Split, owner, attr: str, name: str, forward: bool = False) -> None:
+def _faults() -> tuple:
+    """(this thread's minor, major, the process's minor, major) page faults so far (getrusage; Linux)."""
+
+    t, p = resource.getrusage(resource.RUSAGE_THREAD), resource.getrusage(resource.RUSAGE_SELF)
+    return t.ru_minflt, t.ru_majflt, p.ru_minflt, p.ru_majflt
+
+
+def _patch(split: Split, owner, attr: str, name: str, forward: bool = False, faults: bool = False) -> None:
     fn = getattr(owner, attr, None)
     if fn is None or getattr(fn, "__wrapped__", None) is not None:
         return
-    setattr(owner, attr, split.wrap(name, fn, forward))
+    setattr(owner, attr, split.wrap(name, fn, forward, faults))
 
 
 def install(split: Split) -> None:
@@ -121,7 +138,7 @@ def install(split: Split) -> None:
     _patch(split, ngram.NGram, "ids", "ngram.ids")
     for cls in vars(host_table).values():
         if isinstance(cls, type) and "gather" in vars(cls):
-            _patch(split, cls, "gather", "table.gather")
+            _patch(split, cls, "gather", "table.gather", faults=True)
     _patch(split, torch.cuda.Event, "synchronize", "event.sync")
     _patch(split, torch.cuda.Stream, "synchronize", "stream.sync")
     for attr in ("take", "counted"):
@@ -141,7 +158,14 @@ def summarize(rounds: list, top: int = 14) -> dict:
             got[1] += busy
             got[2] += calls
     ranked = sorted(tot.items(), key=lambda kv: -kv[1][0])
+    faults: dict = {}
+    for r in rounds:
+        for name, got in r.get("faults", {}).items():
+            acc = faults.setdefault(name, [0] * len(got))
+            for i, v in enumerate(got):
+                acc[i] += v
     return {"rounds": len(rounds), "wall_ms": sum(r["wall_ms"] for r in rounds) / n,
             "forward_ms": sum(r["forward_ms"] for r in rounds) / n, "idle_ms": sum(r["idle_ms"] for r in rounds) / n,
             "top": [[name, round(idle / n, 3), round(busy / n, 3), round(calls / n, 2)]
-                    for name, (idle, busy, calls) in ranked[:top]]}
+                    for name, (idle, busy, calls) in ranked[:top]],
+            "faults": {name: [round(v / n, 2) for v in acc] for name, acc in faults.items()}}
