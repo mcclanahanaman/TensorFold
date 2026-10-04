@@ -252,10 +252,10 @@ class FP8Table(BF16Table):
         self.lut = ((f32 + 0x7FFF + ((f32 >> 16) & 1)) >> 16).astype(np.uint16)   # round to nearest even
         self.lut[(np.arange(256) & 0x7F) == 0x7F] = 0x7FC0                         # e4m3's NaN codes stay NaN
 
-    def gather(self, ids: np.ndarray) -> np.ndarray:
-        """Rows ``ids`` (global) -> [n, W] uint16 (bf16 bits of e4m3 x scale)."""
+    def gather(self, ids: np.ndarray, split: int | None = None) -> np.ndarray:
+        """Rows ``ids`` (global) -> [n, W] uint16 (bf16 bits of e4m3 x scale); ``split``: pool pieces (Thor DEC-2)."""
 
-        return self.lut[super().gather(ids)]
+        return self.lut[super().gather(ids, split)]
 
 
 class NVFP4Table(BF16Table):
@@ -282,8 +282,9 @@ class NVFP4Table(BF16Table):
         self.e2m1, self.e4m3, self.g = E2M1, e4m3(np.arange(256)), np.float32(scale)
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
 
-    def gather(self, ids: np.ndarray) -> np.ndarray:
-        """Rows ``ids`` (global) -> [n, W] uint16: bf16 bits of the fp32 code x block scale x table scale, rounded once."""
+    def gather(self, ids: np.ndarray, split: int | None = None) -> np.ndarray:
+        """Rows ``ids`` (global) -> [n, W] uint16: bf16 bits of the fp32 code x block scale x table scale, rounded once;
+        ``split``: pool pieces (Thor DEC-2)."""
 
         shard, local = self._where(ids)
         codes = np.empty((shard.size, self.width // 2), dtype=np.uint8)
@@ -292,7 +293,7 @@ class NVFP4Table(BF16Table):
         def copy(f: int, at: np.ndarray) -> None:
             codes[at], blocks[at] = self.values[f][local[at]], self.scales[f][local[at]]
 
-        _copy_rows(self._pool, shard, copy)
+        _copy_rows(self._pool, shard, copy, split or self.split)
         nib = np.stack([codes & 0xF, codes >> 4], -1).reshape(shard.size, self.width)
         v = (self.e2m1[nib] * np.repeat(self.e4m3[blocks], 16, axis=1)).astype(np.float32) * self.g
         f32 = v.astype(np.float32).view(np.uint32).astype(np.uint64)
