@@ -117,7 +117,7 @@ def test_startup_graphs_serve_any_slot(monkeypatch):
     """Graphs recorded at startup on one free slot (slot-free keys, each stream's n-gram conv tail copied in) replay
     for requests on other slots with the eager rounds' bits; keys outside the startup set stay eager."""
 
-    monkeypatch.setenv(thor_graphs.ROWS_ENV, f"2-{DEPTH + 1}")     # every verification window, not only the default
+    monkeypatch.setenv(thor_graphs.ROWS_ENV, f"2-{DEPTH + 1}")     # every verification window (the default)
     w = _model()
     prompts, counts = PROMPTS[:3], [40, 33, 48]
     off_out, off_rounds, _, _ = _sequential(w, prompts, counts, graphs=False, capacity=1024)
@@ -129,6 +129,8 @@ def test_startup_graphs_serve_any_slot(monkeypatch):
     # verification windows of 2..DEPTH+1 rows (one DeltaNet parity), MTP steps of 1..DEPTH+1 rows with their greedy
     # picks: nothing recorded later
     assert g.captures == {"verify": DEPTH, "mtp": DEPTH + 1}, g.captures
+    # the diagnostics count every eager one-stream forward by its key
+    assert sum(g.missed.values()) == sum(g.forwards.values()) - sum(g.replays.values()), (g.missed, g.forwards)
     assert g.replays.get("verify", 0) > 0 and g.replays.get("mtp", 0) > 0, (g.replays, g.forwards)
 
 
@@ -136,6 +138,7 @@ def test_rows_spec():
     assert thor_graphs._rows("2-7", 7) == [2, 3, 4, 5, 6, 7]
     assert thor_graphs._rows("3,5-6,9", 7) == [3, 5, 6]
     assert thor_graphs._rows("1-2", 7) == [2]
+    assert thor_graphs._rows("2,7", 7) == [2, 7]                     # the kill switch: e8f9144's two windows
 
 
 def test_bucket():
@@ -146,7 +149,7 @@ def test_bucket():
 def test_prerecord_after_the_gate_charges_the_room(monkeypatch):
     """Startup graphs are recorded after the memory gate measured the room, and the room is charged with exactly what
     prerecord reports as the graphs' own memory (captures and uploads); by default the verification windows recorded
-    are two rows and the widest."""
+    are every window from two rows to the widest."""
 
     from tensorfold.families.qwen4_exp.cuda import multi
 
@@ -166,8 +169,8 @@ def test_prerecord_after_the_gate_charges_the_room(monkeypatch):
     finally:
         thor_graphs.available.cache_clear()
     g = dec.graphs
-    assert g is not None and g.fixed and not g.failed and g.rows == [2, DEPTH + 1]
-    assert g.captures == {"verify": 2, "mtp": DEPTH + 1}, g.captures
+    assert g is not None and g.fixed and not g.failed and g.rows == list(range(2, DEPTH + 2))
+    assert g.captures == {"verify": DEPTH, "mtp": DEPTH + 1}, g.captures
     assert len(charged) == 1 and 0 <= charged[0] < 1 << 30
     assert dec.memory_gate.room == (64 << 30) - charged[0]
 

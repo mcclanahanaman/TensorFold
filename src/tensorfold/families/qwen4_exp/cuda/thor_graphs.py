@@ -25,9 +25,10 @@ with a prompt pass stays eager):
   memory, which eager decoding also takes at its first requests, after its gate. Other keys then stay eager
   (``TENSORFOLD_THOR_DECODE_GRAPH_LAZY=1`` records them on their second forward, as before;
   ``TENSORFOLD_THOR_DECODE_GRAPH_STARTUP=0`` records every key that way). ``TENSORFOLD_THOR_DECODE_GRAPH_ROWS``
-  (default ``2,W``: two rows and the widest window ``W``, which carry most one-stream verifications; ``2-7`` or
-  ``3,4,5``) picks the verification windows recorded: on Thor a graph executable holds driver memory of its own, about
-  20 MiB a verification forward;
+  (default ``2-W``: every window from two rows to the widest ``W``; a drafter that stops its chain early leaves the
+  windows between, which ran eagerly under ``2,W``, the earlier default and now the kill switch; or ``3,4,5``) picks
+  the verification windows recorded: on Thor a graph executable holds driver memory of its own, about 20 MiB a
+  verification forward;
 - a one-stream verification forward always writes DeltaNet scratch half 0 (``gdn_multi.normalize`` copies last
   round's pending rows to half 1 first, exact copies), so one graph a window size serves both parities;
 - an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
@@ -73,6 +74,7 @@ MIN_SEEN = 2                # a key's forwards before its graph is recorded (the
 STREAMS = 1                 # the most streams a graphed forward holds (more stay eager: their keys rarely repeat)
 SEEN_MAX = 1 << 14          # keys counted before the counts start over
 STATS_EVERY = 512           # forwards between stats events
+MISSED_MAX = 64             # eager one-stream keys counted by name in stats (the rest as "other")
 MIB = float(1 << 20)
 
 
@@ -210,8 +212,9 @@ class DecodeGraphs:
         self.startup = _flag(STARTUP_ENV, "1")      # prerecord the one-stream short-context keys at startup
         self.lazy = _flag(LAZY_ENV, "0")            # after prerecord, record other keys on their second forward too
         self.capture = _flag(CAPTURE_ENV, "1")      # prerecord records graphs (0: its eager warm-ups only; diagnostics)
-        self.rows = _rows(os.environ.get(ROWS_ENV, "") or f"2,{width}", width)   # verification windows prerecorded
+        self.rows = _rows(os.environ.get(ROWS_ENV, "") or f"2-{width}", width)   # verification windows prerecorded
         self.hist: dict[str, list[int]] = {}        # one-stream forwards by kind and rows: [forwards, replays]
+        self.missed: dict[str, int] = {}            # diagnostics: one-stream eager forwards by key (pointers left out)
         self.fixed = False                          # prerecord ran: unrecorded keys stay eager unless ``lazy``
         self.graphs: OrderedDict[tuple, _Entry] = OrderedDict()
         self.seen: dict[tuple, int] = {}
@@ -235,7 +238,7 @@ class DecodeGraphs:
         return {"event": "stats", "forwards": dict(self.forwards), "replays": dict(self.replays),
                 "captures": dict(self.captures), "evictions": 0, "capture_s": round(self.capture_s, 4),
                 "graph_mib": round(self.graph_mib, 1),
-                "graphs": len(self.graphs), "hist": dict(self.hist),
+                "graphs": len(self.graphs), "hist": dict(self.hist), "missed": dict(self.missed),
                 "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1),
                 "free_mib": _free_mib()}
 
@@ -258,6 +261,14 @@ class DecodeGraphs:
         if tables is not None:
             k += (tables.cur, bool(tables.folds), tables.plan.slots, tables.plan.max_rows, tables.held.shape[1])
         return k
+
+    def _miss(self, key: tuple) -> None:
+        """Diagnostics: a one-stream forward ran eagerly; ``stats`` counts it by its key, pointers left out."""
+
+        k = str((key[0], tuple(p[:2] for p in key[1])) + key[2:])
+        if k not in self.missed and len(self.missed) >= MISSED_MAX:
+            k = "other"
+        self.missed[k] = self.missed.get(k, 0) + 1
 
     def run(self, kind: str, segs: Sequence, b, fn: Callable[[], torch.Tensor], *, step,
             tables=None, extra: tuple = ()) -> torch.Tensor:
@@ -284,16 +295,19 @@ class DecodeGraphs:
             h[1] += 1
             return entry.out
         if self.fixed and not self.lazy:            # the startup set holds the replayed keys; the rest stay eager
+            self._miss(key)
             return fn()
         seen = self.seen.get(key, 0) + 1
         if kind in self.failed or seen < self.min_seen or len(self.graphs) >= self.cap:
             if len(self.seen) >= SEEN_MAX:
                 self.seen.clear()
             self.seen[key] = seen
+            self._miss(key)
             return fn()
         self.seen.pop(key, None)
         entry = self._record(kind, b, step, tables, fn, segs)
         if entry is None:
+            self._miss(key)
             return fn()
         self.graphs[key] = entry
         entry.graph.replay()                        # this round's tables are the ones it was recorded with
@@ -486,6 +500,12 @@ def _mem_watch(path: str) -> None:
         except OSError:
             continue
         _mem_emit(tag)
+        g = getattr(_MEM[0], "graphs", None)
+        if g is not None:                           # the graphs' counters at the same edge (a phase's counts)
+            try:
+                g._emit(dict(g.stats(), tag=tag))
+            except Exception:                       # noqa: BLE001  diagnostics never break serving
+                pass
 
 
 def _mem_emit(tag: str) -> None:
