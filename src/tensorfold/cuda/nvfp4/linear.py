@@ -467,6 +467,20 @@ class Concat:
 FUSED_ROWS = int(__import__("os").environ.get("TF_QMMF_FUSED_ROWS", "256"))   # rows from which slices meet in a block
 
 
+@lru_cache(maxsize=None)
+def thor_slices(device: int) -> bool:
+    """Thor (sm_110): MXFP8 K slices of fewer than FUSED_ROWS rows meet through ``part`` and the reduce, not a cluster.
+
+    qmmf.cu adds the slices in slice order either way (the same bits). On Thor the 8-slice cluster of the out_proj /
+    o_proj shape [2560, 6144] runs at 133 GB/s from 1 to 16 rows; the reduce path at 174-220 GB/s, 1.65x faster from 3
+    rows and 2.1-2.4x at 32-128. TENSORFOLD_THOR_QMMF_SLICES=0 keeps the cluster."""
+    import os
+
+    if os.environ.get("TENSORFOLD_THOR_QMMF_SLICES", "1") == "0":
+        return False
+    return torch.cuda.get_device_capability(device) == (11, 0)
+
+
 def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n: int, k: int, npad: int,
             x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
     """x (M, K) bf16 -> (M, n) bf16; K slices from the shape alone, so a row's bits never depend on M."""
@@ -479,7 +493,9 @@ def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n
     y = out if out is not None and out.is_contiguous() and out.dtype == torch.bfloat16 else \
         torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     sk = qmm.split_k(n, k)
-    part = torch.empty((sk, m, n), dtype=torch.float32, device=x.device) if sk > 8 else None
+    meet = sk > 8 or (sk > 1 and mode == MXFP8 and thor_slices(x.device.index if x.device.index is not None
+                                                                 else torch.cuda.current_device()))
+    part = torch.empty((sk, m, n), dtype=torch.float32, device=x.device) if meet else None
     # prompt rows: each block sums its tile's slices itself (bm 0), the cluster's order without the cluster
     bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
     _ext().qmmf(x, w, bs, scale, y, part if bm else None, mode, n, sk, npad, bm, False)
