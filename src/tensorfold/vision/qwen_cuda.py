@@ -340,6 +340,16 @@ class QwenCudaVision:
                   f"loaded exactly (bf16 values; per-tensor scales applied to the GEMM sums)", flush=True)
         rotary_frequencies(tower.rotary_pos_emb, self.config, resident)
         self.tower = tower.eval()
+        self._thor_attn = None      # THOR-VISION-ATTN (sm_110 only; an offloaded tower keeps transformers' path)
+        if not offload:
+            from . import thor_vision
+
+            self._thor_attn = thor_vision.install(self.tower, device)
+            if self._thor_attn:
+                parts = [p for p, on in (("the rotary embedding in one pass", self._thor_attn["rope"]),
+                                         ("one flash call a layer", self._thor_attn["varlen"])) if on]
+                print(f"[tensorfold] Thor (sm_110): vision attention with {' and '.join(parts)}, transformers' bits "
+                      f"(TENSORFOLD_THOR_VISION=0 keeps transformers' path)", flush=True)
 
     def warm(self):
         """Load tower kernels at startup using one small, merge-aligned image grid."""
@@ -378,6 +388,10 @@ class QwenCudaVision:
     def encode(self, prepared, prompt) -> EncodedVision:
         with self._on_gpu():
             return self._encode(prepared, prompt)
+
+    def _longest(self, segments) -> dict:
+        """THOR-VISION-ATTN's one flash call a layer: the call's longest attention segment from the host."""
+        return {"max_seqlen": max(segments)} if self._thor_attn else {}
 
     def _encode(self, prepared, prompt) -> EncodedVision:
         import torch
@@ -428,7 +442,8 @@ class QwenCudaVision:
                 pixels = torch.tensor(prepared.pixel_values[done:done + sum(sizes[begin:end])],
                                       dtype=torch.bfloat16, device=self.device)
                 grids = torch.tensor(grid[begin:end], dtype=torch.int64, device=self.device)
-                features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
+                features = self.tower(pixels, grid_thw=grids, return_dict=True,
+                                      **self._longest([int(h) * int(w) for _, h, w in grid[begin:end]])).pooler_output
                 for part in features.to(dtype=torch.bfloat16).split([s // merge**2 for s in sizes[begin:end]]):
                     blocks[next(starts)] = part
             if clips:
@@ -442,7 +457,8 @@ class QwenCudaVision:
                         pixels = torch.tensor(prepared.video_pixel_values[done:done + n * h * w],
                                               dtype=torch.bfloat16, device=self.device)
                         grids = torch.tensor([[n, h, w]], dtype=torch.int64, device=self.device)
-                        features = self.tower(pixels, grid_thw=grids, return_dict=True).pooler_output
+                        features = self.tower(pixels, grid_thw=grids, return_dict=True,
+                                              **self._longest([h * w])).pooler_output
                         for part in features.to(dtype=torch.bfloat16).split(h * w // merge**2):
                             start, end = next(spans_left)
                             if end - start != part.shape[0]:
