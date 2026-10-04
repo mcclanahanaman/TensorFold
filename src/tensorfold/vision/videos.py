@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import io
 import math
@@ -14,6 +15,7 @@ import numpy as np
 from .images import _data_bytes
 from .images_http import ImageInputError, fetch_image
 
+SCALE_THREADS = 0       # THOR-VISION-PREP (the CUDA frontend sets it on sm_110): sampled frames scaled on a pool
 VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-matroska": "mkv"}
 
 
@@ -101,6 +103,13 @@ def sample_indices(total: int, fps: float, limits: VideoLimits) -> np.ndarray:
     return np.linspace(0, total - 1, count).round().astype(int)
 
 
+@functools.lru_cache(maxsize=2)
+def _scale_pool(threads: int):
+    from concurrent.futures import ThreadPoolExecutor
+
+    return ThreadPoolExecutor(threads, thread_name_prefix="tensorfold-scale")
+
+
 def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], limits: VideoLimits,
                  deadline: float) -> VideoInput:
     """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic)."""
@@ -127,13 +136,19 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
             out_h, out_w = size(len(wanted), height, width)
             keep = set(int(i) for i in wanted)
             frames, indices = [], []
+            # THOR-VISION-PREP: each sampled frame's scale (swscale, the GIL released) on a pool while the next frames
+            # decode; the same call on the same frame, so the same pixels
+            pool = _scale_pool(SCALE_THREADS) if SCALE_THREADS > 0 else None
             for n, frame in enumerate(container.decode(stream)):
                 if n > wanted[-1] or time.monotonic() >= deadline:
                     break
                 if n in keep:
-                    frames.append(frame.to_ndarray(format="rgb24", width=out_w, height=out_h,
-                                                   interpolation="BICUBIC"))
+                    scale = functools.partial(frame.to_ndarray, format="rgb24", width=out_w, height=out_h,
+                                              interpolation="BICUBIC")
+                    frames.append(scale() if pool is None else pool.submit(scale))
                     indices.append(n)
+            if pool is not None:
+                frames = [job.result() for job in frames]
             if time.monotonic() >= deadline:
                 raise ImageInputError("video decoding exceeds the time limit")
     except ImageInputError:

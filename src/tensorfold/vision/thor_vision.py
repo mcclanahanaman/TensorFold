@@ -25,6 +25,8 @@ import os
 ENV = "TENSORFOLD_THOR_VISION"
 ENV_ROPE = "TENSORFOLD_THOR_VISION_ROPE"
 ENV_VARLEN = "TENSORFOLD_THOR_VISION_VARLEN"
+ENV_PREP = "TENSORFOLD_THOR_VISION_PREP"
+PREP_THREADS = 8                    # THOR-VISION-PREP's CPU threads for a video's patches (Thor: 14 cores)
 CAPABILITY = (11, 0)
 CHECK_SEGMENTS = (64, 200, 33)      # the load check: uneven lengths, tails off the flash kernel's 128 x 64 tiles
 
@@ -41,6 +43,33 @@ def available(device=None) -> bool:
         return _on(ENV) and torch.cuda.is_available() and torch.cuda.get_device_capability(device) == CAPABILITY
     except (ImportError, RuntimeError, ValueError, AssertionError):
         return False
+
+
+def prep_threads(device=None) -> int:
+    """THOR-VISION-PREP's threads on sm_110 (the video CPU path, the same bits: sampled frames scaled on a pool,
+    ``qwen_processing.fused_video_patches``, numpy's hugepage advice off); 0 keeps TensorFold's CPU path (any other
+    GPU, ``TENSORFOLD_THOR_VISION_PREP=0``, or ``TENSORFOLD_THOR_VISION=0``)."""
+    return max(1, min(PREP_THREADS, os.cpu_count() or 1)) if _on(ENV_PREP) and available(device) else 0
+
+
+def numpy_hugepage_advice_off():
+    """THOR-VISION-PREP: numpy advises MADV_HUGEPAGE on its arrays of 4 MiB and more, and with Thor's THP defrag
+    ``madvise`` a page fault in such an array compacts memory in the faulting thread whenever no free 2 MiB block is
+    left. The served model leaves about 2 GiB free beside a 30 GiB page cache, so a 60 s video's patch step spent
+    1.0-4.6 s of kernel time a request in 544-802 compaction stalls on the first server after a container start
+    [s7-dev-r1].
+    Without the advice, numpy's arrays still take free huge pages (THP ``always``) and a fault never compacts. Returns
+    the previous setting (None: this numpy has no switch)."""
+    import importlib
+
+    for name in ("numpy._core.multiarray", "numpy.core.multiarray"):
+        try:
+            setter = getattr(importlib.import_module(name), "_set_madvise_hugepage", None)
+        except ImportError:
+            continue
+        if setter is not None:
+            return setter(False)
+    return None
 
 
 @functools.lru_cache(maxsize=1)

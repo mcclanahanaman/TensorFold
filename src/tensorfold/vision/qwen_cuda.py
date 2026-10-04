@@ -350,6 +350,14 @@ class QwenCudaVision:
                                          ("one flash call a layer", self._thor_attn["varlen"])) if on]
                 print(f"[tensorfold] Thor (sm_110): vision attention with {' and '.join(parts)}, transformers' bits "
                       f"(TENSORFOLD_THOR_VISION=0 keeps transformers' path)", flush=True)
+        from . import thor_vision, videos
+
+        threads = thor_vision.prep_threads(device)       # THOR-VISION-PREP, CPU work: an offloaded tower too
+        if threads:
+            self.frontend.video_threads = videos.SCALE_THREADS = threads
+            thor_vision.numpy_hugepage_advice_off()
+            print(f"[tensorfold] Thor (sm_110): video frames scaled and patched on {threads} threads, numpy's "
+                  f"hugepage advice off, the same bits (TENSORFOLD_THOR_VISION_PREP=0 keeps the CPU path)", flush=True)
 
     def warm(self):
         """Load tower kernels at startup using one small, merge-aligned image grid."""

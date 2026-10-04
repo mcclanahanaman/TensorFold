@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import functools
 import json
 import re
 from pathlib import Path
@@ -145,8 +146,49 @@ def _processor_runtime():
     return AutoTokenizer, Qwen2VLImageProcessor
 
 
+@functools.lru_cache(maxsize=2)
+def _video_pool(threads: int):
+    from concurrent.futures import ThreadPoolExecutor
+
+    return ThreadPoolExecutor(threads, thread_name_prefix="tensorfold-video")
+
+
+def fused_video_patches(frames: np.ndarray, sizes, normalise, threads: int) -> np.ndarray:
+    """THOR-VISION-PREP: ``QwenImageProcessor._video_patches``'s patches, the same bits, without its five full-size
+    float32 temporaries (one a numpy operation, each a fresh mapping the kernel faults in; on Thor the step took
+    0.4-33 s for the same 60 s video from one server start to the next [gate-va-1b, gate-va-2b], the excess kernel
+    time in memory compaction [s7-dev-r1], see ``thor_vision.numpy_hugepage_advice_off``). One strided copy
+    writes each uint8 value as float32 (exact) straight to its patch position; then the processor's three float32
+    operations (times the rescale factor, minus the channel mean, over the channel std, each rounded as numpy rounds
+    it) run in place a channel at a time; slabs of whole frame groups go to ``threads`` threads (numpy releases the
+    GIL in both)."""
+    p, merge, temporal = sizes
+    scale, mean, std = normalise
+    count, height, width, channels = frames.shape
+    gt, gh, gw = count // temporal, height // p, width // p
+    source = frames.reshape(gt, temporal, gh // merge, merge, p, gw // merge, merge, p, channels)
+    source = source.transpose(0, 2, 5, 3, 6, 8, 1, 4, 7)       # the tower's order: [gt, h, w, m, m, C, T, p, p]
+    out = np.empty((gt * gh * gw, channels * temporal * p * p), dtype=np.float32)
+    view = out.reshape(source.shape)
+
+    def slab(begin: int, end: int) -> None:
+        part = view[begin:end]
+        np.copyto(part, source[begin:end], casting="unsafe")
+        for c in range(channels):
+            plane = part[:, :, :, :, :, c]
+            np.multiply(plane, scale, out=plane)
+            np.subtract(plane, mean[c], out=plane)
+            np.divide(plane, std[c], out=plane)
+
+    bounds = np.linspace(0, gt, max(1, min(threads, gt)) + 1).round().astype(int).tolist()
+    list(_video_pool(threads).map(slab, bounds[:-1], bounds[1:]))
+    return out
+
+
 class QwenImageProcessor:
     """A local CPU image processor and tokenizer with no backend imports or model calls."""
+
+    video_threads = 0       # THOR-VISION-PREP: > 0 = fused_video_patches on that many threads (set on sm_110)
 
     def __init__(self, config: dict, processor: Any, tokenizer: Any):
         self.config, self.processor, self.tokenizer = config, processor, tokenizer
@@ -297,8 +339,11 @@ class QwenImageProcessor:
         mean = np.asarray(getattr(options, "image_mean", [0.5] * channels), dtype=np.float32)
         std = np.asarray(getattr(options, "image_std", [0.5] * channels), dtype=np.float32)
         scale = np.float32(getattr(options, "rescale_factor", 1 / 255))
+        gt, gh, gw = frames.shape[0] // temporal, height // p, width // p
+        if self.video_threads:          # THOR-VISION-PREP (set by the CUDA frontend on sm_110): the same bits, fused
+            return fused_video_patches(frames, (p, merge, temporal), (scale, mean, std), self.video_threads), \
+                np.asarray([gt, gh, gw])
         x = ((frames.astype(np.float32) * scale - mean) / std).transpose(0, 3, 1, 2)       # [T, C, H, W]
-        gt, gh, gw = x.shape[0] // temporal, height // p, width // p
         x = x.reshape(gt, temporal, channels, gh // merge, merge, p, gw // merge, merge, p)
         x = x.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
         return np.ascontiguousarray(x.reshape(gt * gh * gw, channels * temporal * p * p)), np.asarray([gt, gh, gw])

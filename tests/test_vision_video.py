@@ -101,3 +101,59 @@ def test_prepare_mixes_images_and_videos_in_prompt_order():
     first_video = prepared.video_spans[0][0]
     assert prepared.image_spans[0][1] <= first_video
     assert prepared.visual_tokens == 4 + 2                    # a 4 x 4 image merged 2 x 2, two frame groups
+
+
+class NormalisingProcessor(ImageProcessor):
+    image_mean, image_std = [0.48145466, 0.4578275, 0.40821073], [0.26862954, 0.26130258, 0.27577711]
+    rescale_factor = 1 / 255
+
+
+@pytest.mark.parametrize("frames", [4, 7])
+@pytest.mark.parametrize("threads", [1, 3, 8])
+def test_fused_video_patches_keep_the_processors_bits(frames, threads):
+    """THOR-VISION-PREP: the fused, threaded patches equal the processor's bit for bit (an odd last frame repeats)."""
+    rng = np.random.default_rng(10 * frames + threads)
+    clip = VideoInput(rng.integers(0, 256, (frames, 64, 96, 3), dtype=np.uint8), tuple(range(frames)), 2.0)
+    front = QwenImageProcessor(CONFIG, NormalisingProcessor(), VideoTokenizer())
+    want, grid = front._video_patches(clip)
+    front.video_threads = threads
+    got, fused_grid = front._video_patches(clip)
+    assert got.dtype == want.dtype == np.float32 and got.shape == want.shape == (grid.prod(), 1536)
+    assert got.tobytes() == want.tobytes() and fused_grid.tolist() == grid.tolist()
+
+
+def test_fused_video_patches_run_on_thor_only_and_switch_off(monkeypatch):
+    from tensorfold.vision import thor_vision
+
+    monkeypatch.setattr(thor_vision, "available", lambda device=None: True)
+    assert thor_vision.prep_threads() >= 1
+    monkeypatch.setenv("TENSORFOLD_THOR_VISION_PREP", "0")
+    assert thor_vision.prep_threads() == 0
+    monkeypatch.delenv("TENSORFOLD_THOR_VISION_PREP")
+    monkeypatch.setattr(thor_vision, "available", lambda device=None: False)
+    assert thor_vision.prep_threads() == 0
+
+
+def test_frames_scaled_on_a_pool_keep_the_serial_pixels(monkeypatch):
+    """THOR-VISION-PREP: the sampled frames' scaling on a pool gives the serial loop's frames, in order."""
+    av = pytest.importorskip("av")
+    import io
+
+    from tensorfold.vision import videos
+
+    raw = io.BytesIO()
+    with av.open(raw, mode="w", format="mp4") as out:
+        stream = out.add_stream("mpeg4", rate=8)
+        stream.width, stream.height, stream.pix_fmt = 96, 64, "yuv420p"
+        rng = np.random.default_rng(3)
+        for i in range(24):
+            frame = av.VideoFrame.from_ndarray(rng.integers(0, 256, (64, 96, 3), dtype=np.uint8), format="rgb24")
+            out.mux(stream.encode(frame))
+        out.mux(stream.encode())
+    limits = VideoLimits(fps=4.0)
+    clips = []
+    for threads in (0, 3):
+        monkeypatch.setattr(videos, "SCALE_THREADS", threads)
+        clips.append(videos.decode_video(raw.getvalue(), lambda n, h, w: (32, 64), limits, float("inf")))
+    assert clips[0].indices == clips[1].indices and len(clips[0].indices) == 12
+    assert clips[0].frames.shape == (12, 32, 64, 3) and clips[0].content_hash == clips[1].content_hash
