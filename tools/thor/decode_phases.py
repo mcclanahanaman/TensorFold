@@ -134,12 +134,14 @@ class Timer:
         self.rows: list = []          # (phase, host seconds, start event, end event)
         self.hooks: dict = {}         # phase -> callable(phase), run after the call (outside its timing)
         self.hooked: set = set()      # phases already hooked this round (first call only)
+        self.phase = None             # the outermost timed phase running now (--count-experts tags its picks)
 
     def wrap(self, phase: str, fn):
         def timed(*args, **kwargs):
             if self.depth:                                # nested (a forward inside a timed graph run): untimed
                 return fn(*args, **kwargs)
             self.depth += 1
+            self.phase = phase
             e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
             torch.cuda.nvtx.range_push(phase)
             e0.record()
@@ -151,6 +153,7 @@ class Timer:
                 e1.record()
                 torch.cuda.nvtx.range_pop()
                 self.depth -= 1
+                self.phase = None
                 self.rows.append((phase, host, e0, e1))
                 hook = self.hooks.get(phase)
                 if hook is not None and phase not in self.hooked:
@@ -249,10 +252,14 @@ def main(argv=None) -> int:
     ap.add_argument("--new", type=int, default=400)
     ap.add_argument("--parallel", type=int, default=4)
     ap.add_argument("--kv-dtype", default="int8")
+    ap.add_argument("--context", type=int, default=0, help="as serve --context (0: the engine's default)")
     ap.add_argument("--nsys", default="")
     ap.add_argument("--sparkdash", type=Path, default=HERE / "_ext" / "decode0" / "sparkdash_port.py")
     ap.add_argument("--cpu", action="store_true", help="sample the host CPU at round start and after read-backs")
     ap.add_argument("--sched", choices=sorted(SCHED), default=None)
+    ap.add_argument("--count-experts", action="store_true",
+                    help="record every MoE call's routed expert ids (eager rounds only: run with graphs off) and "
+                         "report the distinct experts per call by phase (DEC-2)")
     a = ap.parse_args(argv)
     sched = set_sched(a.sched) if a.sched else None
 
@@ -267,7 +274,7 @@ def main(argv=None) -> int:
     from tensorfold.cuda.streams import Stream
 
     t0 = time.perf_counter()
-    engine = pp.build_engine(a.model, a.parallel, a.kv_dtype)
+    engine = pp.build_engine(a.model, a.parallel, a.kv_dtype, a.context or None)
     print(f"[phases] engine up in {time.perf_counter() - t0:.0f}s", flush=True)
     host = {"sched": sched, "ctx": ctx_state(), "spin": os.environ.get("TENSORFOLD_THOR_DECODE_SPIN", ""),
             **cpu_info()}
@@ -292,6 +299,16 @@ def main(argv=None) -> int:
     if cpu is not None:
         timer.hooks = {"sample": cpu.sample, "picks": cpu.sample}
     multi = engine.multi
+    picks: list = []
+    if a.count_experts:
+        from tensorfold.families.qwen4_exp.cuda import nvfp4_moe
+        moe0 = nvfp4_moe.moe
+
+        def moe_counted(x, xs, router_rows, ex, buf, cfg, **kw):
+            got = moe0(x, xs, router_rows, ex, buf, cfg, **kw)
+            picks.append((timer.phase or "other", buf.pick[:x.shape[0], :int(cfg.num_experts_per_tok)].clone()))
+            return got
+        nvfp4_moe.moe = moe_counted
     report = {"label": a.label, "model": str(a.model), "new": a.new, "host": host, "groups": []}
     profiling = False
     for users in [int(u) for u in a.users.split(",") if u]:
@@ -326,6 +343,13 @@ def main(argv=None) -> int:
                     wall = time.perf_counter() - t
                     torch.cuda.nvtx.range_pop()
                     phases = timer.take()
+                    experts = {}
+                    for ph, t in picks:          # per phase: [calls, rows, distinct experts] summed over the calls
+                        got = experts.setdefault(ph, [0, 0, 0])
+                        got[0] += 1
+                        got[1] += t.shape[0]
+                        got[2] += int(torch.unique(t).numel())
+                    picks.clear()
                     taken = cpu.take() if cpu is not None else []
                     if not decoding:
                         fill_s += wall
@@ -334,7 +358,7 @@ def main(argv=None) -> int:
                     span = e0.elapsed_time(e1)
                     rounds.append({"wall_ms": wall * 1e3, "span_ms": span,
                                    "gap_ms": span - sum(v[1] for v in phases.values()), "phases": phases,
-                                   "rows": rows, "cpu": taken,
+                                   "rows": rows, "cpu": taken, "experts": experts,
                                    "graph": {k: after[k] - before.get(k, 0) for k in after}})
                     r += 1
                     if profiling and win and r >= win[1]:
@@ -354,6 +378,7 @@ def main(argv=None) -> int:
                        "agg_tok_s": tokens / dec_s if dec_s else 0.0,
                        "tokens_per_round": tokens / len(rounds) / users if rounds else 0.0,
                        "drafted": sum(s.drafted for s in streams), "accepted": sum(s.accepted for s in streams),
+                       "drafted_each": [s.drafted for s in streams], "accepted_each": [s.accepted for s in streams],
                        "summary": summarize(rounds), "graph_total": graph_counts(multi), "rounds": rounds,
                        "profiled": bool(win)}
                 report["groups"].append(row)

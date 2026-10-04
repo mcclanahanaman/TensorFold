@@ -690,15 +690,15 @@ def dense_bench(captured: dict, out: Path) -> dict:
 
 # ------------------------------------------------------------------------------------------------ main
 
-def build_engine(model_dir: Path, parallel: int, kv_dtype: str):
-    """The engine as ``tensorfold serve MODEL --backend cuda --kv-dtype KV --parallel N`` builds it."""
+def build_engine(model_dir: Path, parallel: int, kv_dtype: str, context: int | None = None):
+    """The engine as ``tensorfold serve MODEL --backend cuda --kv-dtype KV --parallel N [--context C]`` builds it."""
 
     from tensorfold.cuda import prompt_precision
     from tensorfold.families import qwen4_exp
 
     prompt_precision.set_fp8(prompt_precision.FP8_BY_DEFAULT)
     options = {"drafter": "", "tp": 1, "rank": 0, "master": "", "master_port": 29551, "no_drafts": False,
-               "kv_dtype": kv_dtype, "context": None, "context_explicit": False}
+               "kv_dtype": kv_dtype, "context": context, "context_explicit": context is not None}
     if parallel > 1:
         options["parallel"] = parallel
     return qwen4_exp.cuda_engine(model_dir, **options)
