@@ -29,6 +29,12 @@ with a prompt pass stays eager):
   windows between, which ran eagerly under ``2,W``, the earlier default and now the kill switch; or ``3,4,5``) picks
   the verification windows recorded: on Thor a graph executable holds driver memory of its own, about 20 MiB a
   verification forward;
+- past the startup set, a one-stream key (a longer context's bucket; a sparse stream's, which holds its slot's pointers;
+  a first round's) records on its second forward on demand (PAR-1 s4; ``TENSORFOLD_THOR_DECODE_GRAPH_DEMAND=0`` keeps it
+  eager, 8f73033's path and the kill switch) when the memory gate's room, past the streams' caches and its reserve, can
+  pay it: the room is charged the free memory its capture and upload took. The on-demand graphs take at most
+  ``TENSORFOLD_THOR_DECODE_GRAPH_DEMAND_MIB`` (default 1,024 MiB); past it the least recently replayed one, idle for
+  ``RECENT`` forwards, goes, and the room gets back the memory its release returned;
 - a one-stream verification forward always writes DeltaNet scratch half 0 (``gdn_multi.normalize`` copies last
   round's pending rows to half 1 first, exact copies), so one graph a window size serves both parities;
 - an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
@@ -66,6 +72,8 @@ STARTUP_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_STARTUP"
 LAZY_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_LAZY"
 ROWS_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_ROWS"
 CAPTURE_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_CAPTURE"   # diagnostics: 0 = prerecord's eager warm-ups only, no graphs
+DEMAND_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_DEMAND"     # after prerecord, other one-stream keys on demand (default on)
+DEMAND_MIB_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_DEMAND_MIB"
 MEM_ENV = "TENSORFOLD_THOR_MEM_PROBE"   # diagnostics: a trigger file path; [thor-mem] breakdowns at startup and on it
 CAPABILITY = (11, 0)
 SCHED_MASK, SCHED_SPIN = 0x07, 0x01  # CU_CTX_SCHED_MASK, CU_CTX_SCHED_SPIN
@@ -74,6 +82,9 @@ MIN_SEEN = 2                # a key's forwards before its graph is recorded (the
 STREAMS = 1                 # the most streams a graphed forward holds (more stay eager: their keys rarely repeat)
 SEEN_MAX = 1 << 14          # keys counted before the counts start over
 STATS_EVERY = 512           # forwards between stats events
+DEMAND_MIB = 1024           # the on-demand graphs' memory at most (MiB)
+EST_MIB = 24                # an on-demand graph's memory before one is measured (a verification forward's ~20 MiB)
+RECENT = 2048               # forwards an on-demand graph sits unreplayed before it may go
 MISSED_MAX = 64             # eager one-stream keys counted by name in stats (the rest as "other")
 MIB = float(1 << 20)
 
@@ -216,6 +227,16 @@ class DecodeGraphs:
         self.hist: dict[str, list[int]] = {}        # one-stream forwards by kind and rows: [forwards, replays]
         self.missed: dict[str, int] = {}            # diagnostics: one-stream eager forwards by key (pointers left out)
         self.fixed = False                          # prerecord ran: unrecorded keys stay eager unless ``lazy``
+        self.demand = _flag(DEMAND_ENV, "1")        # ... or the room can pay them (on demand, after prerecord)
+        self.budget = float(os.environ.get(DEMAND_MIB_ENV, "") or DEMAND_MIB) * MIB
+        self.gate = None                            # the decoder's memory gate (prerecord attaches it)
+        self.room_at = None                         # its room then (diagnostics)
+        self.own = 0                                # the startup graphs' bytes, which the room pays (THOR-DEC-1)
+        self.paid: OrderedDict[tuple, list] = OrderedDict()     # on demand: key -> [bytes charged, last call]
+        self.charged = self.refunded = 0            # bytes on-demand graphs took off the room, and gave back
+        self.est = EST_MIB * MIB                    # an on-demand graph's bytes before it is measured (the most seen)
+        self.evicted = 0
+        self.ctx: dict[str, list[int]] = {}         # one-stream forwards by kind:bucket:sparse: [forwards, replays]
         self.graphs: OrderedDict[tuple, _Entry] = OrderedDict()
         self.seen: dict[tuple, int] = {}
         self.forwards: dict[str, int] = {}
@@ -226,7 +247,8 @@ class DecodeGraphs:
         self.failed: set[str] = set()
         self.calls = 0
         self._emit({"event": "on", "cap": self.cap, "min_seen": self.min_seen, "streams": self.streams,
-                    "startup": self.startup, "lazy": self.lazy, "rows": self.rows, "ple": self.ple,
+                    "startup": self.startup, "lazy": self.lazy, "rows": self.rows, "demand": self.demand,
+                    "demand_mib": round(self.budget / MIB, 1), "ple": self.ple,
                     "free_mib": _free_mib()})
 
     @staticmethod
@@ -239,6 +261,9 @@ class DecodeGraphs:
                 "captures": dict(self.captures), "evictions": 0, "capture_s": round(self.capture_s, 4),
                 "graph_mib": round(self.graph_mib, 1),
                 "graphs": len(self.graphs), "hist": dict(self.hist), "missed": dict(self.missed),
+                "ctx": {k: list(v) for k, v in self.ctx.items()},
+                "demand": {"graphs": len(self.paid), "mib": round((self.charged - self.refunded) / MIB, 1),
+                           "evicted": self.evicted},
                 "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1),
                 "free_mib": _free_mib()}
 
@@ -287,24 +312,32 @@ class DecodeGraphs:
         key = self.key(kind, segs, b, step, tables, extra)
         h = self.hist.setdefault(f"{kind}{segs[-1][2]}" if len(segs) == 1 else f"{kind}x{len(segs)}", [0, 0])
         h[0] += 1
+        c = self.ctx.setdefault(f"{kind}:{step.context}:{'s' if any(p[1] for p in key[1]) else 'd'}", [0, 0])
+        c[0] += 1
         entry = self.graphs.get(key)
         if entry is not None:
             self._load(entry, kind, segs, step, tables)
             entry.graph.replay()
             self.replays[kind] = self.replays.get(kind, 0) + 1
             h[1] += 1
+            c[1] += 1
+            if key in self.paid:                    # on demand: the least recently replayed goes first
+                self.paid[key][1] = self.calls
+                self.paid.move_to_end(key)
             return entry.out
-        if self.fixed and not self.lazy:            # the startup set holds the replayed keys; the rest stay eager
+        paid = self.fixed and not self.lazy         # past the startup set: on demand, the room pays each graph
+        if paid and (not self.demand or self.gate is None):     # 8f73033: the rest stay eager
             self._miss(key)
             return fn()
         seen = self.seen.get(key, 0) + 1
-        if kind in self.failed or seen < self.min_seen or len(self.graphs) >= self.cap:
+        if kind in self.failed or seen < self.min_seen or len(self.graphs) >= self.cap or paid and not self._afford():
             if len(self.seen) >= SEEN_MAX:
                 self.seen.clear()
             self.seen[key] = seen
             self._miss(key)
             return fn()
         self.seen.pop(key, None)
+        free0 = _free_mib()
         entry = self._record(kind, b, step, tables, fn, segs)
         if entry is None:
             self._miss(key)
@@ -312,7 +345,53 @@ class DecodeGraphs:
         self.graphs[key] = entry
         entry.graph.replay()                        # this round's tables are the ones it was recorded with
         self.replays[kind] = self.replays.get(kind, 0) + 1
+        c[1] += 1
+        if paid:
+            self._charge(key, kind, free0)
         return entry.out
+
+    def _afford(self) -> bool:
+        """On demand: whether one more graph fits the budget (the least recently replayed on-demand graph, idle for
+        ``RECENT`` forwards, goes first) and the memory gate (its room past the streams' caches and the reserve, and the
+        host's live memory)."""
+
+        while self.paid and self.charged - self.refunded + self.est > self.budget and self._evict():
+            pass
+        return self.charged - self.refunded + self.est <= self.budget and self.gate.fits(int(self.est))
+
+    def _charge(self, key: tuple, kind: str, free0: float) -> None:
+        """An on-demand graph's own memory (the free memory its capture and upload took) off the gate's room."""
+
+        torch.cuda.synchronize()                    # the upload landed
+        cost = int(max(0.0, free0 - _free_mib()) * MIB)
+        self.gate.room -= cost
+        self.charged += cost
+        self.paid[key] = [cost, self.calls]
+        self.est = max(self.est, float(cost))
+        self._emit({"event": "demand", "kind": kind, "context": key[3], "graphs": len(self.paid),
+                    "charged_mib": round(cost / MIB, 1), "demand_mib": round((self.charged - self.refunded) / MIB, 1),
+                    "room_mib": round(self.gate.room / MIB, 1), "held_mib": round(self.gate.held / MIB, 1),
+                    "free_mib": _free_mib()})
+
+    def _evict(self) -> bool:
+        """The least recently replayed on-demand graph goes, unless it replayed within ``RECENT`` forwards; the room
+        gets back the memory its release returned (pool blocks stay for later captures, still charged)."""
+
+        key, (cost, last) = next(iter(self.paid.items()))
+        if self.calls - last < RECENT:
+            return False
+        del self.paid[key]
+        entry = self.graphs.pop(key)
+        torch.cuda.synchronize()
+        free0 = _free_mib()
+        entry.graph.reset()
+        del entry
+        torch.cuda.synchronize()
+        back = min(cost, int(max(0.0, _free_mib() - free0) * MIB))
+        self.gate.room += back
+        self.refunded += back
+        self.evicted += 1
+        return True
 
     def _load(self, entry: _Entry, kind: str, segs: Sequence, step, tables) -> None:
         """This round's tables and n-gram conv tails into the graph's own storage, before its replay."""
@@ -394,14 +473,17 @@ class DecodeGraphs:
         context bucket. Each forward runs eagerly once on a free
         slot (it compiles its launches), is recorded, then replays once (the graph's upload); the slot and the scratch
         parity are reset after. A first round (nothing folds in), a one-row verification, a sparse or image stream
-        and a longer context stay eager unless ``lazy``. Returns the graphs' own memory in bytes: the free memory their
-        captures and uploads took (the eager forwards' is the decode path's first-use memory), 0 if nothing ran."""
+        and a longer context are left to ``run`` (on demand, or ``lazy``). Returns the graphs' own memory in bytes
+        (``own``): the free memory their captures and uploads took (the eager forwards' is the decode path's
+        first-use memory), 0 if nothing ran."""
 
         from .attn_multi import Step
         from .forward import compute, stage
         from .gdn_multi import Tables
         from .mtp import mtp_compute, mtp_stage
 
+        self.gate = getattr(dec, "memory_gate", None)     # on demand: later graphs are charged to its room
+        self.room_at = None if self.gate is None else self.gate.room
         if not self.startup or self.fixed or not dec.free:
             return 0
         w, st = dec.w, dec.free[-1]
@@ -435,11 +517,14 @@ class DecodeGraphs:
         held = _free_mib()
         torch.cuda.empty_cache()                    # the warm-ups' cached blocks back to the driver (graphs keep theirs)
         own = max(0.0, sum(v[1] + v[2] for v in mem.values()))    # captures and uploads: the room is charged this
+        if made:
+            self.est = max(self.est, own * MIB / made)
         self._emit({"event": "startup", "graphs": made, "s": round(time.perf_counter() - t0, 3),
                     "graph_mib": round(free0 - _free_mib(), 1), "released_mib": round(_free_mib() - held, 1),
                     "phase_mib": {k: [round(x, 1) for x in v] for k, v in mem.items()}, "charged_mib": round(own, 1),
                     "pool_mib": round((torch.cuda.memory_reserved() - res0) / MIB, 1), "free_mib": _free_mib()})
-        return int(own * MIB)
+        self.own = int(own * MIB)
+        return self.own
 
     def _prerecord(self, kind: str, segs: Sequence, b, step, tables, fn: Callable[[], torch.Tensor], mem: dict,
                    extra: tuple = ()) -> int:

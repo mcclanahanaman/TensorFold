@@ -118,6 +118,7 @@ def test_startup_graphs_serve_any_slot(monkeypatch):
     for requests on other slots with the eager rounds' bits; keys outside the startup set stay eager."""
 
     monkeypatch.setenv(thor_graphs.ROWS_ENV, f"2-{DEPTH + 1}")     # every verification window (the default)
+    monkeypatch.setenv(thor_graphs.DEMAND_ENV, "0")                 # 8f73033: the rest stay eager (the kill switch)
     w = _model()
     prompts, counts = PROMPTS[:3], [40, 33, 48]
     off_out, off_rounds, _, _ = _sequential(w, prompts, counts, graphs=False, capacity=1024)
@@ -187,3 +188,37 @@ def test_graphs_default_on_for_one_stream(monkeypatch):
         assert thor_graphs._off()
     monkeypatch.setenv(thor_graphs.ENV, "1")
     assert not thor_graphs._off()
+
+
+def test_demand_graphs_keep_the_bits_and_charge_the_room(monkeypatch):
+    """Past the startup set, on demand (the default): a sparse stream's keys (its slot's pooled keys in the key) and
+    first rounds record on their second forward, each charged to the memory gate's room, with the eager rounds' bits;
+    with the least recently replayed graph evicted before each new one (``RECENT`` 0) the bits hold and the room gets
+    back what each release returned. ``TENSORFOLD_THOR_DECODE_GRAPH_DEMAND=0`` is 8f73033's path
+    (``test_startup_graphs_serve_any_slot``)."""
+
+    w = _model(7)
+    g = torch.Generator().manual_seed(9)
+    long = torch.randint(1, V, (2400,), generator=g).tolist()
+    prompts, counts = [long, PROMPTS[0], long[:2200] + PROMPTS[1]], [36, 20, 28]
+    off_out, off_rounds, _, _ = _sequential(w, prompts, counts, graphs=False, capacity=4096)
+    startup = 2 * DEPTH + 1                     # verification windows 2..DEPTH+1, MTP steps 1..DEPTH+1
+    afford = thor_graphs.DecodeGraphs._afford
+    for evict in (False, True):
+        if evict:
+            def forced(self):
+                if self.paid:
+                    self._evict()
+                return afford(self)
+            monkeypatch.setattr(thor_graphs, "RECENT", 0)
+            monkeypatch.setattr(thor_graphs.DecodeGraphs, "_afford", forced)
+        on_out, on_rounds, gr, _ = _sequential(w, prompts, counts, graphs=True, capacity=4096)
+        assert on_out == off_out
+        _same_rounds(on_rounds, off_rounds)
+        assert not gr.failed and gr.demand and gr.gate is not None
+        assert sum(gr.captures.values()) > startup + 1, gr.captures
+        assert any(k.endswith(":s") and v[1] > 0 for k, v in gr.ctx.items()), gr.ctx    # sparse rounds replayed
+        assert gr.gate.room == gr.room_at - gr.own - gr.charged + gr.refunded    # startup, then on demand
+        assert sum(gr.missed.values()) == sum(gr.forwards.values()) - sum(gr.replays.values())
+        if evict:
+            assert gr.evicted > 0 and len(gr.paid) <= 1, (gr.evicted, len(gr.paid))
