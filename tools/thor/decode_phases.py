@@ -2,7 +2,7 @@
 
     python tools/thor/decode_phases.py OUT.json --model MODEL [--label L] [--users 1,4] [--types prose,code]
         [--groups 2] [--new 400] [--nsys u1:20:40,u4:20:40] [--sparkdash tools/thor/_ext/decode0/sparkdash_port.py]
-        [--cpu] [--sched auto|spin|yield|blocking]
+        [--cpu] [--sched auto|spin|yield|blocking] [--host-split]
 
 The engine is built as ``tensorfold serve MODEL --backend cuda --kv-dtype int8 --parallel 4`` builds it
 (``prefill_profile.build_engine``; the Thor switches come from the environment). The requests are sparkDash's decode
@@ -27,6 +27,8 @@ every phase is an NVTX range, so ``nsys --capture-range=cudaProfilerApi`` attrib
 thread runs on, its ``scaling_cur_freq`` and a fixed pure-Python loop's time (the host's effective speed); the
 report's ``cpu`` holds the governor, frequency limits and idle states. ``--sched`` sets the CUDA primary context's
 scheduling flag before torch starts CUDA (the driver's wait in a synchronize: spin, yield or blocking sleep).
+``--host-split`` replaces the phase timer with ``host_split.py``: each round's host time by call, split by whether a
+forward runs on the GPU (DEC-2: what the host does while no forward runs).
 """
 
 from __future__ import annotations
@@ -260,6 +262,8 @@ def main(argv=None) -> int:
     ap.add_argument("--count-experts", action="store_true",
                     help="record every MoE call's routed expert ids (eager rounds only: run with graphs off) and "
                          "report the distinct experts per call by phase (DEC-2)")
+    ap.add_argument("--host-split", action="store_true",
+                    help="host time by call a round, split by whether a forward runs (host_split.py; no phase timer)")
     a = ap.parse_args(argv)
     sched = set_sched(a.sched) if a.sched else None
 
@@ -294,7 +298,13 @@ def main(argv=None) -> int:
         u, lo, hi = w.split(":")
         windows[int(u.lstrip("u"))] = (int(lo), int(hi))
     timer = Timer()
-    install(timer)
+    split = None
+    if a.host_split:
+        import host_split
+        split = host_split.Split()
+        host_split.install(split)
+    else:
+        install(timer)
     cpu = Cpu() if a.cpu else None
     if cpu is not None:
         timer.hooks = {"sample": cpu.sample, "picks": cpu.sample}
@@ -334,6 +344,8 @@ def main(argv=None) -> int:
                     torch.cuda.nvtx.range_push(f"round u{users}" if decoding else f"fill u{users}")
                     if cpu is not None and decoding:
                         cpu.sample("start")
+                    if split is not None:
+                        split.begin()
                     e0.record()
                     t = time.perf_counter()
                     done = multi.round()
@@ -341,6 +353,7 @@ def main(argv=None) -> int:
                     e1.record()
                     torch.cuda.synchronize()
                     wall = time.perf_counter() - t
+                    hs = split.end() if split is not None else None
                     torch.cuda.nvtx.range_pop()
                     phases = timer.take()
                     experts = {}
@@ -359,7 +372,8 @@ def main(argv=None) -> int:
                     rounds.append({"wall_ms": wall * 1e3, "span_ms": span,
                                    "gap_ms": span - sum(v[1] for v in phases.values()), "phases": phases,
                                    "rows": rows, "cpu": taken, "experts": experts,
-                                   "graph": {k: after[k] - before.get(k, 0) for k in after}})
+                                   "graph": {k: after[k] - before.get(k, 0) for k in after},
+                                   **({"host": hs} if hs is not None else {})})
                     r += 1
                     if profiling and win and r >= win[1]:
                         torch.cuda.synchronize()
@@ -380,6 +394,7 @@ def main(argv=None) -> int:
                        "drafted": sum(s.drafted for s in streams), "accepted": sum(s.accepted for s in streams),
                        "drafted_each": [s.drafted for s in streams], "accepted_each": [s.accepted for s in streams],
                        "summary": summarize(rounds), "graph_total": graph_counts(multi), "rounds": rounds,
+                       **({"host_split": host_split.summarize([x["host"] for x in rounds])} if split else {}),
                        "profiled": bool(win)}
                 report["groups"].append(row)
                 sm = row["summary"]
@@ -389,6 +404,11 @@ def main(argv=None) -> int:
                       f"{sm['verify']['host_ms']:.2f}, mtp gpu {sm['mtp']['gpu_ms']:.2f} x{sm['mtp_steps']:.2f}, "
                       f"gap {sm['gap_ms']:.2f}, captures {sm['captures']} ({sm['capture_s']:.2f} s), "
                       f"replays {sm['replays']}", flush=True)
+                if split is not None:
+                    hs = row["host_split"]
+                    print(f"[host] {a.label} u{users} {kind} g{g}: wall {hs['wall_ms']:.2f} forward {hs['forward_ms']:.2f} "
+                          f"no-forward {hs['idle_ms']:.2f} ms | " + " ".join(f"{n} {i:.2f}" for n, i, _, _ in hs["top"][:10]),
+                          flush=True)
                 for name, c in sm.get("cpu", {}).items():
                     print(f"[phases]   cpu@{name}: {c['khz'] / 1e3:.0f} MHz (min {c['khz_min'] / 1e3:.0f}), probe "
                           f"{c['probe_us']:.1f} us (p50 {c['probe_p50_us']:.1f}), cpus {c['cpus']}", flush=True)
