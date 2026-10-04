@@ -317,7 +317,8 @@ class QwenCudaVision:
                 names = {vision_key(name): name for name in source.keys()}
                 for key in selected:
                     value = source.get_tensor(names[key])
-                    if key.rpartition(".")[0] in schemes:      # a quantized linear's tensors: decoded below
+                    owner, _, part = key.rpartition(".")
+                    if owner in schemes and part != "bias":    # a quantized linear's weight and scales: decoded below
                         stored[key] = value
                         continue
                     if key == "patch_embed.proj.weight" and value.shape[-1] == self.config["in_channels"]:

@@ -351,6 +351,39 @@ def test_quantized_weights_decode_exactly_as_the_shared_reference_decoder(tmp_pa
         assert alpha == (float(parts["weight_scale_2"]) if kind == "nvfp4" else 1.0)
 
 
+def test_a_quantized_tower_holds_every_stored_tensor_exactly(tmp_path, monkeypatch):
+    """Built end to end from a quantized checkpoint, the tower holds each quantized linear's decoded weight and scale,
+    and every other stored tensor (the quantized linears' bf16 biases included) exactly as stored."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("transformers.models.qwen3_5.modeling_qwen3_5")
+    from safetensors import safe_open
+    from tensorfold.vision import qwen_cuda, qwen_processing
+
+    _, _, linears = _quantized_checkpoint(tmp_path)
+    config = json.loads((tmp_path / "config.json").read_text())
+    (tmp_path / "config.json").write_text(json.dumps({**config, "image_token_id": 9}))
+    monkeypatch.setattr(qwen_processing.QwenImageProcessor, "from_directory", classmethod(lambda cls, path: None))
+    tower = qwen_cuda.QwenCudaVision(tmp_path, "cpu").tower
+    state = tower.state_dict()
+    with safe_open(str(tmp_path / "model.safetensors"), framework="pt", device="cpu") as source:
+        stored = {name.removeprefix("model.visual."): source.get_tensor(name) for name in source.keys()}
+    for name, (_, kind) in linears.items():
+        parts = {key.rpartition(".")[2]: value for key, value in stored.items()
+                 if key.rpartition(".")[0] == name and key.rpartition(".")[2] != "bias"}
+        weight, alpha = qwen_cuda.dequantized(kind, parts, "cpu")
+        assert torch.equal(state.pop(f"{name}.weight"), weight), name
+        assert getattr(tower.get_submodule(name), "alpha", 1.0) == alpha, name
+    for key, value in stored.items():
+        owner, _, part = key.rpartition(".")
+        if owner in linears and part != "bias":
+            continue                                # weight and scales: the decoded weight above
+        if key == "patch_embed.proj.weight":
+            value = value.permute(0, 4, 1, 2, 3)    # stored channels-last
+        assert key in state, f"{key} was not loaded"
+        assert torch.equal(state.pop(key), value.to(torch.bfloat16)), key
+    assert not state, sorted(state)
+
+
 @pytest.mark.parametrize("kind", ["mxfp8", "nvfp4"])
 def test_nan_scales_refuse_at_load(kind):
     torch = pytest.importorskip("torch")
