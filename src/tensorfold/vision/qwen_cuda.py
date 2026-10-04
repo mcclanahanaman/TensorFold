@@ -23,7 +23,9 @@ OFFLOAD_WORKSPACE_BYTES = int(2.25 * 1024**3)
 FLOATS = ("BF16", "F16", "F32")
 # a quantized tower linear's tensors beside its weight (ModelOpt names); they are folded in at load, none stays resident
 SCALES = ("weight_scale", "weight_scale_2", "input_scale")
-ALGOS = {"mxfp8": "MXFP8", "nvfp4": "NVFP4", "fp8": "FP8"}      # quantized_layers' quant_algo for each scheme
+# quantized_layers' quant_algo names for each stored scheme; ModelOpt lists weight-only NVFP4 (no input_scale) as
+# W4A16_NVFP4, as Flash Next 7c4f1bc1 does for its tower's mlp.linear_fc2: the same stored weights
+ALGOS = {"mxfp8": ("MXFP8",), "nvfp4": ("NVFP4", "W4A16_NVFP4"), "fp8": ("FP8",)}
 E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)   # FP4 values by code
 
 
@@ -135,7 +137,7 @@ def _schemes(tensors: dict, shapes: dict, listed: dict) -> dict[str, str]:
             expect, size = {**required, **optional}[part]
             if dtype != expect or (shape not in ([], [1]) if size is None else shape != size):
                 raise ValueError(f"vision tensor shapes differ from the checkpoint configuration: {name}.{part}")
-        if algo is not None and str(algo).upper() != ALGOS[kind]:
+        if algo is not None and str(algo).upper() not in ALGOS[kind]:
             raise ValueError(f"vision linear {name} stores {kind} weights but the config lists {algo}")
         found[name] = kind
     return found

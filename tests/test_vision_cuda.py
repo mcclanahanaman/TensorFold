@@ -297,6 +297,25 @@ def test_quantized_tower_headers_count_its_bf16_weights(tmp_path):
     assert checkpoint_vision(tmp_path) == (config, resident)
 
 
+@pytest.mark.parametrize("algo", ["NVFP4", "W4A16_NVFP4", "w4a16_nvfp4"])
+def test_weight_only_nvfp4_listings_load_as_nvfp4(tmp_path, algo):
+    """7c4f1bc1 lists its NVFP4 fc2 linears as W4A16_NVFP4 (weight-only, no input_scale; s4-gate refused it): the same
+    stored weights as an NVFP4 listing, so both are accepted; a listing names the scheme, not the activations."""
+    from tensorfold.vision.qwen_cuda import vision_layout
+
+    fc2 = "blocks.0.mlp.linear_fc2"
+    _quantized_checkpoint(tmp_path, listed={f"model.visual.{fc2}": {"quant_algo": algo, "group_size": 16}})
+    assert vision_layout(tmp_path)[2][fc2] == "nvfp4"
+
+
+def test_a_weight_only_nvfp4_listing_on_mxfp8_weights_refuses(tmp_path):
+    from tensorfold.vision.qwen_cuda import vision_layout
+
+    _quantized_checkpoint(tmp_path, listed={"model.visual.blocks.0.attn.qkv": {"quant_algo": "W4A16_NVFP4", "group_size": 16}})
+    with pytest.raises(ValueError, match="config lists W4A16_NVFP4"):
+        vision_layout(tmp_path)
+
+
 @pytest.mark.parametrize("damage", ["no_scale_2", "scale_shape", "listed", "stray_scale", "nan_dtype"])
 def test_incomplete_or_mislabelled_quantized_towers_refuse_before_loading(tmp_path, damage):
     fc2 = "blocks.0.mlp.linear_fc2"
