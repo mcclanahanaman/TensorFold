@@ -231,7 +231,6 @@ class DecodeGraphs:
         self.budget = float(os.environ.get(DEMAND_MIB_ENV, "") or DEMAND_MIB) * MIB
         self.gate = None                            # the decoder's memory gate (prerecord attaches it)
         self.room_at = None                         # its room then (diagnostics)
-        self.own = 0                                # the startup graphs' bytes, which the room pays (THOR-DEC-1)
         self.paid: OrderedDict[tuple, list] = OrderedDict()     # on demand: key -> [bytes charged, last call]
         self.charged = self.refunded = 0            # bytes on-demand graphs took off the room, and gave back
         self.est = EST_MIB * MIB                    # an on-demand graph's bytes before it is measured (the most seen)
@@ -473,9 +472,9 @@ class DecodeGraphs:
         context bucket. Each forward runs eagerly once on a free
         slot (it compiles its launches), is recorded, then replays once (the graph's upload); the slot and the scratch
         parity are reset after. A first round (nothing folds in), a one-row verification, a sparse or image stream
-        and a longer context are left to ``run`` (on demand, or ``lazy``). Returns the graphs' own memory in bytes
-        (``own``): the free memory their captures and uploads took (the eager forwards' is the decode path's
-        first-use memory), 0 if nothing ran."""
+        and a longer context are left to ``run`` (on demand, or ``lazy``). Returns the graphs' own memory in bytes:
+        the free memory their captures and uploads took (the eager forwards' is the decode path's first-use memory),
+        0 if nothing ran."""
 
         from .attn_multi import Step
         from .forward import compute, stage
@@ -523,8 +522,7 @@ class DecodeGraphs:
                     "graph_mib": round(free0 - _free_mib(), 1), "released_mib": round(_free_mib() - held, 1),
                     "phase_mib": {k: [round(x, 1) for x in v] for k, v in mem.items()}, "charged_mib": round(own, 1),
                     "pool_mib": round((torch.cuda.memory_reserved() - res0) / MIB, 1), "free_mib": _free_mib()})
-        self.own = int(own * MIB)
-        return self.own
+        return int(own * MIB)
 
     def _prerecord(self, kind: str, segs: Sequence, b, step, tables, fn: Callable[[], torch.Tensor], mem: dict,
                    extra: tuple = ()) -> int:

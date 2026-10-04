@@ -218,7 +218,7 @@ def test_demand_graphs_keep_the_bits_and_charge_the_room(monkeypatch):
         assert not gr.failed and gr.demand and gr.gate is not None
         assert sum(gr.captures.values()) > startup + 1, gr.captures
         assert any(k.endswith(":s") and v[1] > 0 for k, v in gr.ctx.items()), gr.ctx    # sparse rounds replayed
-        assert gr.gate.room == gr.room_at - gr.own - gr.charged + gr.refunded    # startup, then on demand
+        assert gr.gate.room == gr.room_at - gr.charged + gr.refunded     # _sequential's own prerecord charges nothing
         assert sum(gr.missed.values()) == sum(gr.forwards.values()) - sum(gr.replays.values())
         if evict:
             assert gr.evicted > 0 and len(gr.paid) <= 1, (gr.evicted, len(gr.paid))
