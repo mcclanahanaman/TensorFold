@@ -51,20 +51,29 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
         template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos)
     except (ImageInputError, ValueError) as exc:
         raise RequestError(str(exc)) from exc
-    slot = image_slot()
+    slot, early = image_slot(), None
     try:
         images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=limits, allow_urls=allow_urls)
         budget = {} if limits.max_visual_tokens == DEFAULT_LIMITS.max_visual_tokens else \
             {"max_visual_tokens": limits.max_visual_tokens}
         clips = [s for s in sources if not isinstance(s, ImageSource)]
+        prepared = None
         if clips:
             from tensorfold.vision.videos import load_videos
 
-            budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls)
-        prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
+            # THOR-VISION-STREAM (sm_110): one video and no image: its tower calls run while it decodes, here, as before
+            early = frontend.speculate(lambda: render(template), max_prompt_tokens=context_limit, **budget) if (
+                len(clips) == 1 and not images and hasattr(frontend, "speculate")) else None
+            budget["videos"] = load_videos(clips, frontend.video_size, allow_urls=allow_urls,
+                                           **({} if early is None else {"feed": early.feed}))
+            prepared = None if early is None else early.take(budget["videos"][0])
+        if prepared is None:
+            prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
     except (ImageInputError, ValueError, ImportError) as exc:
         raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded
     finally:
+        if early is not None:
+            early.cancel()
         slot.release()
     return RenderedPrompt(list(prepared.token_ids), vision=prepared)
 

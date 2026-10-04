@@ -34,6 +34,44 @@ class PreparedVisionPrompt:
         return sum(end - start for start, end in self.image_spans + self.video_spans)
 
 
+@dataclass(frozen=True)
+class StreamedVisionPrompt(PreparedVisionPrompt):
+    """THOR-VISION-STREAM: a one-video prompt whose tower calls ran while its frames decoded; ``video_features`` maps
+    each call's (video, first group) to the tower's bf16 output for it, the bits the encode would compute."""
+    video_features: Any = None
+
+
+class LazyVideoPatches:
+    """THOR-VISION-STREAM: a video's patches [groups * h * w, C * T * p * p] made a run of whole frame groups at a time
+    (a slice), from ``frames(begin, end)``. Each patch row depends on its own frame group only, and the arithmetic is
+    elementwise, so every slice holds the bits of the same rows of ``QwenImageProcessor._video_patches``."""
+
+    dtype = np.dtype(np.float32)
+    ndim = 2
+
+    def __init__(self, frames, count: int, grid, temporal: int, make) -> None:
+        self._frames, self._count, self._temporal, self._make = frames, int(count), int(temporal), make
+        gt, gh, gw = (int(v) for v in grid)
+        self._per_group = gh * gw
+        self.shape = (gt * gh * gw, int(make.width))
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, key) -> np.ndarray:
+        if not isinstance(key, slice):
+            raise TypeError("lazy video patches take a slice of whole frame groups")
+        start, stop, step = key.indices(self.shape[0])
+        if step != 1 or start % self._per_group or stop % self._per_group or stop <= start:
+            raise ValueError("lazy video patches take a slice of whole frame groups")
+        g0, g1 = start // self._per_group, stop // self._per_group
+        first, end = g0 * self._temporal, g1 * self._temporal
+        frames = self._frames(first, min(end, self._count))
+        if end > self._count:                          # the last group of an odd count repeats the last frame
+            frames = np.concatenate([frames, np.repeat(frames[-1:], end - self._count, axis=0)])
+        return self._make(frames)
+
+
 def continued(prepared: PreparedVisionPrompt, tokens: Sequence[int], config: dict) -> PreparedVisionPrompt:
     """The same images for a prompt that goes on past ``prepared``'s tokens (text only), positions extended."""
     tokens = tuple(int(t) for t in tokens)
@@ -285,8 +323,9 @@ class QwenImageProcessor:
         video_grid = np.asarray([g for _, g in clips], dtype=np.int64).reshape(-1, 3) if videos else None
         positions, delta, spans, frames = media_positions(tokens, grid, video_grid, self.config)
         pixels = (np.concatenate(parts, axis=0) if parts else np.zeros((0, expected_width), dtype=np.float32))
-        video_pixels = np.concatenate([p for p, _ in clips], axis=0) if videos else None
-        for array in (pixels, grid, positions, video_pixels, video_grid):
+        lazy = len(clips) == 1 and isinstance(clips[0][0], LazyVideoPatches)     # THOR-VISION-STREAM: one video
+        video_pixels = clips[0][0] if lazy else np.concatenate([p for p, _ in clips], axis=0) if videos else None
+        for array in (pixels, grid, positions, None if lazy else video_pixels, video_grid):
             if array is not None:
                 array.setflags(write=False)
         return PreparedVisionPrompt(tokens, pixels, grid, positions, delta, spans,
@@ -326,27 +365,45 @@ class QwenImageProcessor:
 
     def _video_patches(self, video) -> tuple[np.ndarray, np.ndarray]:
         """Normalized patches [groups * h * w, C * T * p * p] and the (groups, h, w) grid of one decoded video, in the
-        tower's order (Qwen3-VL's ``patchify``; an odd last frame repeats)."""
+        tower's order (Qwen3-VL's ``patchify``; an odd last frame repeats). A ``PlannedVideo`` (THOR-VISION-STREAM)
+        gets ``LazyVideoPatches`` that wait for its frames in its feed."""
         vision = self.config["vision_config"]
         p, merge, temporal = (int(vision[k]) for k in ("patch_size", "spatial_merge_size", "temporal_patch_size"))
-        frames = np.asarray(video.frames)
-        count, height, width, channels = frames.shape
+        planned = getattr(video, "feed", None) is not None
+        count, height, width, channels = tuple(video.shape) if planned else np.asarray(video.frames).shape
         if height % (p * merge) or width % (p * merge) or channels != int(vision.get("in_channels", 3)):
             raise ValueError("decoded video frames do not match the tower's patch grid")
+        make = self._patcher(channels)
+        grid = np.asarray([-(-count // temporal), height // p, width // p])
+        if planned:
+            return LazyVideoPatches(video.feed.take, count, grid, temporal, make), grid
+        frames = np.asarray(video.frames)
         if count % temporal:
             frames = np.concatenate([frames, np.repeat(frames[-1:], temporal - count % temporal, axis=0)])
+        return make(frames), grid
+
+    def _patcher(self, channels: int):
+        """The patches of whole frame groups (uint8 [groups * T, H, W, C] -> float32 rows), the processor's bits."""
+        vision = self.config["vision_config"]
+        p, merge, temporal = (int(vision[k]) for k in ("patch_size", "spatial_merge_size", "temporal_patch_size"))
         options = self.processor
         mean = np.asarray(getattr(options, "image_mean", [0.5] * channels), dtype=np.float32)
         std = np.asarray(getattr(options, "image_std", [0.5] * channels), dtype=np.float32)
         scale = np.float32(getattr(options, "rescale_factor", 1 / 255))
-        gt, gh, gw = frames.shape[0] // temporal, height // p, width // p
-        if self.video_threads:          # THOR-VISION-PREP (set by the CUDA frontend on sm_110): the same bits, fused
-            return fused_video_patches(frames, (p, merge, temporal), (scale, mean, std), self.video_threads), \
-                np.asarray([gt, gh, gw])
-        x = ((frames.astype(np.float32) * scale - mean) / std).transpose(0, 3, 1, 2)       # [T, C, H, W]
-        x = x.reshape(gt, temporal, channels, gh // merge, merge, p, gw // merge, merge, p)
-        x = x.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
-        return np.ascontiguousarray(x.reshape(gt * gh * gw, channels * temporal * p * p)), np.asarray([gt, gh, gw])
+        threads = self.video_threads
+
+        def make(frames: np.ndarray) -> np.ndarray:
+            _, height, width, _ = frames.shape
+            gt, gh, gw = frames.shape[0] // temporal, height // p, width // p
+            if threads:          # THOR-VISION-PREP (set by the CUDA frontend on sm_110): the same bits, fused
+                return fused_video_patches(frames, (p, merge, temporal), (scale, mean, std), threads)
+            x = ((frames.astype(np.float32) * scale - mean) / std).transpose(0, 3, 1, 2)       # [T, C, H, W]
+            x = x.reshape(gt, temporal, channels, gh // merge, merge, p, gw // merge, merge, p)
+            x = x.transpose(0, 3, 6, 4, 7, 2, 1, 5, 8)
+            return np.ascontiguousarray(x.reshape(gt * gh * gw, channels * temporal * p * p))
+
+        make.width = channels * temporal * p * p
+        return make
     def estimate_workspace_bytes(self, prepared: PreparedVisionPrompt) -> int:
         """The tower's measured workspace (unmeasured: every layer's activations at once) plus this request's arrays."""
         vision = self.config["vision_config"]

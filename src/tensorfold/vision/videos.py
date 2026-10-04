@@ -6,6 +6,7 @@ import functools
 import hashlib
 import io
 import math
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -70,6 +71,78 @@ class VideoInput:
         return [(seconds[i] + seconds[i + temporal - 1]) / 2 for i in range(0, len(seconds), temporal)]
 
 
+@dataclass(frozen=True, slots=True)
+class PlannedVideo:
+    """THOR-VISION-STREAM: the video a decode will return when every sampled frame decodes (its ``timestamps`` the
+    same), known once the stream's metadata is read; the frames themselves come through a ``FrameFeed``."""
+    shape: tuple[int, int, int, int]      # [frames, height, width, 3]
+    indices: tuple[int, ...]
+    fps: float
+    feed: Any = None
+    content_hash: str = ""                # the decoded video's (``VideoInput``), set once it has decoded
+
+    timestamps = VideoInput.timestamps
+
+
+class FeedClosed(Exception):
+    """The decode ended (or the request stopped waiting) before the frames a reader waits for arrived."""
+
+
+class FrameFeed:
+    """THOR-VISION-STREAM: ``decode_video`` reports its plan and each sampled frame here as it goes, so another thread
+    can work on the first frames while later ones decode. Passive: the decode and its errors stay where they were."""
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self.plan: PlannedVideo | None = None
+        self.frames: list = []
+        self.ready = 0                        # the leading frames that have arrived
+        self.closed = False
+
+    def begin(self, count: int, height: int, width: int, indices, fps: float) -> None:
+        with self._cond:
+            self.plan = PlannedVideo((count, height, width, 3), tuple(int(i) for i in indices), fps, self)
+            self.frames = [None] * count
+            self._cond.notify_all()
+
+    def frame(self, slot: int, item) -> None:
+        """Frame ``slot`` (an array, or the scale pool's future of one)."""
+        if hasattr(item, "add_done_callback"):
+            item.add_done_callback(lambda job: self._arrive(slot, job.result() if job.exception() is None else None))
+        else:
+            self._arrive(slot, item)
+
+    def _arrive(self, slot: int, array) -> None:
+        with self._cond:
+            if array is None or slot >= len(self.frames):
+                self.closed = True
+            else:
+                self.frames[slot] = array
+                while self.ready < len(self.frames) and self.frames[self.ready] is not None:
+                    self.ready += 1
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        with self._cond:
+            self.closed = True
+            self._cond.notify_all()
+
+    def wait_plan(self) -> PlannedVideo:
+        with self._cond:
+            self._cond.wait_for(lambda: self.plan is not None or self.closed)
+            if self.plan is None:
+                raise FeedClosed
+            return self.plan
+
+    def take(self, begin: int, end: int) -> np.ndarray:
+        """Frames ``begin:end`` stacked, once they have arrived."""
+        with self._cond:
+            self._cond.wait_for(lambda: self.ready >= end or self.closed)
+            if self.ready < end:
+                raise FeedClosed
+            return np.stack(self.frames[begin:end])
+
+
 def video_source(value: Any, limits: VideoLimits, allow_urls: bool) -> VideoSource:
     if not isinstance(value, dict) or not isinstance(value.get("url"), str) or not value["url"]:
         raise ImageInputError("video_url must contain a non-empty url string")
@@ -111,8 +184,9 @@ def _scale_pool(threads: int):
 
 
 def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], limits: VideoLimits,
-                 deadline: float) -> VideoInput:
-    """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic)."""
+                 deadline: float, feed: FrameFeed | None = None) -> VideoInput:
+    """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic); ``feed``
+    (THOR-VISION-STREAM) hears the plan and each sampled frame as it goes."""
     av = _av()
     try:
         with av.open(io.BytesIO(data), mode="r") as container:
@@ -136,6 +210,8 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
             out_h, out_w = size(len(wanted), height, width)
             keep = set(int(i) for i in wanted)
             frames, indices = [], []
+            if feed is not None:
+                feed.begin(len(wanted), out_h, out_w, wanted, fps)
             # THOR-VISION-PREP: each sampled frame's scale (swscale, the GIL released) on a pool while the next frames
             # decode; the same call on the same frame, so the same pixels
             pool = _scale_pool(SCALE_THREADS) if SCALE_THREADS > 0 else None
@@ -147,6 +223,8 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
                                               interpolation="BICUBIC")
                     frames.append(scale() if pool is None else pool.submit(scale))
                     indices.append(n)
+                    if feed is not None:
+                        feed.frame(len(frames) - 1, frames[-1])
             if pool is not None:
                 frames = [job.result() for job in frames]
             if time.monotonic() >= deadline:
@@ -162,8 +240,9 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
 
 
 def load_videos(sources: list[VideoSource], size: Callable[[int, int, int], tuple[int, int]], *,
-                limits: VideoLimits = DEFAULT_VIDEO_LIMITS, allow_urls: bool = False) -> list[VideoInput]:
-    """Bound encoded bytes and decoding time across the videos of one request."""
+                limits: VideoLimits = DEFAULT_VIDEO_LIMITS, allow_urls: bool = False,
+                feed: FrameFeed | None = None) -> list[VideoInput]:
+    """Bound encoded bytes and decoding time across the videos of one request (``feed``: the one video's frames)."""
     if len(sources) > limits.max_videos:
         raise ImageInputError(f"a request supports at most {limits.max_videos} videos")
     total = 0
@@ -183,5 +262,6 @@ def load_videos(sources: list[VideoSource], size: Callable[[int, int, int], tupl
         else:
             raise ImageInputError("video URLs are off on this server")
         total += len(data)
-        output.append(decode_video(data, size, limits, deadline))
+        output.append(decode_video(data, size, limits, deadline) if feed is None else
+                      decode_video(data, size, limits, deadline, feed))
     return output

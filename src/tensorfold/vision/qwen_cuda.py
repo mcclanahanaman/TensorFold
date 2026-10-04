@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 import functools
@@ -352,6 +353,13 @@ class QwenCudaVision:
                       f"(TENSORFOLD_THOR_VISION=0 keeps transformers' path)", flush=True)
         from . import thor_vision, videos
 
+        # THOR-VISION-STREAM: a one-video request's tower calls run while its frames decode (needs the one-flash-call
+        # attention: no SDPA flags, which are process-wide, are set off the scheduler's thread)
+        self.stream_videos = bool(self._thor_attn and self._thor_attn.get("varlen") and thor_vision.stream_on(device))
+        self._tower_lock = threading.Lock()
+        if self.stream_videos:
+            print("[tensorfold] Thor (sm_110): a video's tower calls run as its frames decode, the same bits "
+                  "(TENSORFOLD_THOR_VISION_STREAM=0 encodes after the decode)", flush=True)
         threads = thor_vision.prep_threads(device)       # THOR-VISION-PREP, CPU work: an offloaded tower too
         if threads:
             self.frontend.video_threads = videos.SCALE_THREADS = threads
@@ -394,8 +402,35 @@ class QwenCudaVision:
                 torch.cuda.empty_cache()
 
     def encode(self, prepared, prompt) -> EncodedVision:
+        if getattr(self, "stream_videos", False):     # THOR-VISION-STREAM: one tower call at a time beside early calls
+            with self._tower_lock:
+                return self._encode(prepared, prompt)
         with self._on_gpu():
             return self._encode(prepared, prompt)
+
+    def speculate(self, render, **prepare_options):
+        """THOR-VISION-STREAM: a ``VideoSpeculation`` for a one-video request, None when off (``stream_videos``)."""
+        return VideoSpeculation(self, render, prepare_options) if getattr(self, "stream_videos", False) else None
+
+    def _video_call(self, pixels, n: int, h: int, w: int):
+        """One tower call: ``n`` frame groups of ``h`` x ``w`` patches (float32 rows) -> their bf16 features."""
+        import torch
+
+        pixels = torch.tensor(pixels, dtype=torch.bfloat16, device=self.device)
+        grids = torch.tensor([[n, h, w]], dtype=torch.int64, device=self.device)
+        features = self.tower(pixels, grid_thw=grids, return_dict=True, **self._longest([h * w])).pooler_output
+        return features.to(dtype=torch.bfloat16)
+
+    def _video_steps(self, videos):
+        """``_encode``'s tower calls over the videos, in order: (key, first patch row, groups, h, w)."""
+        done = 0
+        for v, (t, h, w) in enumerate(videos):
+            t, h, w = int(t), int(h), int(w)
+            step = max(1, MAX_PATCHES // (h * w))
+            for g in range(0, t, step):
+                n = min(step, t - g)
+                yield (v, g), done, n, h, w
+                done += n * h * w
 
     def _longest(self, segments) -> dict:
         """THOR-VISION-ATTN's one flash call a layer: the call's longest attention segment from the host."""
@@ -456,28 +491,87 @@ class QwenCudaVision:
                     blocks[next(starts)] = part
             if clips:
                 # frame groups never attend to one another either: a video encodes a bounded run of them at a time
-                done, spans_left = 0, iter(frames)
-                for t, h, w in videos:
-                    t, h, w = int(t), int(h), int(w)
-                    step = max(1, MAX_PATCHES // (h * w))
-                    for g in range(0, t, step):
-                        n = min(step, t - g)
-                        pixels = torch.tensor(prepared.video_pixel_values[done:done + n * h * w],
-                                              dtype=torch.bfloat16, device=self.device)
-                        grids = torch.tensor([[n, h, w]], dtype=torch.int64, device=self.device)
-                        features = self.tower(pixels, grid_thw=grids, return_dict=True,
-                                              **self._longest([h * w])).pooler_output
-                        for part in features.to(dtype=torch.bfloat16).split(h * w // merge**2):
-                            start, end = next(spans_left)
-                            if end - start != part.shape[0]:
-                                raise ValueError("video frame features do not match their placeholders")
-                            blocks[start] = part
-                        done += n * h * w
+                spans_left = iter(frames)
+                early = getattr(prepared, "video_features", None) or {}     # THOR-VISION-STREAM: calls already run
+                for key, done, n, h, w in self._video_steps(videos):
+                    features = early.get(key)
+                    if features is None:
+                        features = self._video_call(prepared.video_pixel_values[done:done + n * h * w], n, h, w)
+                    for part in features.split(h * w // merge**2):
+                        start, end = next(spans_left)
+                        if end - start != part.shape[0]:
+                            raise ValueError("video frame features do not match their placeholders")
+                        blocks[start] = part
             features = torch.cat([blocks[start] for start, _ in spans]).contiguous()
         if tuple(features.shape) != (len(rows), self.config["out_hidden_size"]):
             raise ValueError("vision tower returned a different number of image features")
         return EncodedVision(rows, features, torch.tensor(positions, dtype=torch.int32, device=self.device),
                              prepared.rope_delta)
+
+
+class VideoSpeculation:
+    """THOR-VISION-STREAM: a one-video request's preparation and tower calls on their own thread while the request's
+    thread decodes the video exactly as before (``feed`` hears each frame). It never raises into the request: any
+    failure, a decode that ends early or differs from the plan, or ``cancel`` leaves ``take`` returning None, and the
+    request prepares and encodes after the decode as it always did (the same errors at the same points). The scheduler
+    gets the prompt only after the decode, every call run, so it never waits for a frame."""
+
+    def __init__(self, vision: QwenCudaVision, render, prepare_options: dict) -> None:
+        from .videos import FrameFeed
+
+        self.vision, self.render, self.options = vision, render, prepare_options
+        self.feed = FrameFeed()
+        self.prepared = self.error = None
+        self.features: dict = {}
+        self.cancelled = False
+        self.thread = threading.Thread(target=self._run, name="tensorfold-video-early", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        import torch
+
+        try:
+            plan = self.feed.wait_plan()
+            prepared = self.vision.prepare(self.render(), [], videos=[plan], **self.options)
+            if prepared.image_grid_thw.shape[0] or prepared.video_grid_thw is None:
+                raise ValueError("a speculated video prompt holds one video and no image")
+            cuda = torch.device(self.vision.device).type == "cuda"
+            with torch.cuda.device(self.vision.device) if cuda else contextlib.nullcontext(), torch.inference_mode():
+                for key, done, n, h, w in self.vision._video_steps(prepared.video_grid_thw):
+                    pixels = prepared.video_pixel_values[done:done + n * h * w]     # waits for these frames
+                    if self.cancelled:
+                        return
+                    with self.vision._tower_lock:
+                        self.features[key] = self.vision._video_call(pixels, n, h, w)
+                if cuda:
+                    torch.cuda.current_stream().synchronize()     # the features are ready for any stream
+            self.prepared = prepared
+        except Exception as exc:  # noqa: BLE001 - the request's own path reports its errors where it always did
+            self.error = exc
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.feed.close()
+
+    def take(self, video):
+        """The prompt prepared from ``video`` (the decode's result) with its tower calls run, or None."""
+        plan = self.feed.plan
+        if plan is None or video.indices != plan.indices or tuple(video.frames.shape) != plan.shape or \
+                video.fps != plan.fps:
+            self.cancel()
+            return None
+        self.thread.join()
+        if self.prepared is None or self.cancelled:
+            return None
+        from .qwen_processing import LazyVideoPatches, StreamedVisionPrompt
+
+        lazy = self.prepared.video_pixel_values
+        frames = video.frames
+        pixels = LazyVideoPatches(lambda a, b: frames[a:b], frames.shape[0], self.prepared.video_grid_thw[0],
+                                  lazy._temporal, lazy._make)
+        fields = {f: getattr(self.prepared, f) for f in self.prepared.__dataclass_fields__}
+        fields.update(video_pixel_values=pixels, video_hashes=(video.content_hash,), video_features=self.features)
+        return StreamedVisionPrompt(**fields)
 
 
 def image_runs(sizes, limit: int) -> list[tuple[int, int]]:

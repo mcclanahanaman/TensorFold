@@ -26,6 +26,7 @@ ENV = "TENSORFOLD_THOR_VISION"
 ENV_ROPE = "TENSORFOLD_THOR_VISION_ROPE"
 ENV_VARLEN = "TENSORFOLD_THOR_VISION_VARLEN"
 ENV_PREP = "TENSORFOLD_THOR_VISION_PREP"
+ENV_STREAM = "TENSORFOLD_THOR_VISION_STREAM"
 PREP_THREADS = 8                    # THOR-VISION-PREP's CPU threads for a video's patches (Thor: 14 cores)
 CAPABILITY = (11, 0)
 CHECK_SEGMENTS = (64, 200, 33)      # the load check: uneven lengths, tails off the flash kernel's 128 x 64 tiles
@@ -50,6 +51,13 @@ def prep_threads(device=None) -> int:
     ``qwen_processing.fused_video_patches``, numpy's hugepage advice off); 0 keeps TensorFold's CPU path (any other
     GPU, ``TENSORFOLD_THOR_VISION_PREP=0``, or ``TENSORFOLD_THOR_VISION=0``)."""
     return max(1, min(PREP_THREADS, os.cpu_count() or 1)) if _on(ENV_PREP) and available(device) else 0
+
+
+def stream_on(device=None) -> bool:
+    """THOR-VISION-STREAM on sm_110: a one-video request's tower calls run on their own thread as its frame groups
+    decode, the same bits; off (``TENSORFOLD_THOR_VISION_STREAM=0``, ``TENSORFOLD_THOR_VISION=0`` or another GPU)
+    the tower runs after the decode, at admission."""
+    return _on(ENV_STREAM) and available(device)
 
 
 def numpy_hugepage_advice_off():
