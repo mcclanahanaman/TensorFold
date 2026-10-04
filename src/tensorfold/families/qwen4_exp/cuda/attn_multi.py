@@ -12,7 +12,7 @@ import triton.language as tl
 
 from tensorfold.cuda.kernels import gdn as shared
 
-from . import attention as attn_mod, glue
+from . import attention as attn_mod, glue, thor_dec2
 from .attention import CHUNK, _chunk, _merge_row, _pool_block
 
 PTRS = 6                 # a stream's pointers a layer: keys, values, key scales, value scales, index keys, pooled
@@ -80,6 +80,10 @@ def _merge_multi(PO, PM, PL, POSR, OUT, NKR, H: tl.constexpr, HK: tl.constexpr, 
     _merge_row(PO, PM, PL, OUT, n, r, tl.program_id(1), H, HK, D, G, CH, NCH, BITS)
 
 
+def _to_device(values: np.ndarray, dtype: torch.dtype, device) -> torch.Tensor:
+    return shared.to_device(values.tolist(), dtype, device)
+
+
 class Step:
     """A step's row, stream and cache-pointer tables (the MTP head's with ``mtp``), read now: caches may move."""
 
@@ -93,21 +97,29 @@ class Step:
             posr[a0:a1] = p0 + np.arange(a1 - a0)
             sid[a0:a1] = s
         counts = [a1 - a0 for _, a0, a1 in segs]
-        ptrs = np.empty((len(layers), PTRS, n), np.int64)
-        for s, (st, _, _) in enumerate(segs):
-            for i, layer in enumerate(layers):
-                if mtp:
-                    kc, ikc, pooled = st.mtp_kc, st.mtp_ikc, st.mtp_pooled
-                else:
-                    a = st.att_index[layer.index]
-                    kc, ikc, pooled = st.kc[a], st.ikc[a], st.pooled[a]
-                ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
-                                 ikc.data_ptr(), pooled.data_ptr()]
+        fast = thor_dec2.tables_on()                     # Thor DEC-2: kept pointers, numpy straight to the copy
+        kept = np.stack([thor_dec2.attn_ptrs(st, layers) for st, _, _ in segs], axis=-1) if fast and not mtp else None
+        if kept is None or thor_dec2.S.check:
+            ptrs = np.empty((len(layers), PTRS, n), np.int64)
+            for s, (st, _, _) in enumerate(segs):
+                for i, layer in enumerate(layers):
+                    if mtp:
+                        kc, ikc, pooled = st.mtp_kc, st.mtp_ikc, st.mtp_pooled
+                    else:
+                        a = st.att_index[layer.index]
+                        kc, ikc, pooled = st.kc[a], st.ikc[a], st.pooled[a]
+                    ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
+                                     ikc.data_ptr(), pooled.data_ptr()]
+            if kept is not None:
+                ptrs = thor_dec2.same(kept, ptrs)
+        else:
+            ptrs = kept
         dev = w.device
-        ints = shared.to_device(np.concatenate([posr, sid, first, counts]).tolist(), torch.int32, dev)
+        put = thor_dec2.to_dev if fast else _to_device
+        ints = put(np.concatenate([posr, sid, first, counts]), torch.int32, dev)
         self.posr, self.sid = ints[:rows], ints[rows:2 * rows]
         self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:]
-        self.ptrs = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev).view(len(layers), PTRS * n)
+        self.ptrs = put(ptrs.ravel(), torch.int64, dev).view(len(layers), PTRS * n)
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
         self.most = max(counts)
@@ -118,7 +130,7 @@ class Step:
             vp = [[st.image_positions.data_ptr() if st.image_positions is not None else st.pos_dev.data_ptr(),
                    st.rope_delta_dev.data_ptr(), 0 if st.image_positions is None else st.image_positions.shape[0]]
                   for st, _, _ in segs]
-            self.vision_ptrs = shared.to_device(np.asarray(vp, dtype=np.int64).T.ravel().tolist(), torch.int64, dev)
+            self.vision_ptrs = put(np.asarray(vp, dtype=np.int64).T.ravel(), torch.int64, dev)
 
 
 def layer(layer, w, b, step: Step, mtp: bool, scale: float) -> torch.Tensor:

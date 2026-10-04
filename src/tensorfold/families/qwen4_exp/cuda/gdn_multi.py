@@ -9,7 +9,7 @@ import torch
 
 from tensorfold.cuda.kernels import gdn as shared
 
-from . import gdn_io
+from . import gdn_io, thor_dec2
 from .gdn import DK, DV
 
 
@@ -48,14 +48,24 @@ class Tables:
             held[s, :len(rows_)] = rows_
         counts = np.asarray([len(rows_) for rows_ in pending], dtype=np.int32)
         ints = np.concatenate([sid, win.ravel(), np.asarray(entries + starts, dtype=np.int32), held.ravel(), counts])
-        ptrs = np.empty((2, lin, n), dtype=np.int64)
-        for s, (st, _, _) in enumerate(segs):
-            for li in range(lin):
-                ptrs[0, li, s] = st.conv[li].data_ptr()
-                ptrs[1, li, s] = st.rec[st.cur[li], li].data_ptr()
+        fast = thor_dec2.tables_on()                     # Thor DEC-2: pointers from bases and strides, numpy copies
+        kept = np.stack([thor_dec2.gdn_ptrs(st, lin) for st, _, _ in segs], axis=-1) if fast else None
+        if kept is None or thor_dec2.S.check:
+            ptrs = np.empty((2, lin, n), dtype=np.int64)
+            for s, (st, _, _) in enumerate(segs):
+                for li in range(lin):
+                    ptrs[0, li, s] = st.conv[li].data_ptr()
+                    ptrs[1, li, s] = st.rec[st.cur[li], li].data_ptr()
+            if kept is not None:
+                ptrs = thor_dec2.same(kept, ptrs)
+        else:
+            ptrs = kept
         dev = w.device
-        i32 = shared.to_device(ints.tolist(), torch.int32, dev)
-        i64 = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev)
+        if fast:
+            i32, i64 = thor_dec2.to_dev(ints, torch.int32, dev), thor_dec2.to_dev(ptrs.ravel(), torch.int64, dev)
+        else:
+            i32 = shared.to_device(ints.tolist(), torch.int32, dev)
+            i64 = shared.to_device(ptrs.ravel().tolist(), torch.int64, dev)
         self.sid, self.win = i32[:rows], i32[rows:5 * rows].view(rows, 4)
         at = 8 * rows + n + 1
         self.plan = shared.Plan(i32[5 * rows:8 * rows].view(rows, 3), i32[8 * rows:at], slots, most)

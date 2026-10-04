@@ -24,7 +24,7 @@ from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapsho
 from .mtp import mtp_compute, mtp_stage
 from .prompt_plan import keeps_pool, pass_limit
 from .state import ENDS, Buffers, State
-from . import thor_graphs
+from . import thor_dec2, thor_graphs
 from ..cuda import CONFIDENCE, DEPTH
 
 FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
@@ -539,7 +539,8 @@ class MultiDecoder:
                     s.error = exc
             last = s.error is not None or len(s.out) + len(new) >= s.count or end in self._ends(s)
             kept.append((s, a0, rows[:len(path)], new, last))
-        self._draft_all([(s, a0, keep) for s, a0, keep, _, last in kept if s.draft and not last])
+        drafting = [(s, a0, keep, new) for s, a0, keep, new, last in kept if s.draft and not last]
+        self._draft_all([(s, a0, keep) for s, a0, keep, _ in drafting], {s.sid: new[-1] for s, _, _, new in drafting})
         for s, _, _, new, _ in kept:
             if s.error is not None:
                 s.done = True
@@ -554,8 +555,9 @@ class MultiDecoder:
             self.held.pop(s.sid, None)
         return failed + done + ended
 
-    def _draft_all(self, streams: list) -> None:
-        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth."""
+    def _draft_all(self, streams: list, nexts: dict | None = None) -> None:
+        """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth; ``nexts``:
+        each stream's next window's first token (Thor DEC-2 gathers the window's n-gram rows while the steps run)."""
 
         for s, _, _ in streams:
             s.drafts = []
@@ -573,17 +575,21 @@ class MultiDecoder:
         # Thor graphs: each MTP step's graph also holds its picks' reductions and their copy to pinned host memory
         k = self._k([s.sampling for s, _, _ in todo]) if self.graphs is not None else None
         logits = self._mtp(segs, k)
+        ahead = bool(nexts) and thor_dec2.ahead_on(self.w)
+        if ahead:                                        # Thor DEC-2: while the step runs, the next windows' first rows
+            thor_dec2.ple_ahead(self.w, [(s.st, nexts[s.sid]) for s, _, _ in todo if s.sid in nexts], start=True)
         for (s, _, keep), (st, a0, a1) in zip(todo, segs):
             st.set_mtp_len(st.mtp_len + len(keep))
         active = [(s, a1 - 1) for s, (_, _, a1) in zip([t[0] for t in todo], segs)]
         for j in range(self.depth):
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active], k)
-            nxt = []
+            nxt, took = [], []
             for (s, row), (d, p) in zip(active, picks):
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
                     continue
                 s.drafts.append(d)
+                took.append((s.st, d))
                 if not low and j + 1 < room[s.sid]:
                     nxt.append((s, row, d))
             if not nxt:
@@ -592,6 +598,8 @@ class MultiDecoder:
             segs = mtp_stage(self.w, self.mbuf, windows)
             k = self._k([s.sampling for s, _, _ in nxt]) if self.graphs is not None else None
             logits = self._mtp(segs, k)
+            if ahead:                                    # the drafts just picked: their rows while this step runs
+                thor_dec2.ple_ahead(self.w, took, start=False)
             for s, _, _ in nxt:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1

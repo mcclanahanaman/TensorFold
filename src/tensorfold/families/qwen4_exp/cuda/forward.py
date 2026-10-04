@@ -374,6 +374,8 @@ def stage_ple_rows(p, b: Buffers, ids: np.ndarray, at: int = 0, got=None) -> Non
     """Copy the rows' n-gram table entries (``got``: already gathered) to the GPU buffers, from staging row ``at``."""
 
     got = p.table.gather(ids) if got is None else got
+    if isinstance(got, list):                              # Thor DEC-2: row blocks (gathered ahead, then the rest)
+        got = np.concatenate(got)
     if getattr(p.table, "bits", 4) == 16:                  # a bf16 table: the rows go over as they are
         values = got
         rows = slice(at, at + values.shape[0])
@@ -529,21 +531,13 @@ def stage_ahead() -> bool:
     return os.environ.get(STAGE_AHEAD, "1").strip().lower() not in ("0", "off", "false", "no")
 
 
-def _gather(lookups: list) -> list:
-    """Each lookup's table rows; Thor DEC-2 (``thor_dec2.S.batch``): one gather a table for every stream, the same rows."""
+def _gather(lookups: list, reuse: dict | None = None) -> list:
+    """Each lookup's table rows; Thor DEC-2 (``thor_dec2``): one gather a table for every stream, and the rows gathered
+    while the MTP steps ran reused (``reuse``); the same rows."""
 
-    if not thor_dec2.S.batch or len(lookups) < 2:
+    if not (thor_dec2.S.batch or reuse):
         return [p.table.gather(ids) for p, ids, _ in lookups]
-    got, by = [None] * len(lookups), {}
-    for i, (p, _, _) in enumerate(lookups):
-        by.setdefault(id(p.table), (p.table, []))[1].append(i)
-    for table, idx in by.values():
-        rows = table.gather(np.concatenate([lookups[i][1].reshape(-1) for i in idx]))
-        at = 0
-        for i in idx:
-            got[i] = rows[at:at + lookups[i][1].size]
-            at += lookups[i][1].size
-    return got
+    return thor_dec2.gather_lookups(lookups, reuse or {})
 
 
 def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]) -> list[Seg]:
@@ -558,17 +552,20 @@ def stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int]]]
     R = segs[-1][2]
     if R > b.rows:
         raise ValueError(f"window of {R} rows, buffers hold {b.rows}")
-    lookups = []                         # (layer's PLE, row ids [rows, heads], first staging row)
-    for layer in w.layers:
-        if layer.ple is not None:
-            p = layer.ple
-            for (st, tokens), (_, a0, _) in zip(windows, segs):
-                toks = np.asarray(tokens, dtype=np.int64)
-                ids = p.ngram.ids(st.ple_history, toks)
-                st.ple_last = (st.ple_history, toks)
-                lookups.append((p, ids, a0 * (ids.size // len(toks))))
+    if thor_dec2.ahead_on(w):            # Thor DEC-2: the rows gathered while the MTP steps ran are reused
+        lookups, reuse = thor_dec2.stage_lookups(w, windows, segs)
+    else:
+        lookups, reuse = [], None        # (layer's PLE, row ids [rows, heads], first staging row)
+        for layer in w.layers:
+            if layer.ple is not None:
+                p = layer.ple
+                for (st, tokens), (_, a0, _) in zip(windows, segs):
+                    toks = np.asarray(tokens, dtype=np.int64)
+                    ids = p.ngram.ids(st.ple_history, toks)
+                    st.ple_last = (st.ple_history, toks)
+                    lookups.append((p, ids, a0 * (ids.size // len(toks))))
     # the table reads before the wait, which ends once the GPU has run the previous step: their faults overlap it
-    ahead = _gather(lookups) if w.x3 is None and stage_ahead() else None
+    ahead = _gather(lookups, reuse) if w.x3 is None and stage_ahead() else None
     b.staged.synchronize()               # the previous step's copies out of the pinned buffers are done
     b.ids_host[:R].numpy()[:] = np.asarray([t for _, tokens in windows for t in tokens], dtype=np.int32)
     b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)

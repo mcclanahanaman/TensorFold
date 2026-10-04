@@ -79,6 +79,11 @@ class NGram:
         """Row ids [L, heads] for ``tokens`` [L] after ``history`` [n-1] (EOS resets the n-grams)."""
 
         seq = np.concatenate([np.asarray(history, dtype=np.int64), np.asarray(tokens, dtype=np.int64)])[None]
+        return self.rows_of(seq)[0, -len(tokens):]
+
+    def rows_of(self, seq: np.ndarray) -> np.ndarray:
+        """Row ids [B, W, heads] at every position of ``seq`` [B, W] (each row its own sequence; EOS resets)."""
+
         batch, width = seq.shape
         pos = np.arange(width)
         eos_at = np.where(seq == self.eos, pos[None], -1)
@@ -98,8 +103,7 @@ class NGram:
                     mixed = np.bitwise_xor(mixed, shifted[p] * self.multipliers[p])
                 sizes = self.head_sizes[first:first + self.per_ngram]
                 blocks.append(mixed[..., None] % sizes + self.head_offsets[first:first + self.per_ngram])
-        out = np.concatenate(blocks, axis=-1)[0, -len(tokens):]
-        return out
+        return np.concatenate(blocks, axis=-1)
 
     def initial_history(self) -> np.ndarray:
         return np.full((self.context,), self.eos, dtype=np.int64)

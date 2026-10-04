@@ -186,8 +186,8 @@ class BF16Table:
         shard = np.searchsorted(self.starts, flat, side="right") - 1
         return shard, flat - self.starts[shard]
 
-    def gather(self, ids: np.ndarray) -> np.ndarray:
-        """Rows ``ids`` (global) -> [n, W] uint16 (the bf16 bits of W values)."""
+    def gather(self, ids: np.ndarray, split: int | None = None) -> np.ndarray:
+        """Rows ``ids`` (global) -> [n, W] uint16 (the bf16 bits of W values); ``split``: pool pieces (Thor DEC-2)."""
 
         shard, local = self._where(ids)
         out = np.empty((shard.size, self.width), dtype=np.uint16)
@@ -195,7 +195,7 @@ class BF16Table:
         def copy(f: int, at: np.ndarray) -> None:
             out[at] = self.values[f][local[at]]
 
-        _copy_rows(self._pool, shard, copy, self.split)
+        _copy_rows(self._pool, shard, copy, split or self.split)
         return out
 
     def lock(self) -> bool:
