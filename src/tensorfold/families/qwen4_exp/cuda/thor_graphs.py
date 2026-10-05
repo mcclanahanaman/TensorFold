@@ -205,6 +205,7 @@ class _Entry:
     out: torch.Tensor
     step: _Twin
     tables: _Twin | None
+    shx: int = 0                                # fused shared-expert tails this graph captured (each replay runs them)
 
 
 class DecodeGraphs:
@@ -316,7 +317,7 @@ class DecodeGraphs:
         entry = self.graphs.get(key)
         if entry is not None:
             self._load(entry, kind, segs, step, tables)
-            entry.graph.replay()
+            self._replay(entry)
             self.replays[kind] = self.replays.get(kind, 0) + 1
             h[1] += 1
             c[1] += 1
@@ -342,7 +343,7 @@ class DecodeGraphs:
             self._miss(key)
             return fn()
         self.graphs[key] = entry
-        entry.graph.replay()                        # this round's tables are the ones it was recorded with
+        self._replay(entry)                         # this round's tables are the ones it was recorded with
         self.replays[kind] = self.replays.get(kind, 0) + 1
         c[1] += 1
         if paid:
@@ -402,6 +403,14 @@ class DecodeGraphs:
             for tail, (st, _, _) in zip(self.tails, segs):
                 tail.copy_(st.ple_tail, non_blocking=True)
 
+    def _replay(self, entry: _Entry) -> None:
+        """Replay ``entry``. Each fused shared-expert tail it captured runs again; ``thor_shx`` counts those."""
+
+        entry.graph.replay()
+        if entry.shx:
+            from . import thor_shx
+            thor_shx.add_replays(entry.shx)
+
     def _record(self, kind: str, b, step, tables, fn, segs) -> _Entry | None:
         t0 = time.perf_counter()
         free0, alloc0, res0 = _free_mib(), torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
@@ -424,12 +433,15 @@ class DecodeGraphs:
         enabled = gc.isenabled()
         gc.disable()                                # a collected graph's destructor would invalidate the capture
         failed = None
+        shx = 0
+        from . import thor_shx
         try:
             if ple:
                 for tail, (st, _, _) in zip(self.tails, segs):
                     st.ple_tail = tail
             # recorded on a side stream, nothing runs (torch.cuda.graph would also sync, collect and empty the cache)
             with torch.cuda.stream(side):
+                thor_shx.begin_capture()
                 graph.capture_begin(pool=self.pool, capture_error_mode="thread_local")
                 try:
                     out = fn()
@@ -440,6 +452,7 @@ class DecodeGraphs:
                         graph.capture_end()
                     except Exception as exc:        # noqa: BLE001
                         failed = failed or exc
+                    shx = thor_shx.take_capture()
         finally:
             if enabled:
                 gc.enable()
@@ -463,7 +476,7 @@ class DecodeGraphs:
                     "kept_mib": round((torch.cuda.memory_allocated() - alloc0) / MIB, 2),
                     "pool_mib": round((torch.cuda.memory_reserved() - res0) / MIB, 1),
                     "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1), "free_mib": free1})
-        return _Entry(graph, out, twin_step, twin_tables)
+        return _Entry(graph, out, twin_step, twin_tables, shx)
 
     def prerecord(self, dec, mtp_fn: Callable | None = None) -> int:
         """Record the one-stream keys of short contexts now (``dec``: the ``MultiDecoder``, every slot free): a
@@ -542,7 +555,7 @@ class DecodeGraphs:
             return 0
         self.graphs[key] = entry
         f2 = _free_mib()
-        entry.graph.replay()                        # the upload, now rather than in a request
+        self._replay(entry)                         # the upload, now rather than in a request
         torch.cuda.synchronize()
         f3 = _free_mib()
         for i, lost in enumerate((f0 - f1, f1 - f2, f2 - f3)):

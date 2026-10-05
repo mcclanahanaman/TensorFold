@@ -232,7 +232,7 @@ def test_shx_tail_matches_torch_and_replays(monkeypatch):
     """The fused SwiGLU writes the act slot and the cuBLAS pad; the down GEMM's y matches torch's thirteen kernels,
     on a fresh call and on a CUDA-graph replay."""
 
-    from tensorfold.cuda.nvfp4 import linear as lin_mod
+    from tensorfold.cuda import prompt_precision
     from tensorfold.cuda.nvfp4 import thor_dense
     from tensorfold.families.qwen4_exp.cuda import thor_shx
 
@@ -240,6 +240,7 @@ def test_shx_tail_matches_torch_and_replays(monkeypatch):
         pytest.skip("sm_110 with TENSORFOLD_THOR_DENSE on only")
     monkeypatch.delenv(thor_shx.ENV, raising=False)
     assert thor_shx.active()
+    assert not prompt_precision.fp8()                   # the default: bf16 prompts. The FP8 case is below.
     old = (thor_dense.S.pad, thor_dense.S.staging, thor_dense.S.active)
     thor_dense.S.pad = torch.zeros((thor_dense.PAD * 2560,), dtype=torch.bfloat16, device="cuda")
     thor_dense.S.staging = torch.empty((1280 * 2560,), dtype=torch.bfloat16, device="cuda")
@@ -251,7 +252,8 @@ def test_shx_tail_matches_torch_and_replays(monkeypatch):
             y_off, act_off = _tail_once(x, gu, down, width, fused=False)
             y_on, act_on = _tail_once(x, gu, down, width, fused=True)
             assert _bits(y_on, y_off) and _bits(act_on, act_off), (width, rows)
-            _replay_matches(x, gu, down, width, y_off)
+            _replay_matches(x, gu, down, width, y_off, act_off)
+        _fp8_prompt_matches_the_kill_switch(monkeypatch)
     finally:
         thor_dense.S.pad, thor_dense.S.staging, thor_dense.S.active = old
 
@@ -277,6 +279,7 @@ def _tail_once(x, gu, down, width: int, *, fused: bool):
 
     from tensorfold.cuda.nvfp4 import thor_dense
     from tensorfold.families.qwen4_exp.cuda import thor_shx
+    from tensorfold.families.qwen4_exp.cuda.nvfp4_moe import _shared
 
     rows = x.shape[0]
     thor_dense.S.pad.zero_()
@@ -284,17 +287,18 @@ def _tail_once(x, gu, down, width: int, *, fused: bool):
     act = torch.empty((rows, 3, width), dtype=torch.bfloat16, device=x.device)
     held = torch.empty((rows, 3, down.n), dtype=torch.bfloat16, device=x.device)
     slot = act[:, 2]
+    prompt = held.dtype != torch.float32                     # moe(): bf16 slots are a prompt
     if fused:
         thor_shx.store(g, width, slot, rows)
         held[:, 2] = thor_shx.project(down, rows)
     else:
         gate, up = g[:, :width].to(torch.float32), g[:, width:].to(torch.float32)
         slot.copy_(((gate / (1.0 + torch.exp(-gate))).to(torch.bfloat16).to(torch.float32) * up).to(torch.bfloat16))
-        held[:, 2] = thor_dense.linear(slot, down)          # the pad copy, then the same cuBLAS GEMM
+        held[:, 2] = _shared(down, slot, prompt, not prompt)  # moe()'s down: Linear.prefill, not thor_dense.linear
     return held[:, 2].contiguous(), slot.contiguous()
 
 
-def _replay_matches(x, gu, down, width: int, reference: torch.Tensor) -> None:
+def _replay_matches(x, gu, down, width: int, reference: torch.Tensor, eager_slot: torch.Tensor) -> None:
     from tensorfold.cuda.nvfp4 import thor_dense
     from tensorfold.families.qwen4_exp.cuda import thor_shx
 
@@ -309,6 +313,7 @@ def _replay_matches(x, gu, down, width: int, reference: torch.Tensor) -> None:
             thor_shx.store(got, width, static_act, rows)
             thor_shx.project(down, rows)
         thor_dense.S.pad.zero_()
+        thor_shx.begin_capture()
         graph.capture_begin(pool=torch.cuda.graph_pool_handle(), capture_error_mode="thread_local")
         try:
             got = thor_dense.linear(static_x, gu)
@@ -316,10 +321,61 @@ def _replay_matches(x, gu, down, width: int, reference: torch.Tensor) -> None:
             y = thor_shx.project(down, rows)
         finally:
             graph.capture_end()
+            recorded = thor_shx.take_capture()
     torch.cuda.current_stream().wait_stream(side)
     graph.replay()
     torch.cuda.synchronize()
+    assert recorded == 1                                   # the capture recorded the one store and did not run it
     assert _bits(y, reference)
+    assert _bits(static_act, eager_slot)                   # the replay rewrote the act slot, not only y
+
+
+def _fp8_prompt_matches_the_kill_switch(monkeypatch) -> None:
+    """``--prefill-fp8``: ``want`` is false, so the fuse is not taken and y matches ``TENSORFOLD_THOR_SHX_FUSE=0``."""
+
+    from types import SimpleNamespace
+
+    from tensorfold.cuda import prompt_precision
+    from tensorfold.cuda.nvfp4 import thor_dense
+    from tensorfold.families.qwen4_exp.cuda import thor_shx
+    from tensorfold.families.qwen4_exp.cuda.nvfp4_moe import MoE4, _shared
+
+    def tail(x, gu, down, width: int):
+        rows = x.shape[0]
+        top_k = 2
+        ex = SimpleNamespace(shared=SimpleNamespace(gu=gu, down=down), width=width, dims=down.n)
+        buf = SimpleNamespace(act=torch.empty((rows, top_k + 1, width), dtype=torch.bfloat16, device=x.device),
+                              y=torch.empty((rows, top_k + 1, down.n), dtype=torch.bfloat16, device=x.device))
+        prompt = buf.y.dtype != torch.float32
+        thor_dense.S.pad.zero_()
+        if thor_shx.want(ex, x, buf, rows, top_k, prompt):
+            thor_shx.store(_shared(ex.shared.gu, x, prompt, False), width, buf.act[:rows, top_k], rows)
+            buf.y[:rows, top_k] = thor_shx.project(down, rows)
+            taken = True
+        else:
+            buf.act[:rows, top_k] = MoE4.shared_act(ex, x, prompt)
+            buf.y[:rows, top_k] = _shared(down, buf.act[:rows, top_k], prompt, not prompt)
+            taken = False
+        return buf.y[:rows, top_k].contiguous(), buf.act[:rows, top_k].contiguous(), taken, ex, buf
+
+    with prompt_precision.using(True):
+        # K of 64 makes prefill8's scale tensor non-contiguous; 256 is a shape that kernel already runs.
+        for width, hidden, rows in ((256, 256, 1), (256, 256, 6)):
+            gu, down = _mx_pair(width, hidden, seed=width + rows)
+            x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+            with prompt_precision.using(False):
+                _, _, bf16_taken, ex, buf = tail(x, gu, down, width)
+            assert bf16_taken, (width, rows)               # the same fixture fuses on a bf16 prompt
+            assert not thor_shx.want(ex, x, buf, x.shape[0], 2, True)
+            monkeypatch.setenv(thor_shx.ENV, "0")
+            y_off, act_off, off_taken, _, _ = tail(x, gu, down, width)
+            monkeypatch.delenv(thor_shx.ENV, raising=False)
+            assert thor_shx.active()
+            before = thor_shx.S.calls
+            y_on, act_on, on_taken, _, _ = tail(x, gu, down, width)
+            assert not off_taken and not on_taken
+            assert thor_shx.S.calls == before              # the fused kernel did not run
+            assert _bits(y_on, y_off) and _bits(act_on, act_off), (width, rows)
 
 
 @pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
@@ -353,14 +409,16 @@ def test_shx_fuse_keeps_every_rounds_bits(kv_dtype, tmp_path, monkeypatch):
     for name, graphs, fuse in (("eager", False, False), ("off", True, False), ("on", True, True)):
         monkeypatch.setenv(thor_shx.ENV, "1" if fuse else "0")
         assert thor_shx.active() is fuse
-        before = thor_shx.S.calls
+        before, before_replays = thor_shx.S.calls, thor_shx.S.replays
         thor_dense.S.pad.zero_()
         out, rounds, gr = _decode(w, prompts, counts, [None], graphs=graphs, capacity=256, kv_dtype=kv_dtype)
         runs[name] = (out, rounds, gr)
         if fuse:
             assert thor_shx.S.calls > before
+            assert thor_shx.S.replays > before_replays      # graph replays ran the fused tail; a capture alone does not
         else:
             assert thor_shx.S.calls == before
+            assert thor_shx.S.replays == before_replays
     monkeypatch.delenv(thor_shx.ENV, raising=False)
     eager, off, on = runs["eager"], runs["off"], runs["on"]
     assert on[0] == off[0] == eager[0]

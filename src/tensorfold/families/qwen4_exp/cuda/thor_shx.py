@@ -17,7 +17,9 @@ The down GEMM is ``thor_dense.linear``'s ``torch.mm`` on that buffer. No new buf
 already exist, and the GEMM outputs are the ones the graph already captured.
 
 ``TENSORFOLD_THOR_SHX_FUSE=0`` keeps today's kernels. Unset is on for sm_110. MTP buffers (fp32 slots, the lane
-matmul) and a window of PAD rows or more keep today's kernels too.
+matmul), a window of PAD rows or more, and ``--prefill-fp8`` (those prompts stay on ``prefill8``) keep today's
+kernels too. ``stats()["calls"]`` counts tails that ran: eager launches, and each replay of a graph that captured
+them (the capture itself runs nothing).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
+from tensorfold.cuda import prompt_precision
 from tensorfold.cuda.nvfp4 import thor_dense
 
 ENV = "TENSORFOLD_THOR_SHX_FUSE"
@@ -53,19 +56,50 @@ def active(device: int = 0) -> bool:
 
 
 class _State:
-    calls = 0
+    calls = 0       # fused tails that ran: eager launches, plus replays (``add_replays``)
+    replays = 0     # of those, the ones a CUDA-graph replay ran
+    pending = 0     # ``store`` calls recorded in the capture underway (a capture runs nothing)
 
 
 S = _State()
 
 
 def stats() -> dict:
-    return {"on": active(), "calls": S.calls}
+    """``calls``: fused tails that ran (eager launches and graph replays). ``replays``: the replayed ones."""
+
+    return {"on": active(), "calls": S.calls, "replays": S.replays}
+
+
+def begin_capture() -> None:
+    """A CUDA-graph capture is starting. ``store`` during it is recorded, not an execution."""
+
+    S.pending = 0
+
+
+def take_capture() -> int:
+    """How many fused tails the capture that just ended recorded (0 if it recorded none)."""
+
+    n = S.pending
+    S.pending = 0
+    return n
+
+
+def add_replays(n: int) -> None:
+    """``n`` fused tails ran because a graph that captured them replayed."""
+
+    S.replays += n
+    S.calls += n
 
 
 def want(ex, x: torch.Tensor, buf, rows: int, top_k: int, prompt: bool) -> bool:
-    """The thirteen-kernel tail: bf16 slots, both projections on the cuBLAS path, fewer than PAD rows."""
+    """The thirteen-kernel tail: bf16 slots, both projections on the cuBLAS path, fewer than PAD rows.
 
+    ``--prefill-fp8`` is refused here, before any other guard: those runs keep torch's thirteen kernels and
+    ``Mx8Linear.prefill8``. The fused down GEMM is cuBLAS bf16, which does not match that FP8 prompt GEMM.
+    """
+
+    if prompt_precision.fp8():                  # --prefill-fp8: today's prefill8 path. This is the only new check.
+        return False
     if not prompt or rows <= 0 or rows >= thor_dense.PAD or not active(x.device.index or 0):
         return False
     gu, down = ex.shared.gu, ex.shared.down
@@ -106,7 +140,10 @@ def store(g: torch.Tensor, width: int, act_slot: torch.Tensor, rows: int) -> Non
     pad = thor_dense.S.pad[:thor_dense.PAD * width].view(thor_dense.PAD, width)
     _tail[(rows, triton.cdiv(width, BLOCK))](g, g.stride(0), pad, pad.stride(0), act_slot, act_slot.stride(0),
                                               W=width, BLOCK=BLOCK, num_warps=1)
-    S.calls += 1
+    if torch.cuda.is_current_stream_capturing():
+        S.pending += 1                          # recorded; the kernel runs when the graph replays
+    else:
+        S.calls += 1
 
 
 def project(lin, rows: int) -> torch.Tensor:
