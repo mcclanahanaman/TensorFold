@@ -222,3 +222,149 @@ def test_demand_graphs_keep_the_bits_and_charge_the_room(monkeypatch):
         assert sum(gr.missed.values()) == sum(gr.forwards.values()) - sum(gr.replays.values())
         if evict:
             assert gr.evicted > 0 and len(gr.paid) <= 1, (gr.evicted, len(gr.paid))
+
+
+def _bits(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.shape == b.shape and a.dtype == b.dtype and bool(torch.equal(a.view(torch.uint8), b.view(torch.uint8)))
+
+
+def test_shx_tail_matches_torch_and_replays(monkeypatch):
+    """The fused SwiGLU writes the act slot and the cuBLAS pad; the down GEMM's y matches torch's thirteen kernels,
+    on a fresh call and on a CUDA-graph replay."""
+
+    from tensorfold.cuda.nvfp4 import linear as lin_mod
+    from tensorfold.cuda.nvfp4 import thor_dense
+    from tensorfold.families.qwen4_exp.cuda import thor_shx
+
+    if not thor_dense.available():
+        pytest.skip("sm_110 with TENSORFOLD_THOR_DENSE on only")
+    monkeypatch.delenv(thor_shx.ENV, raising=False)
+    assert thor_shx.active()
+    old = (thor_dense.S.pad, thor_dense.S.staging, thor_dense.S.active)
+    thor_dense.S.pad = torch.zeros((thor_dense.PAD * 2560,), dtype=torch.bfloat16, device="cuda")
+    thor_dense.S.staging = torch.empty((1280 * 2560,), dtype=torch.bfloat16, device="cuda")
+    thor_dense.S.active = True
+    try:
+        for width, hidden, rows in ((64, 256, 1), (64, 256, 6), (640, 2560, 2)):
+            gu, down = _mx_pair(width, hidden, seed=width + rows)
+            x = torch.randn(rows, hidden, device="cuda").to(torch.bfloat16)
+            y_off, act_off = _tail_once(x, gu, down, width, fused=False)
+            y_on, act_on = _tail_once(x, gu, down, width, fused=True)
+            assert _bits(y_on, y_off) and _bits(act_on, act_off), (width, rows)
+            _replay_matches(x, gu, down, width, y_off)
+    finally:
+        thor_dense.S.pad, thor_dense.S.staging, thor_dense.S.active = old
+
+
+def _mx_pair(width: int, hidden: int, seed: int):
+    from tensorfold.cuda.nvfp4 import linear as lin_mod
+    from tensorfold.cuda.nvfp4 import thor_dense
+
+    def mx(n, k, salt):
+        g = torch.Generator().manual_seed(seed + salt)
+        codes = (torch.randn(n, k, generator=g) * 64).clamp(-448, 448).to(torch.float8_e4m3fn)
+        scales = torch.randint(110, 132, (n, k // 32), generator=g, dtype=torch.uint8)
+        lin = lin_mod.Mx8Linear.from_checkpoint(codes.cuda(), scales.cuda())
+        lin.thor = True
+        lin.thor_w = thor_dense.dequantize(lin)
+        return lin
+
+    return mx(2 * width, hidden, 1), mx(hidden, width, 2)
+
+
+def _tail_once(x, gu, down, width: int, *, fused: bool):
+    """One shared-expert tail from a zeroed PAD buffer, torch's kernels or the fused ones."""
+
+    from tensorfold.cuda.nvfp4 import thor_dense
+    from tensorfold.families.qwen4_exp.cuda import thor_shx
+
+    rows = x.shape[0]
+    thor_dense.S.pad.zero_()
+    g = thor_dense.linear(x, gu)
+    act = torch.empty((rows, 3, width), dtype=torch.bfloat16, device=x.device)
+    held = torch.empty((rows, 3, down.n), dtype=torch.bfloat16, device=x.device)
+    slot = act[:, 2]
+    if fused:
+        thor_shx.store(g, width, slot, rows)
+        held[:, 2] = thor_shx.project(down, rows)
+    else:
+        gate, up = g[:, :width].to(torch.float32), g[:, width:].to(torch.float32)
+        slot.copy_(((gate / (1.0 + torch.exp(-gate))).to(torch.bfloat16).to(torch.float32) * up).to(torch.bfloat16))
+        held[:, 2] = thor_dense.linear(slot, down)          # the pad copy, then the same cuBLAS GEMM
+    return held[:, 2].contiguous(), slot.contiguous()
+
+
+def _replay_matches(x, gu, down, width: int, reference: torch.Tensor) -> None:
+    from tensorfold.cuda.nvfp4 import thor_dense
+    from tensorfold.families.qwen4_exp.cuda import thor_shx
+
+    rows = x.shape[0]
+    static_x = x.clone()
+    static_act = torch.empty((rows, width), dtype=torch.bfloat16, device=x.device)
+    graph, side = torch.cuda.CUDAGraph(), torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(2):                     # compile, then a second eager pass, before the capture
+            got = thor_dense.linear(static_x, gu)
+            thor_shx.store(got, width, static_act, rows)
+            thor_shx.project(down, rows)
+        thor_dense.S.pad.zero_()
+        graph.capture_begin(pool=torch.cuda.graph_pool_handle(), capture_error_mode="thread_local")
+        try:
+            got = thor_dense.linear(static_x, gu)
+            thor_shx.store(got, width, static_act, rows)
+            y = thor_shx.project(down, rows)
+        finally:
+            graph.capture_end()
+    torch.cuda.current_stream().wait_stream(side)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert _bits(y, reference)
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
+def test_shx_fuse_keeps_every_rounds_bits(kv_dtype, tmp_path, monkeypatch):
+    """Switch on, switch off, and eager: the same tokens and the same logits every round, both KV dtypes."""
+
+    from tensorfold.cuda.nvfp4 import linear as lin_mod
+    from tensorfold.cuda.nvfp4 import thor_dense
+    from tensorfold.families.qwen4_exp.cuda import thor_shx
+    from tensorfold.families.qwen4_exp.cuda.weights import load
+
+    if not thor_dense.available():
+        pytest.skip("sm_110 with TENSORFOLD_THOR_DENSE on only")
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from nvfp4_tiny import write
+
+    w = load(write(tmp_path / "shx", mxfp8=True, ple_nvfp4=True, hidden=512), mtp=True)
+    thor_dense.prepare(w)
+    marked = 0
+    for layer in w.layers:
+        shared = layer.moe.experts.shared
+        for lin in (shared.gu, shared.down):
+            if isinstance(lin, lin_mod.Mx8Linear):
+                lin.thor = True
+                if getattr(lin, "thor_w", None) is None:
+                    lin.thor_w = thor_dense.dequantize(lin)
+                marked += 1
+    assert marked >= 2
+    prompts, counts = [[5, 17, 9, 3, 8, 2]], [20]
+    runs = {}
+    for name, graphs, fuse in (("eager", False, False), ("off", True, False), ("on", True, True)):
+        monkeypatch.setenv(thor_shx.ENV, "1" if fuse else "0")
+        assert thor_shx.active() is fuse
+        before = thor_shx.S.calls
+        thor_dense.S.pad.zero_()
+        out, rounds, gr = _decode(w, prompts, counts, [None], graphs=graphs, capacity=256, kv_dtype=kv_dtype)
+        runs[name] = (out, rounds, gr)
+        if fuse:
+            assert thor_shx.S.calls > before
+        else:
+            assert thor_shx.S.calls == before
+    monkeypatch.delenv(thor_shx.ENV, raising=False)
+    eager, off, on = runs["eager"], runs["off"], runs["on"]
+    assert on[0] == off[0] == eager[0]
+    _same_rounds(on[1], off[1])
+    _same_rounds(on[1], eager[1])
+    assert on[2] is not None and on[2].replays.get("verify", 0) > 0, on[2].replays if on[2] else None
+    assert not on[2].failed and not off[2].failed

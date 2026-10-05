@@ -14,7 +14,7 @@ import torch
 from tensorfold.cuda.nvfp4 import experts as nvx
 from tensorfold.cuda.nvfp4 import thor_experts as thor
 
-from . import nvfp4, thor_glue
+from . import nvfp4, thor_glue, thor_shx
 
 
 @dataclass
@@ -157,6 +157,13 @@ def moe(x: torch.Tensor, xs: torch.Tensor, router_rows: torch.Tensor, ex: MoE4, 
         shared = buf.y.view(-1, ex.dims)[:rows]
         _shared(ex.shared.down, buf.act[:rows, top_k], prompt, False, out=shared)
         buf.kept = thor_glue.Rows(scratch.hidden, scratch.pos, shared, buf.slots)
+        return buf
+    if thor_shx.want(ex, x, buf, rows, top_k, prompt):
+        # kernels 1-12 of the elementwise tail, then the routed down (portable experts), then kernel 13
+        thor_shx.store(_shared(ex.shared.gu, x, prompt, False), ex.width, buf.act[:rows, top_k], rows)
+        if not on_thor:
+            nvx.down(buf.act.view(-1, ex.width), routed, buf.plan, buf.y.view(-1, ex.dims), rows, skip=ex.routed)
+        buf.y[:rows, top_k] = thor_shx.project(ex.shared.down, rows)
         return buf
     buf.act[:rows, top_k] = ex.shared_act(x, prompt)
     if not on_thor:

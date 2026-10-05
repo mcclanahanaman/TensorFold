@@ -174,6 +174,11 @@ class FlashNextEngine:
                      f"dequantized at each call, {held['scratch_bytes'] / 2**20:.0f} MiB of staging")
                   + f" ({thor_dense.ENV}=0 keeps the portable kernels, {thor_dense.WEIGHTS_ENV}=copy|dequant)",
                   flush=True)
+            from . import thor_shx
+
+            print(f"[tensorfold] Thor (sm_110): shared-expert elementwise tail "
+                  + ("one kernel, TensorFold's bits" if thor_shx.active() else "torch's thirteen kernels")
+                  + f" ({thor_shx.ENV}=0 keeps torch's kernels)", flush=True)
         from tensorfold.cuda.kernels import thor_gdn
 
         began = time.perf_counter()                  # Thor, NVFP4 checkpoints: built now, before the caches
