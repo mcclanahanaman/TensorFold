@@ -7,7 +7,7 @@ import traceback
 import uuid
 from typing import TYPE_CHECKING, Any
 
-from tensorfold.cuda import health
+from tensorfold.cuda import capacity_status, health
 from tensorfold.server import anthropic, metrics, responses, token_routes
 from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
 from tensorfold.server.decisions import DecisionError
@@ -38,7 +38,7 @@ def _log_error(exc: BaseException) -> None:
     traceback.print_exception(exc)
 
 
-POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health")
+POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health", "/capacity", "/v1/capacity")
 
 
 def make_handler(app: App):
@@ -53,18 +53,33 @@ def make_handler(app: App):
             if not (self.command == "GET" and self.path.split("?", 1)[0].rstrip("/") in POLLED and code == 200):
                 super().log_request(code, size)
 
-        def _json(self, code: int, payload: dict[str, Any]) -> None:
+        def _json(self, code: int, payload: dict[str, Any], *, retry_after_s: float | None = None) -> None:
             data = json.dumps(payload).encode()
             try:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                if retry_after_s is not None:         # par-1-fix: whole seconds, rounded up, as HTTP's Retry-After is
+                    import math
+                    self.send_header("Retry-After", str(max(1, math.ceil(retry_after_s))))
                 if self.close_connection:                # so a pooling client does not reuse the socket
                     self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(data)
             except (BrokenPipeError, ConnectionResetError):          # the client has gone
                 self.close_connection = True
+
+        def _capacity_json(self, exc: RequestError, field: str | None = None) -> None:
+            """par-1-fix: a RequestError as JSON, 503 + Retry-After + a machine-readable reason for a CapacityError
+            (NoRoom's "memory"/"slots"/"length"; any other CapacityError keeps today's bare 503), 400 otherwise."""
+
+            body = error_body(exc, field)
+            if isinstance(exc, CapacityError):
+                reason = getattr(exc, "reason", None)
+                if reason:
+                    body["reason"] = reason
+                return self._json(503, {"error": body}, retry_after_s=getattr(exc, "retry_after_s", None))
+            return self._json(400, {"error": body})
 
         def _discard_body(self) -> None:
             """Read a refused request's body, so it cannot reach the next request on this connection."""
@@ -93,6 +108,8 @@ def make_handler(app: App):
                                                             for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, health.of(app).snapshot(app))
+            elif self.path.rstrip("/") in ("/v1/capacity", "/capacity"):
+                self._json(200, capacity_status.of(app))
             elif responses.route(self.path):
                 responses.get(self, app, responses.route(self.path))
             else:
@@ -124,7 +141,7 @@ def make_handler(app: App):
                 try:
                     reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)
                 except RequestError as exc:
-                    return self._json(503 if isinstance(exc, CapacityError) else 400, {"error": error_body(exc)})
+                    return self._capacity_json(exc)
                 except Exception as exc:
                     _log_error(exc)
                     return self._json(400, {"error": {"message": _error_message(exc)}})
@@ -133,8 +150,7 @@ def make_handler(app: App):
             try:
                 prepared = app.prepare(body, chat)
             except RequestError as exc:
-                return self._json(503 if isinstance(exc, CapacityError) else 400,
-                                  {"error": error_body(exc, field)})
+                return self._capacity_json(exc, field)
             except Exception as exc:        # any other failure to read the request is refused too, as on MLX
                 _log_error(exc)
                 return self._json(400, {"error": {"message": _error_message(exc)}})
@@ -177,7 +193,10 @@ def make_handler(app: App):
                     self.close_connection = True
                     return
                 except RequestError as exc:
-                    return self._stream_error(error_body(exc, field))
+                    eb = error_body(exc, field)
+                    if isinstance(exc, CapacityError) and getattr(exc, "reason", None):
+                        eb["reason"] = exc.reason          # par-1-fix: a stream can't carry Retry-After as a header
+                    return self._stream_error(eb)
                 except Exception as exc:
                     _log_error(exc)
                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
@@ -214,8 +233,7 @@ def make_handler(app: App):
                 self.close_connection = True
                 return
             except RequestError as exc:
-                return self._json(503 if isinstance(exc, CapacityError) else 400,
-                                  {"error": error_body(exc, field)})
+                return self._capacity_json(exc, field)
             except Exception as exc:
                 _log_error(exc)
                 try:

@@ -4,11 +4,25 @@ from __future__ import annotations
 
 from typing import Callable
 
+from tensorfold.server.errors import CapacityError
+
 from .capacity import cuda_limit_bytes
 
 
-class NoRoom(RuntimeError):
-    """A request that can't start until a live stream finishes and frees its caches."""
+class NoRoom(CapacityError):
+    """A request that can't start until a live stream finishes and frees its caches: HTTP 503, retry shortly.
+
+    par-1-fix (Brendan 2026-10-05, admission control): was ``RuntimeError``. Every existing catch site names
+    ``NoRoom`` explicitly (unaffected); the change is so the many ``isinstance(exc, CapacityError)`` checks already
+    in the HTTP layer (cuda/http.py, server/http.py, server/anthropic.py) map it to 503 with no new code there.
+    ``reason`` is a short machine-readable tag (``"memory"``, ``"slots"`` or ``"length"``) a client or router can
+    key on without parsing the message; ``retry_after_s`` is this gate's own best estimate of a useful wait, or
+    None where no better guess exists than "the usual poll interval" (the caller picks a default)."""
+
+    def __init__(self, message: str, *, reason: str = "memory", retry_after_s: float | None = None) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.retry_after_s = retry_after_s
 
 
 class MemoryGate:
@@ -20,6 +34,33 @@ class MemoryGate:
         self.live = live
         self.pool = pool                 # AGX Thor's wide prompt pieces: the GPU pages a grow takes without reclaim
         self.waits = self.ends = 0
+        self.evicted_kept = 0             # par-1-fix: LRU-evicted kept prefixes, counted so /v1/capacity can report it
+        # par-1-fix: admission reserves a live stream's full worst-case extent (prompt + its declared max tokens,
+        # clamped to the window) for its whole lifetime, not just what it currently holds. Simpler and safe
+        # (never under-reserves) at the cost of some utilisation: a stream that ends up needing less than its
+        # worst case still occupies that much of the ledger until it finishes. This is what lets admission refuse
+        # a new request BEFORE it starts, rather than an already-running one being squeezed later (multi.py
+        # _make_room's kill-the-newest fallback is then unreachable in normal operation: see its docstring).
+        # Ledgered with promise()/unpromise() below (not named reserve()/unreserve(): self.reserve, right above,
+        # is already the margin-bytes int every grow() checks against; the names must not collide with it).
+        self.reserved: dict[int, int] = {}
+
+    @property
+    def reserved_total(self) -> int:
+        return sum(self.reserved.values())
+
+    def admits(self, extra: int) -> bool:
+        """Whether reserving ``extra`` more bytes (a new stream's full worst-case extent) still fits ``room``."""
+
+        return self.reserved_total + int(extra) <= self.room
+
+    def promise(self, key: int, extra: int) -> None:
+        """Ledger ``extra`` bytes against ``key`` (named ``promise``: ``self.reserve`` is already the margin int)."""
+
+        self.reserved[key] = int(extra)
+
+    def unpromise(self, key: int) -> int:
+        return self.reserved.pop(key, 0)
 
     def fits(self, extra: int) -> bool:
         """Whether ``extra`` more bytes can be allocated now (a resize holds its old buffers until the copy lands)."""

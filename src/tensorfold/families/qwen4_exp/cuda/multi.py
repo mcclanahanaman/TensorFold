@@ -115,6 +115,9 @@ class MultiDecoder:
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
         self.slot_bytes = sum(t.numel() * t.element_size() for t in _tensors(self.free[0]))
         self.window_bytes = self.free[0].cache_bytes(capacity)          # one stream's caches at the full window
+        # par-1-fix: a stable reference for cache_bytes(rows)/layer_bytes(rows) math regardless of which slot is
+        # free or busy later (the formula only reads the model's own config, fixed and the same on every slot).
+        self._ref_state = self.free[0]
         free = torch_live(torch, available_bytes) if torch.cuda.is_available() else None
         # the mapped n-gram tables are not held back (they barely fit on a Spark); lookups page from disk instead
         live = free
@@ -207,6 +210,10 @@ class MultiDecoder:
                 self._shrink(st)
                 if all(f is not st for f in self.free):
                     self.free.append(st)
+                gate = getattr(self, "memory_gate", None)    # some tests build a decoder with no gate at all
+                if gate is not None:
+                    gate.evicted_kept = getattr(gate, "evicted_kept", 0) + 1  # par-1-fix: so a client can tell its
+                    # next turn on this prefix will be cold
                 return True
         return False
 
@@ -275,29 +282,51 @@ class MultiDecoder:
 
         room = self.capacity - len(s.prompt) - self.depth - 1
         if room < 1:
+            # too long for ANY configuration, not a transient capacity refusal: stays a plain refusal (OpenAI's
+            # context_length_exceeded, via refusal()/ContextLengthError elsewhere), not NoRoom/503.
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.capacity}-token context")
         s.count = max(1, min(s.count, room))
         if any(x.waiting for x in self.streams.values()):
-            raise NoRoom("streams already wait for memory; a new request waits until one finishes")
-        t0 = time.perf_counter()
-        st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            raise NoRoom("streams already wait for memory; a new request waits until one finishes", reason="memory")
+        # par-1-fix admission control: reserve this stream's full worst-case extent (its prompt plus its declared
+        # max tokens, clamped to the window) before touching a slot, so a later request cannot squeeze a stream
+        # already promised that room (see MemoryGate.reserved's docstring). Freed in finish()/drop(). ``_ref_state``
+        # is set by __init__; a hand-built decoder in a test (MultiDecoder.__new__, __init__ skipped) does not have
+        # it, and skips this reservation layer too, unchanged from before this feature existed.
+        ref = getattr(self, "_ref_state", None)
+        if ref is not None:
+            worst_case = ref.cache_bytes(min(self.capacity, len(s.prompt) + s.count))
+            if not self.memory_gate.admits(worst_case):
+                raise NoRoom(
+                    f"accepting a {len(s.prompt)}-token prompt (up to {s.count} reply tokens) would need more cache "
+                    f"room than this server's budget allows with its other live and reserved sessions; retry "
+                    "shortly, or after an in-flight session finishes", reason="memory", retry_after_s=5.0)
+            self.memory_gate.promise(id(s), worst_case)
         try:
-            if not self._grow(st, len(s.prompt) + self.depth + 2, alone=not self.streams and not self.filling):
-                raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes")
-        except NoRoom:
-            if resume is None:
+            t0 = time.perf_counter()
+            st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            try:
+                if not self._grow(st, len(s.prompt) + self.depth + 2, alone=not self.streams and not self.filling):
+                    raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes",
+                                reason="memory")
+            except NoRoom:
+                if resume is None:
+                    self.free.append(st)
+                else:                                        # the kept prompt end stays kept
+                    self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
+                raise
+            e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
+            mtp = s.draft and self.depth > 0 and self.mbuf is not None
+            try:
+                begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
+                image_rows.begin(e, s, self.vision)
+            except Exception:
+                self._drop_kept(st)
                 self.free.append(st)
-            else:                                        # the kept prompt end stays kept
-                self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
-            raise
-        e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
-        mtp = s.draft and self.depth > 0 and self.mbuf is not None
-        try:
-            begin = prefill_begin(e, s.prompt, mtp=mtp, resume=resume)
-            image_rows.begin(e, s, self.vision)
+                raise
         except Exception:
-            self._drop_kept(st)
-            self.free.append(st)
+            if ref is not None:                # the reservation above was only made when ref was not None either
+                self.memory_gate.unpromise(id(s))
             raise
         e.stops = (thor_gdn.stops(self.points(s.prompt), begin + MIN_GAP, entry_end(s.prompt)) if thor_gdn.use() else
                    sorted({p for p in self.points(s.prompt) if begin + MIN_GAP <= p < entry_end(s.prompt)})) \
@@ -715,7 +744,10 @@ class MultiDecoder:
     def finish(self, done: list[Stream]) -> None:
         """Drop finished streams; a slot whose prompt state is kept stays with it, the rest are free again."""
 
+        gate = getattr(self, "memory_gate", None)
         for s in done:
+            if gate is not None:
+                gate.unpromise(id(s))      # par-1-fix: its admission reservation, freed once and for all
             self.streams.pop(s.sid, None)
             if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
                 self._shrink(s.st)
@@ -724,7 +756,10 @@ class MultiDecoder:
     def drop(self) -> list[Stream]:
         live = [s for s in self.streams.values() if not s.done] + self.filling
         self.filling, self.fills = [], {}
+        gate = getattr(self, "memory_gate", None)
         for s in live:
+            if gate is not None:
+                gate.unpromise(id(s))      # par-1-fix: as finish(), for the streams a dead server drops
             self.streams.pop(s.sid, None)
             self.held.pop(s.sid, None)
             self._drop_kept(s.st)

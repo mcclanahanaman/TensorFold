@@ -6,6 +6,7 @@ The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
 | --- | --- |
 | `GET /v1/models` | Served model ID; MLX also lists configured aliases |
 | `GET /health` | Server health and available status information |
+| `GET /v1/capacity`, `GET /capacity` | Live admission state (CUDA, `--parallel`): streams, cache room, kept sessions, overloaded |
 | `GET /metrics`, `GET /v1/metrics` | Prometheus text: requests, KV occupancy, drafts and latency (both servers) |
 | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
 | `POST /v1/completions` | Raw text without a chat template, or token IDs |
@@ -230,6 +231,41 @@ with a smaller `--context` or `--parallel`. `TENSORFOLD_MEMORY_RESERVE_GIB` repl
 when you know the machine's headroom: a larger one leaves more for other work, a smaller one more for KV caches. The
 reserve also carries CUDA context, NCCL and workspace memory the estimate does not count, and exhausting a unified
 GPU's memory can freeze the host, so lower it only with room to spare.
+
+## Capacity and admission
+
+On CUDA's `--parallel` decoder, a request that cannot be admitted because the server's cache room is already
+promised to other live or reserved sessions is refused with HTTP 503, `Retry-After` (seconds, an integer, rounded
+up), and an `error` object whose `reason` is a short machine-readable tag: `"memory"` (cache room) or `"slots"`
+(every `--parallel` seat is in use; today only `"memory"` is raised, `"slots"` is reserved for a future admission
+check on seat count alone). This is a transient, worth-a-retry refusal, unlike a 400 (the request itself is
+invalid, such as `context_length_exceeded`, whose `reason` field is not set: retrying it unchanged never helps).
+A non-streamed request gets the `Retry-After` header; a request that asked to stream gets the same `error` object
+(with `reason`) as its stream's error event, since a header cannot follow an already-open stream. Admission never
+ends an already-admitted, already-decoding request to make room for a new one: a later request that would need
+more cache than is free is refused or waits (if another live request is expected to finish and free it) instead,
+so a stream already underway is not cut off mid-reply once it starts.
+
+`GET /v1/capacity` (CUDA, `--parallel` decoder only; `GET /capacity` answers the same) reports that same admission
+state for a client or a router to read before sending, so it can back off before the server would have to refuse:
+
+| Field | Meaning |
+| --- | --- |
+| `ok` | `false` only when this engine has no concurrent decoder to report on (a different backend/family) |
+| `live_streams`, `prefilling_streams`, `max_streams` | Requests decoding, requests still prefilling, and the `--parallel` seat count |
+| `context_window_tokens` | The served context window |
+| `reserved_bytes`, `held_bytes`, `room_bytes` | Cache bytes promised to live/admitted sessions, actually allocated now, and the total budget for growing caches |
+| `free_cache_bytes` | `room_bytes` minus `reserved_bytes`: budget still free to promise to a new request |
+| `free_cache_tokens_estimate`, `largest_admissible_prompt_tokens_estimate` | `free_cache_bytes` converted through this model's bytes-per-token-at-full-window figure; a planning estimate, not an exact count, and the second is clamped to `context_window_tokens` |
+| `kept_sessions` | `[{"tokens": N}, ...]`, one entry per idle kept prompt prefix, sizes only (no content) |
+| `kept_sessions_total_tokens` | Sum of `kept_sessions[].tokens` |
+| `evicted_kept_sessions_total` | Count of kept prefixes freed (LRU) to make room since startup: a client whose own prefix was among them sees its next turn run cold, uncounted per-session |
+| `waits_total`, `ended_total` | Counts of a live stream pausing for room, and (today, never for an already-admitted stream: see above) one ending for it |
+| `memavailable_mib`, `pool_headroom_mib` | The host's live `MemAvailable`, and the allocator's own quick-reuse headroom (`null` off a unified-memory GPU or without AGX Thor's wide-piece pool guard) |
+| `overloaded` | `true` when every seat is live or `free_cache_bytes` is 0: a new request is likely to wait or be refused |
+
+Every byte field is bytes (not MiB) except `memavailable_mib`/`pool_headroom_mib`, named for their unit. The
+numbers can be a round old (read without locking, as `/health`'s), which is fine for a capacity check.
 
 ## Responses
 
