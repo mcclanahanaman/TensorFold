@@ -50,7 +50,8 @@ class S:
     ahead = False                  # the next window's known rows gathered while the MTP steps run (set at load)
     tables = None                  # Step/Tables from numpy with kept pointers (decided at first use)
     check = False                  # diagnostics: reused ids and fast pointers checked against the earlier path
-    stats = {"windows": 0, "reused": 0, "tokens": 0, "missed": 0, "mismatch": 0, "ptr_checks": 0, "ptr_mismatch": 0}
+    stats = {"windows": 0, "reused": 0, "tokens": 0, "missed": 0, "mismatch": 0, "ptr_checks": 0, "ptr_mismatch": 0,
+              "ptr_mismatch_attn": 0, "ptr_mismatch_gdn": 0}  # diagnostics only (par-1-fix): which table desynced
 
 
 def _on(name: str, default: str = "1") -> bool:
@@ -287,9 +288,18 @@ def to_dev(values: np.ndarray, dtype: torch.dtype, device) -> torch.Tensor:
 
 def attn_ptrs(st, layers) -> np.ndarray:
     """A stream's attention cache pointers [layers, 6] (keys, values, key scales, value scales, index keys, pooled),
-    kept on its state until the caches move (``State.resize`` sets a new capacity; a clone has its own lists)."""
+    kept on its state until the caches move (``State.resize`` sets a new capacity; a clone has its own lists).
 
-    key = (st.capacity, id(st.kc), id(st.ikc), id(st.pooled), len(layers), st.kc[0].k.data_ptr() if st.kc else 0)
+    The key uses ``st.version`` (``State.resize`` increments it; its own docstring: "a graph's pointer table
+    refreshes on a change"), not a sampled pointer. With 8 concurrent streams sharing one caching allocator, a
+    resize's freed block for one layer can be handed straight back by the allocator while a sibling layer's block
+    goes to a different, concurrently-resizing stream (and vice versa): a key that samples only ``kc[0]``'s address
+    can then match by coincidence while other layers' pointers have actually moved, serving a stale table (par-1-fix:
+    measured 31/802 stale tables with TENSORFOLD_THOR_DEC2_CHECK=1 on a 92160-context 8-stream soak, all ``attn``,
+    0 ``gdn``; ``gdn_ptrs`` has no cache to go stale). ``version`` is a monotonic per-state counter, so it cannot
+    repeat by allocator coincidence."""
+
+    key = (st.capacity, id(st.kc), id(st.ikc), id(st.pooled), len(layers), st.version)
     kept = getattr(st, "dec2_ptrs", None)
     if kept is not None and kept[0] == key:
         return kept[1]
@@ -313,11 +323,14 @@ def gdn_ptrs(st, lin: int) -> np.ndarray:
                      rec.data_ptr() + (cur * rec.stride(0) + li * rec.stride(1)) * rec.element_size()])
 
 
-def same(fast: np.ndarray, slow: np.ndarray) -> np.ndarray:
-    """Diagnostics: a fast pointer table checked against the earlier one (which is used on a mismatch)."""
+def same(fast: np.ndarray, slow: np.ndarray, kind: str = "") -> np.ndarray:
+    """Diagnostics: a fast pointer table checked against the earlier one (which is used on a mismatch); ``kind``
+    (``"attn"`` or ``"gdn"``, par-1-fix) breaks the mismatch count down by which table desynced."""
 
     S.stats["ptr_checks"] += 1
     if fast.shape != slow.shape or not np.array_equal(fast, slow):
         S.stats["ptr_mismatch"] += 1
+        if kind:
+            S.stats[f"ptr_mismatch_{kind}"] = S.stats.get(f"ptr_mismatch_{kind}", 0) + 1
         return slow
     return fast

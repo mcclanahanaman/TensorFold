@@ -57,7 +57,7 @@ class Tables:
                     ptrs[0, li, s] = st.conv[li].data_ptr()
                     ptrs[1, li, s] = st.rec[st.cur[li], li].data_ptr()
             if kept is not None:
-                ptrs = thor_dec2.same(kept, ptrs)
+                ptrs = thor_dec2.same(kept, ptrs, "gdn")
         else:
             ptrs = kept
         dev = w.device

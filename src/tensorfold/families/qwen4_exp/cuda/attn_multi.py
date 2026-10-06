@@ -111,7 +111,7 @@ class Step:
                     ptrs[i, :, s] = [kc.k.data_ptr(), kc.v.data_ptr(), kc.ks.data_ptr(), kc.vs.data_ptr(),
                                      ikc.data_ptr(), pooled.data_ptr()]
             if kept is not None:
-                ptrs = thor_dec2.same(kept, ptrs)
+                ptrs = thor_dec2.same(kept, ptrs, "attn")
         else:
             ptrs = kept
         dev = w.device
