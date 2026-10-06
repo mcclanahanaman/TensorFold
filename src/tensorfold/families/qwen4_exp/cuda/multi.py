@@ -34,6 +34,41 @@ PASS_MIN = 128                   # the fewest prompt rows a round's pass takes
 FILL_GUARD = 8                   # a prompt passed over this many passes takes the next one (no starvation), as on Macs
 
 
+def _mapped_tables(w) -> int:
+    """Bytes of every layer's mapped n-gram table (0 without PLE): host memory, not charged to the CUDA budget."""
+
+    return sum(layer.ple.table.nbytes for layer in w.layers if layer.ple is not None)
+
+
+def _table_aware_pool(torch, base_pool, mapped: int):
+    """``base_pool`` (``driver_pool``'s own freed-page signal), or true MemAvailable headroom past the mapped
+    n-gram tables when that is larger (par-1-fix).
+
+    ROWS-2's own gate (T-033/T-034, r22) validated ``driver_pool`` at ``--parallel 4`` with no vision and no
+    mapped table: there, ``KReclaimable - SReclaimable`` plus torch's own cushion tracked real pressure, because
+    there was nothing else to subtract. A vision-capable, 8-stream recipe with a 26.8 GiB mapped table keeps that
+    cushion structurally small (``_grow`` calls ``empty_cache()`` right after this check, by design) regardless of
+    true room: measured on Thor (par1fix-verify-b, ``[thor-mem]`` probes during an 80k prompt_reuse growth),
+    ``pool_mib`` sat at 0.9-1.7 GiB while ``memavail_mib`` stayed at 29-31 GiB the whole time, so ``short()`` fired
+    on nearly every qualifying grow and evicted a wanted kept prefix instead of an idle one (80k turns 2% cached
+    instead of 99%+). Past that true margin, a low ``base_pool`` reading is reported as a protective "short" only
+    when it is NOT a false alarm, i.e. only when MemAvailable minus the table is ALSO tight: both signals track
+    the same underlying pressure, so neither usually reads healthy while the other reads truly short. ``base_pool``
+    alone decides where there is no mapped table (``mapped == 0``) or on a non-unified GPU (``page_room`` is None),
+    which keeps ROWS-2's own gate exactly reproduced there."""
+
+    from tensorfold.cuda.capacity import page_room
+
+    def pool() -> int:
+        base = base_pool()
+        if not mapped:
+            return base
+        room = page_room(torch)
+        return base if room is None else max(base, room - mapped)
+
+    return pool
+
+
 def _slot(w, st: State, buf: Buffers, mbuf: Buffers, pbuf: Buffers, capacity: int, prefill_rows: int) -> Engine:
     """A one-sequence engine over a slot's state and the shared buffers (eager: no CUDA graphs)."""
 
@@ -86,7 +121,7 @@ class MultiDecoder:
         self.memory_gate = MemoryGate(live() if live is not None else 1 << 62,
                                       reserve=max(2 * GIB, workspace_bytes), live=live)
         if torch.cuda.is_available() and keeps_pool(prefill_rows, torch.cuda.get_device_capability()):
-            self.memory_gate.pool = driver_pool(torch)
+            self.memory_gate.pool = _table_aware_pool(torch, driver_pool(torch), _mapped_tables(w))
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
         self.fills: dict[int, list] = {}                 # stream id -> [its engine, drafts?, next row, kept state]

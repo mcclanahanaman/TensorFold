@@ -630,6 +630,9 @@ def _mem_emit(tag: str) -> None:
             "rss_mib": {k: round(v / 1024, 1) for k, v in own.items()},
             "room_mib": round(gate.room / MIB, 1) if gate is not None else None,
             "held_mib": round(gate.held / MIB, 1) if gate is not None else None,
+            # par-1-fix diagnostics: the pool-guard's own live signal (MemoryGate.pool, e.g. driver_pool), beside
+            # memavail_mib, to see whether short() is reading real pressure or a noisy proxy.
+            "pool_mib": round(gate.pool() / MIB, 1) if gate is not None and gate.pool is not None else None,
             "kept": len(getattr(dec, "kept", ())), "streams": len(getattr(dec, "streams", ())),
             "graphs": len(dec.graphs.graphs) if getattr(dec, "graphs", None) is not None else 0})
     except Exception as exc:                        # diagnostics never break serving

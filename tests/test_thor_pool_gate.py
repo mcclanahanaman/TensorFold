@@ -106,3 +106,56 @@ def test_the_growing_and_protected_slots_are_never_freed(allocations):  # noqa: 
     assert dec._grow(grower, 9000, protect=guarded) and grower.capacity == 16384
     assert [k[1] for k in dec.kept] == [grower, guarded]               # the others went, oldest first
     assert slots[0].capacity == 256 and slots[3].capacity == 256
+
+
+# par-1-fix: driver_pool's own reading can be structurally small (torch's own emptied cushion, by design of the
+# empty_cache() right after this check) on a vision-capable, 8-stream, large-n-gram-table recipe, regardless of
+# true headroom (measured on Thor: pool_mib 0.9-1.7 GiB while memavail_mib stayed 29-31 GiB for the whole 80k
+# prompt_reuse growth): short() then fired on nearly every qualifying grow and evicted a wanted kept prefix instead
+# of an idle one (80k turns fell from 99%+ cached to 2%). _table_aware_pool adds the one signal driver_pool cannot
+# see without it: true MemAvailable past the mapped table's own bytes.
+
+def test_mapped_tables_sums_every_ple_layers_table_nbytes():
+    multi = importlib.import_module("tensorfold.families.qwen4_exp.cuda.multi")
+    layers = [SimpleNamespace(ple=None),
+              SimpleNamespace(ple=SimpleNamespace(table=SimpleNamespace(nbytes=5 * GIB))),
+              SimpleNamespace(ple=SimpleNamespace(table=SimpleNamespace(nbytes=3 * GIB)))]
+    assert multi._mapped_tables(SimpleNamespace(layers=layers)) == 8 * GIB
+
+
+def test_mapped_tables_is_zero_without_ple():
+    multi = importlib.import_module("tensorfold.families.qwen4_exp.cuda.multi")
+    w = SimpleNamespace(layers=[SimpleNamespace(ple=None), SimpleNamespace(ple=None)])
+    assert multi._mapped_tables(w) == 0
+
+
+def test_table_aware_pool_keeps_driver_pool_without_a_mapped_table():
+    multi = importlib.import_module("tensorfold.families.qwen4_exp.cuda.multi")
+    pool = multi._table_aware_pool(SimpleNamespace(), lambda: 7, 0)    # torch is never touched: mapped == 0
+    assert pool() == 7
+
+
+def test_table_aware_pool_keeps_driver_pool_off_a_unified_gpu(monkeypatch):
+    multi = importlib.import_module("tensorfold.families.qwen4_exp.cuda.multi")
+    capacity = importlib.import_module("tensorfold.cuda.capacity")
+    monkeypatch.setattr(capacity, "page_room", lambda torch: None)     # a discrete GPU: no page cache to share
+    pool = multi._table_aware_pool(SimpleNamespace(), lambda: 7, 5 * GIB)
+    assert pool() == 7
+
+
+def test_table_aware_pool_uses_memavailable_past_the_table_when_that_is_larger(monkeypatch):
+    multi = importlib.import_module("tensorfold.families.qwen4_exp.cuda.multi")
+    capacity = importlib.import_module("tensorfold.cuda.capacity")
+    monkeypatch.setattr(capacity, "page_room", lambda torch: 30 * GIB)
+    pool = multi._table_aware_pool(SimpleNamespace(), lambda: GIB, 27 * GIB)
+    assert pool() == 3 * GIB                                           # 30 - 27, not driver_pool's 1 GiB reading
+
+
+def test_table_aware_pool_still_reports_short_when_both_signals_are_tight(monkeypatch):
+    """ROWS-2's own scenario, reproduced: real pressure shows up in both signals, so the guard still protects."""
+
+    multi = importlib.import_module("tensorfold.families.qwen4_exp.cuda.multi")
+    capacity = importlib.import_module("tensorfold.cuda.capacity")
+    monkeypatch.setattr(capacity, "page_room", lambda torch: 27.2 * GIB)
+    pool = multi._table_aware_pool(SimpleNamespace(), lambda: 0.15 * GIB, 27 * GIB)
+    assert abs(pool() - 0.2 * GIB) < 1024                               # max(0.15, 0.2) GiB: still a tight reading
