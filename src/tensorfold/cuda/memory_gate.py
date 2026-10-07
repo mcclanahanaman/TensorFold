@@ -54,9 +54,10 @@ class MemoryGate:
         return sum(self.reserved.values())
 
     def admits(self, extra: int) -> bool:
-        """Whether reserving ``extra`` more bytes (a new stream's full worst-case extent) still fits ``room``."""
+        """Whether reserving ``extra`` more bytes (a new stream's full worst-case extent) still fits ``room`` (a pool's
+        less its reserve, which every grow keeps free: then an admitted stream always grows to its worst case)."""
 
-        return self.reserved_total + int(extra) <= self.room
+        return self.reserved_total + int(extra) <= self.room - (self.reserve if self.pooled else 0)
 
     def promise(self, key: int, extra: int) -> None:
         """Ledger ``extra`` bytes against ``key`` (named ``promise``: ``self.reserve`` is already the margin int)."""

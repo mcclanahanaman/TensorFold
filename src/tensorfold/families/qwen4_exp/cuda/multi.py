@@ -288,6 +288,13 @@ class MultiDecoder:
         return st.rec[0].numel() * st.rec.element_size() + st.conv.numel() * st.conv.element_size() + \
             st.ple_tail.numel() * st.ple_tail.element_size()
 
+    def _worst(self, ref: State, prompt: int, count: int) -> int:
+        """A request's worst case: its caches at the step its prompt and reply reach (and the drafts' rows), with one
+        layer's old buffers during the last grow's copy."""
+
+        rows = min(self.capacity, -(-(prompt + count + self.depth + 2) // STEP) * STEP)
+        return ref.cache_bytes(rows) + ref.layer_bytes(rows)
+
     def room_tokens(self) -> int:
         """The most prompt plus reply tokens one request's caches hold within the gate's whole room."""
 
@@ -297,7 +304,7 @@ class MultiDecoder:
         low, high = 0, self.capacity
         while low < high:
             mid = (low + high + 1) // 2
-            if ref.cache_bytes(mid) <= room:
+            if self._worst(ref, mid, 0) <= room:
                 low = mid
             else:
                 high = mid - 1
@@ -371,7 +378,7 @@ class MultiDecoder:
         best = prefixes._best(list(self.kept), list(prompt))
         out["cached_tokens"] = len(best[0]) if best is not None else 0
         ref, gate = getattr(self, "_ref_state", None), self.memory_gate
-        need = ref.cache_bytes(min(self.capacity, len(prompt) + count)) if ref is not None else 0
+        need = self._worst(ref, len(prompt), count) if ref is not None else 0
         out["need_bytes"] = need
         if need > gate.room:
             out["reason"] = "length"
@@ -416,7 +423,7 @@ class MultiDecoder:
         # it, and skips this reservation layer too, unchanged from before this feature existed.
         ref = getattr(self, "_ref_state", None)
         if ref is not None:
-            worst_case = ref.cache_bytes(min(self.capacity, len(s.prompt) + s.count))
+            worst_case = self._worst(ref, len(s.prompt), s.count)
             if worst_case > self.memory_gate.room:       # past the whole room: no wait would make it fit
                 raise ContextLengthError(self._too_long(len(s.prompt), s.count))
             if not self.memory_gate.admits(worst_case):

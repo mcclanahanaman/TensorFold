@@ -103,12 +103,13 @@ def test_a_request_past_the_whole_room_is_refused_as_too_long_not_held(allocatio
     errors = importlib.import_module("tensorfold.server.errors")
     dec = decoder(multi, state, torch, room=0)
     dec.capacity, dec.slots = 65536, 8
-    dec._ref_state = state.State(weights(), 256, 4, "bf16", limit=65536)
-    dec.memory_gate.room = dec._ref_state.cache_bytes(20000)
-    with pytest.raises(errors.ContextLengthError, match=r"maximum context length is 2\d{4} tokens") as exc:
-        dec.admit(SimpleNamespace(prompt=[1] * 15000, count=8000, draft=False, vision=None))
+    ref = dec._ref_state = state.State(weights(), 256, 4, "bf16", limit=65536)
+    dec.memory_gate.room = dec._worst(ref, 20000, 0)                   # 24,576 rows' caches and one layer's copy
+    assert dec.room_tokens() == 24576 - dec.depth - 2
+    with pytest.raises(errors.ContextLengthError, match=r"maximum context length is 24571 tokens") as exc:
+        dec.admit(SimpleNamespace(prompt=[1] * 20000, count=8000, draft=False, vision=None))
     assert "Shorten the prompt or max_tokens" in str(exc.value)
-    assert dec.memory_gate.reserved_total == 0 and dec.room_tokens() >= 20000
+    assert dec.memory_gate.reserved_total == 0
 
 
 def test_preview_names_why_a_request_would_not_start_now(allocations):  # noqa: F811
@@ -116,15 +117,16 @@ def test_preview_names_why_a_request_would_not_start_now(allocations):  # noqa: 
     dec = decoder(multi, state, torch, room=0)
     dec.capacity, dec.slots = 65536, 8
     ref = dec._ref_state = state.State(weights(), 256, 4, "bf16", limit=65536)
-    dec.memory_gate.room = ref.cache_bytes(30000)
+    dec.memory_gate.room = dec._worst(ref, 30000, 0)
     slots = kept_slots(dec, state, 1)
     prompt = [1] * 10 + [4] * 90
     ok = dec.preview(prompt, 50)
     assert ok["admissible_now"] and ok["cached_tokens"] == 10 and ok["prompt_tokens"] == 100 and ok["reason"] is None
-    assert ok["need_bytes"] == ref.cache_bytes(150) and ok["max_tokens"] == 50
+    assert ok["need_bytes"] == dec._worst(ref, 100, 50) == ref.cache_bytes(8192) + ref.layer_bytes(8192)
+    assert ok["max_tokens"] == 50
     assert dec.preview([1] * 65534, 50)["reason"] == "length"                     # the window
     assert dec.preview([1] * 25000, 9000)["reason"] == "length"                   # the whole room
-    dec.memory_gate.promise(1, ref.cache_bytes(29950))
+    dec.memory_gate.promise(1, dec.memory_gate.room - ok["need_bytes"] + 1)
     assert dec.preview(prompt, 50)["reason"] == "memory"
     dec.memory_gate.unpromise(1)
     dec.streams = {i: SimpleNamespace(st=slots[0], waiting=False) for i in range(8)}
@@ -217,3 +219,10 @@ def test_capacity_preview_route_renders_the_body_and_skips_images(allocations): 
     img = {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:x"}}]}]}
     code, body = cap.preview(app, img)
     assert code == 200 and body["previewed"] is False
+
+
+def test_a_pooled_gate_admits_only_what_still_grows_past_its_reserve():
+    gate = importlib.import_module("tensorfold.cuda.memory_gate").MemoryGate(10 * GIB, reserve=GIB)
+    assert gate.admits(10 * GIB)                                       # the earlier path: the whole room
+    gate.pooled = True
+    assert gate.admits(9 * GIB) and not gate.admits(9 * GIB + 1)
