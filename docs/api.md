@@ -234,38 +234,58 @@ GPU's memory can freeze the host, so lower it only with room to spare.
 
 ## Capacity and admission
 
-On CUDA's `--parallel` decoder, a request that cannot be admitted because the server's cache room is already
-promised to other live or reserved sessions is refused with HTTP 503, `Retry-After` (seconds, an integer, rounded
-up), and an `error` object whose `reason` is a short machine-readable tag: `"memory"` (cache room) or `"slots"`
-(every `--parallel` seat is in use; today only `"memory"` is raised, `"slots"` is reserved for a future admission
-check on seat count alone). This is a transient, worth-a-retry refusal, unlike a 400 (the request itself is
-invalid, such as `context_length_exceeded`, whose `reason` field is not set: retrying it unchanged never helps).
-A non-streamed request gets the `Retry-After` header; a request that asked to stream gets the same `error` object
-(with `reason`) as its stream's error event, since a header cannot follow an already-open stream. Admission never
-ends an already-admitted, already-decoding request to make room for a new one: a later request that would need
-more cache than is free is refused or waits (if another live request is expected to finish and free it) instead,
-so a stream already underway is not cut off mid-reply once it starts.
+On CUDA's `--parallel` decoder every admitted request is promised its worst case: its caches at the 8,192-row step
+its prompt, its `max_tokens` and the drafts' rows reach, plus one layer's buffers for the last grow's copy. Admission
+never ends an already-admitted, already-decoding request to make room for a new one. A request whose worst case does
+not fit what the live requests' promises leave waits in the server's queue, first in line, until a live request
+finishes; one whose worst case exceeds the whole cache room, so that no wait would ever make it fit, is refused at
+once with HTTP 400 `context_length_exceeded` and OpenAI's wording ("This server's maximum context length is N
+tokens ..."), naming the largest prompt-plus-reply this server's memory holds for one request. A transient refusal
+is HTTP 503 with `Retry-After` (seconds, an integer, rounded up) and an `error` object whose `reason` is a short
+machine-readable tag: `"memory"` (cache room) or `"slots"` (every `--parallel` seat is in use). A non-streamed
+request gets the `Retry-After` header; a request that asked to stream gets the same `error` object (with `reason`)
+as its stream's error event, since a header cannot follow an already-open stream.
 
-`GET /v1/capacity` (CUDA, `--parallel` decoder only; `GET /capacity` answers the same) reports that same admission
-state for a client or a router to read before sending, so it can back off before the server would have to refuse:
+Kept conversations (each slot's chain of resume points: a prompt's end, a message start) live in whatever room the
+live requests leave. When a grow needs room, a new request needs a slot, or the kept points pass their cap, the
+least recently used idle conversation goes first (a slot's last use is when a request last started, finished or was
+previewed on it), and a conversation's inner points go before any conversation's longest point. A prompt that
+matches only a shared point inside another conversation's chain (the same system prompt) copies that point into a
+slot of its own rather than taking the other conversation's. Every conversation freed is counted, by cause.
+
+`GET /v1/capacity` (CUDA, `--parallel` decoder only; `GET /capacity` answers the same) reports that state for a
+client or a router to read before sending, so it can back off before the server would have to refuse:
 
 | Field | Meaning |
 | --- | --- |
 | `ok` | `false` only when this engine has no concurrent decoder to report on (a different backend/family) |
 | `live_streams`, `prefilling_streams`, `max_streams` | Requests decoding, requests still prefilling, and the `--parallel` seat count |
 | `context_window_tokens` | The served context window |
-| `reserved_bytes`, `held_bytes`, `room_bytes` | Cache bytes promised to live/admitted sessions, actually allocated now, and the total budget for growing caches |
-| `free_cache_bytes` | `room_bytes` minus `reserved_bytes`: budget still free to promise to a new request |
-| `free_cache_tokens_estimate`, `largest_admissible_prompt_tokens_estimate` | `free_cache_bytes` converted through this model's bytes-per-token-at-full-window figure; a planning estimate, not an exact count, and the second is clamped to `context_window_tokens` |
-| `kept_sessions` | `[{"tokens": N}, ...]`, one entry per idle kept prompt prefix, sizes only (no content) |
-| `kept_sessions_total_tokens` | Sum of `kept_sessions[].tokens` |
-| `evicted_kept_sessions_total` | Count of kept prefixes freed (LRU) to make room since startup: a client whose own prefix was among them sees its next turn run cold, uncounted per-session |
-| `waits_total`, `ended_total` | Counts of a live stream pausing for room, and (today, never for an already-admitted stream: see above) one ending for it |
-| `memavailable_mib`, `pool_headroom_mib` | The host's live `MemAvailable`, and the allocator's own quick-reuse headroom (`null` off a unified-memory GPU or without AGX Thor's wide-piece pool guard) |
-| `overloaded` | `true` when every seat is live or `free_cache_bytes` is 0: a new request is likely to wait or be refused |
+| `reserved_bytes`, `held_bytes`, `room_bytes` | Cache bytes promised to admitted requests, allocated now (live and kept), and the total room for growing caches |
+| `free_cache_bytes` | `room_bytes` minus `reserved_bytes`: room still free to promise to a new request (kept conversations give way) |
+| `free_cache_tokens_estimate`, `largest_admissible_prompt_tokens_estimate` | `free_cache_bytes` in tokens at this model's bytes per token at the full window; a planning estimate, the second capped by `largest_request_tokens` |
+| `largest_request_tokens` | The most prompt-plus-reply tokens one request's caches can ever hold in `room_bytes` (the window, or less when memory is smaller) |
+| `kept_sessions` | One entry per kept conversation: `tokens` (its longest point), `points`, `bytes` (its caches), `idle_s` (seconds since its last use, `null` if never used) and `busy` (a live request holds it); sizes only, no content |
+| `kept_sessions_total_tokens`, `kept_bytes` | Sums over `kept_sessions` |
+| `evicted_kept_sessions_total`, `evicted_kept_by` | Kept conversations freed since startup, and by cause: `memory` (a grow's room), `slots` (a request's slot), `entries` (past the kept points' cap) |
+| `waits_total`, `ended_total` | Counts of a live stream pausing for room, and of one ending for it (never an admitted stream: see above) |
+| `pooled`, `pool_bytes` | Whether the caches come from one pool reserved at load (Jetson AGX Thor), and its size |
+| `memavailable_mib`, `pool_headroom_mib` | The host's `MemAvailable`, and the wide-piece guard's driver headroom (`null` without that guard) |
+| `overloaded` | `true` when every seat is live or `free_cache_bytes` is 0: a new request is likely to wait |
 
-Every byte field is bytes (not MiB) except `memavailable_mib`/`pool_headroom_mib`, named for their unit. The
-numbers can be a round old (read without locking, as `/health`'s), which is fine for a capacity check.
+`POST /v1/capacity` (and `/capacity`) with a request body, the one a client is about to send to
+`/v1/chat/completions` (`messages`) or `/v1/completions` (`prompt`), previews that request without running it:
+`prompt_tokens` (as rendered), `cached_tokens` (the kept prefix it would resume right now), `max_tokens` (as clamped
+to the window), `need_bytes` (its worst case), `admissible_now`, `reason` (`null`, or `"length"`: it can never fit,
+the window or the whole room; `"slots"`: every seat is live; `"memory"`: the room is promised to live requests),
+`retry_after_s` and `evicted_kept_sessions_total`. A turn whose `cached_tokens` falls short of its previous prompt
+will run cold: its conversation was freed. A preview that finds its conversation's kept prefix counts as that
+conversation's use, so it moves to the back of the eviction queue until the turn arrives. Image requests are not
+previewed (`"previewed": false`); a malformed body is a 400 as on the completion routes.
+
+Every byte field is bytes except the `*_mib` fields. The numbers can be a round old (read without locking, as
+`/health`'s), which is fine for a capacity check; a turn previewed as kept can still run cold when another request's
+grow frees its conversation between the preview and the turn (the eviction counter then moves).
 
 ## Responses
 
