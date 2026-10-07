@@ -197,14 +197,17 @@ class DecisionHostTests(unittest.TestCase):
 
     def test_fresh_score_can_reclaim_an_idle_kept_slot(self):
         idle = object()
-        owner = types.SimpleNamespace(kept=[([1], idle, {}, None)], free=[], depth=6,
-                                      _busy=lambda: set())
+        owner = types.SimpleNamespace(kept=[([1], idle, {}, None)], free=[], depth=6, evicted_by={},
+                                      _busy=lambda: set(), _shrink=lambda state: None)
         owner._drop_kept = lambda state: setattr(owner, 'kept', [k for k in owner.kept if k[1] is not state])
+        Decoder = source_class('tensorfold/families/qwen4_exp/cuda/multi.py', 'MultiDecoder', {'_evict_kept'}, {})
+        owner._evict_kept = lambda keep, **kw: Decoder._evict_kept(owner, keep, **kw)   # the decoder's LRU eviction
         state, hit, cached = prefixes.slot_for(owner, [2], False)
         self.assertIs(state, idle)
         self.assertIsNone(hit)
         self.assertEqual(cached, 0)
         self.assertEqual(owner.kept, [])
+        self.assertEqual(owner.evicted_by, {'slots': 1})
 
     def test_decision_prompt_respects_the_existing_live_decode_budget(self):
         seen = []
