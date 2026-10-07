@@ -198,6 +198,15 @@ class FlashNextEngine:
         # ``streams`` > 1: up to that many requests decoded together, every stream's chain in one forward
         self.concurrent = streams > 1
         self.multi = self.scheduler = None
+        from . import thor_kv
+
+        tables = {id(layer.ple.table): layer.ple.table for layer in w.layers if layer.ple is not None}
+        locked = pooled = False
+        if self.concurrent and prefetch and not ple_on_ssd and tables and thor_kv.available():
+            # Thor KV pool: the tables locked before the decoder measures its room, which then leaves them out
+            locked, note = thor_kv.lock_tables(tables.values(), tables_read)
+            pooled = locked
+            print(f"[tensorfold] Thor (sm_110): {note} ({thor_kv.ENV}=0: the earlier path)", flush=True)
         if self.concurrent:
             from tensorfold.cuda.scheduler import Scheduler
 
@@ -207,15 +216,14 @@ class FlashNextEngine:
             self.multi = MultiDecoder(w, slots=streams, capacity=self.max_len, depth=self.depth,
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
-                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace)
+                                      prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace,
+                                      pool=pooled, vision_bytes=workspace)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
         started = time.perf_counter()
-        locked = False
-        if prefetch and not ple_on_ssd:               # the n-gram tables' pages, read now rather than by requests
-            tables = {id(layer.ple.table): layer.ple.table for layer in w.layers if layer.ple is not None}
+        if prefetch and not ple_on_ssd and not locked:   # the n-gram tables' pages, read now rather than by requests
             size = sum(t.nbytes for t in tables.values())
             # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for
             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
@@ -223,6 +231,7 @@ class FlashNextEngine:
                 if not tables_read:
                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
                 locked = room >= size and table.lock()
+        if prefetch and not ple_on_ssd:
             from . import thor_dec2
 
             if thor_dec2.available():   # Thor: the cached pages mapped (lookups never fault) and the DEC-2 host path
@@ -258,6 +267,9 @@ class FlashNextEngine:
         if self.vision is not None:
             self.vision.warm()
             torch.cuda.empty_cache()
+        if pooled:                                     # last: nothing after it gives torch's cached blocks back
+            print(f"[tensorfold] Thor (sm_110): {self.multi.reserve_pool()} ({thor_kv.ENV}=0: the earlier path)",
+                  flush=True)
         warm_s = time.perf_counter() - started
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)

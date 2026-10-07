@@ -50,7 +50,9 @@ def make_handler(app: App):
 
         def log_request(self, code="-", size="-"):
             # a scraper polls these every few seconds and would bury the requests; a failed poll still prints
-            if not (self.command == "GET" and self.path.split("?", 1)[0].rstrip("/") in POLLED and code == 200):
+            path = self.path.split("?", 1)[0].rstrip("/")
+            polled = path in POLLED and (self.command == "GET" or path.endswith("/capacity"))   # previews too
+            if not (polled and code == 200):
                 super().log_request(code, size)
 
         def _json(self, code: int, payload: dict[str, Any], *, retry_after_s: float | None = None) -> None:
@@ -128,7 +130,8 @@ def make_handler(app: App):
                 return responses.post(self, app)
             chat = self.path.rstrip("/").endswith("/chat/completions")
             tokenizer = path in token_routes.ROUTES
-            if not chat and not tokenizer and not self.path.rstrip("/").endswith("/completions"):
+            capacity = path in ("/v1/capacity", "/capacity")
+            if not chat and not tokenizer and not capacity and not self.path.rstrip("/").endswith("/completions"):
                 self._discard_body()
                 return self._json(404, {"error": "not found"})
             try:
@@ -137,6 +140,13 @@ def make_handler(app: App):
                 return self._json(400, {"error": {"message": str(exc), "type": "invalid_request_error"}})
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return self._json(400, {"error": {"message": "the request body is not JSON", "type": "invalid_request_error"}})
+            if capacity:                                    # a preview of one request (capacity_status.preview)
+                try:
+                    code, reply = capacity_status.preview(app, body)
+                except Exception as exc:
+                    _log_error(exc)
+                    return self._json(400, {"error": {"message": _error_message(exc)}})
+                return self._json(code, reply)
             if tokenizer:                                   # vLLM's /tokenize and /detokenize
                 try:
                     reply = app.detokenize(body) if path.endswith("/detokenize") else app.tokenize(body)

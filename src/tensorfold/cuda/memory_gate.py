@@ -44,6 +44,10 @@ class MemoryGate:
         # Ledgered with promise()/unpromise() below (not named reserve()/unreserve(): self.reserve, right above,
         # is already the margin-bytes int every grow() checks against; the names must not collide with it).
         self.reserved: dict[int, int] = {}
+        # Thor KV pool (families/qwen4_exp/cuda/thor_kv.py): ``room`` is a block reserved in torch's allocator at load;
+        # what lives outside it (the on-demand decode graphs) asks ``outside`` (the host's memory past the reserve).
+        self.pooled = False
+        self.system: Callable[[], int] | None = None
 
     @property
     def reserved_total(self) -> int:
@@ -74,6 +78,11 @@ class MemoryGate:
 
     def give(self, freed: int) -> None:
         self.held = max(0, self.held - int(freed))
+
+    def outside(self, extra: int) -> bool:
+        """Whether ``extra`` bytes allocated outside the pool (``pooled``) leave the host its reserve; True without one."""
+
+        return self.system is None or self.system() >= int(extra)
 
     def short(self, extra: int) -> bool:
         """Whether ``extra`` more bytes and the reserve exceed ``pool`` (False without one): past it, AGX Thor's GPU

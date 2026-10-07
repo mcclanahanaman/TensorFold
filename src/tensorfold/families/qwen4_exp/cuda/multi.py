@@ -13,6 +13,7 @@ from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_byte
 from tensorfold.cuda.kernels import thor_gdn
 from tensorfold.cuda.markers import MIN_GAP
 from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, driver_pool, torch_live
+from tensorfold.server.errors import CONTEXT_LIMIT, ContextLengthError
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
 from tensorfold.engine.exact_sampling import MARGIN, choose_rows
@@ -84,7 +85,8 @@ class MultiDecoder:
 
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
-                 share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0) -> None:
+                 share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0, pool: bool = False,
+                 vision_bytes: int = 0) -> None:
         if w.comm is not None:
             raise ValueError("concurrent Flash Next runs on one GPU for now")
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
@@ -123,7 +125,13 @@ class MultiDecoder:
         live = free
         self.memory_gate = MemoryGate(live() if live is not None else 1 << 62,
                                       reserve=max(2 * GIB, workspace_bytes), live=live)
-        if torch.cuda.is_available() and keeps_pool(prefill_rows, torch.cuda.get_device_capability()):
+        # Thor KV pool (thor_kv: the tables locked, the caches' memory reserved at load by ``reserve_pool``): a grow
+        # never takes the driver's pages, so the wide-piece guard has nothing to keep
+        self.kv_pool, self.pool_bytes, self.vision_bytes = bool(pool), 0, int(vision_bytes)
+        if pool:
+            self.memory_gate.pooled = True
+            self.memory_gate.system = lambda: available_bytes(torch)
+        elif torch.cuda.is_available() and keeps_pool(prefill_rows, torch.cuda.get_device_capability()):
             self.memory_gate.pool = _table_aware_pool(torch, driver_pool(torch), _mapped_tables(w))
         self.streams: dict[int, Stream] = {}
         self.filling: list[Stream] = []                  # admitted, prompts still prefilling (oldest first)
@@ -134,6 +142,8 @@ class MultiDecoder:
         self.draft_host = w.draft_ids.cpu().numpy() if w.draft_ids is not None else None
         self.kept: list[tuple[list[int], State, dict, torch.Tensor | None]] = []   # (ids, slot, snapshot, tail)
         self.keep = keep
+        self.used: dict[int, float] = {}                 # id(slot) -> when it last started or finished a request
+        self.evicted_by = {"memory": 0, "slots": 0, "entries": 0}     # kept chains freed, by cause (/v1/capacity)
         thor_graphs.mem_probe(self, "gate")              # diagnostics (TENSORFOLD_THOR_MEM_PROBE=<trigger path>)
         if self.graphs is not None:     # Thor: one-stream short-context graphs, recorded after the gate measured the room
             self.memory_gate.room -= self._prerecord()      # the room pays the graphs' own memory (THOR-DEC-1)
@@ -189,7 +199,7 @@ class MultiDecoder:
             self.memory_gate.take(st.cache_bytes() - before)
             raise
         self.memory_gate.take(added)
-        if torch.cuda.is_available():
+        if torch.cuda.is_available() and not getattr(self, "kv_pool", False):
             torch.cuda.empty_cache()             # the old buffers back to the system: MemAvailable stays true
         return True
 
@@ -200,22 +210,29 @@ class MultiDecoder:
         if force or st.capacity > FIRST:
             self.memory_gate.give(-st.resize(min(FIRST, st.limit)))
 
-    def _evict_kept(self, keep: State, *, protect: State | None = None) -> bool:
-        """Free the oldest idle kept prompt end (never ``keep``); False when none is left."""
+    def _evict_kept(self, keep: State | None, *, protect: State | None = None, cause: str = "memory") -> bool:
+        """Free the least recently used idle kept slot (never ``keep`` or ``protect``): its prompt ends go, its caches
+        shrink and it joins the free list. Counted by cause ("memory": a grow's room, "slots": a request's slot,
+        "entries": past ``keep`` points) for /v1/capacity, so a client can tell its next turn will run cold. Slots no
+        request has used yet count as oldest, in the kept list's order. False when no idle kept slot is left."""
 
         busy = self._busy()
-        for ids, st, _, _ in self.kept:
-            if st is not keep and st is not protect and id(st) not in busy:
-                self._drop_kept(st)
-                self._shrink(st)
-                if all(f is not st for f in self.free):
-                    self.free.append(st)
-                gate = getattr(self, "memory_gate", None)    # some tests build a decoder with no gate at all
-                if gate is not None:
-                    gate.evicted_kept = getattr(gate, "evicted_kept", 0) + 1  # par-1-fix: so a client can tell its
-                    # next turn on this prefix will be cold
-                return True
-        return False
+        used = getattr(self, "used", {})
+        idle = [st for _, st, _, _ in self.kept if st is not keep and st is not protect and id(st) not in busy]
+        if not idle:
+            return False
+        st = min(idle, key=lambda x: used.get(id(x), 0.0))
+        self._drop_kept(st)
+        self._shrink(st)
+        if all(f is not st for f in self.free):
+            self.free.append(st)
+        gate = getattr(self, "memory_gate", None)        # some tests build a decoder with no gate at all
+        if gate is not None:
+            gate.evicted_kept = getattr(gate, "evicted_kept", 0) + 1
+        by = getattr(self, "evicted_by", None)
+        if by is not None:
+            by[cause] = by.get(cause, 0) + 1
+        return True
 
     def _make_room(self) -> list[Stream]:
         """Before a round: grow each live window oldest-first; a stream that can't grow makes the newest end."""
@@ -262,6 +279,110 @@ class MultiDecoder:
     def live(self) -> int:
         return len(self.streams) + len(self.filling)
 
+    def _snapshot_bytes(self) -> int:
+        """One kept point's snapshot (``State.snapshot``: a DeltaNet state, the conv and n-gram tails)."""
+
+        st = getattr(self, "_ref_state", None)
+        if st is None:
+            return 0
+        return st.rec[0].numel() * st.rec.element_size() + st.conv.numel() * st.conv.element_size() + \
+            st.ple_tail.numel() * st.ple_tail.element_size()
+
+    def room_tokens(self) -> int:
+        """The most prompt plus reply tokens one request's caches hold within the gate's whole room."""
+
+        ref, room = getattr(self, "_ref_state", None), self.memory_gate.room
+        if ref is None:
+            return self.capacity
+        low, high = 0, self.capacity
+        while low < high:
+            mid = (low + high + 1) // 2
+            if ref.cache_bytes(mid) <= room:
+                low = mid
+            else:
+                high = mid - 1
+        return low
+
+    def _too_long(self, prompt: int, count: int) -> str:
+        n = self.room_tokens()
+        return (f"{CONTEXT_LIMIT} {n} tokens for one request at this server's memory setting (its window is "
+                f"{self.capacity} tokens; the caches' pool is {self.memory_gate.room / GIB:.2f} GiB): this request's "
+                f"{prompt} prompt tokens with up to {count} reply tokens do not fit it. Shorten the prompt or "
+                "max_tokens.")
+
+    def reserve_pool(self) -> str:
+        """Thor KV pool (``thor_kv``): after the warm-ups, the gate's live room past the on-demand graphs' budget is
+        allocated once into torch's cache, so later grows split it instead of taking the driver's pages; the room
+        becomes that block (and what the caches already hold) less the kept snapshots' share and the image tower's
+        workspace (its calls run beside the rounds, a video's as its frames decode). Returns the note."""
+
+        from tensorfold.cuda.capacity import reserve_bytes, _meminfo
+        from . import thor_kv
+
+        gate = self.memory_gate
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        graphs = getattr(self, "graphs", None)
+        demand = int(graphs.budget) if graphs is not None and getattr(graphs, "demand", False) else 0
+        live = int(gate.live()) if gate.live is not None else 0
+        size = thor_kv.reserve(live - demand)
+        snaps = self.keep * self._snapshot_bytes()
+        gate.room = max(0, size + gate.held - snaps - self.vision_bytes)
+        gate.reserve = thor_kv.SLACK
+        self.pool_bytes = size
+        memory = _meminfo()
+        host = reserve_bytes(memory["MemTotal"]) if memory else 0
+        n = self.room_tokens()
+        return (f"every stream's caches from one {size / GIB:.2f} GiB pool reserved at load: {gate.room / GIB:.2f} GiB "
+                f"for caches past {self.keep} kept snapshots and {self.vision_bytes / GIB:.2f} GiB of image tower "
+                f"workspace ({n} tokens, {gate.room / max(1, self.window_bytes):.2f} full {self.capacity}-token "
+                f"windows); {demand / GIB:.2f} GiB left for on-demand graphs and {host / GIB:.2f} GiB for the host "
+                "(TENSORFOLD_MEMORY_RESERVE_GIB)")
+
+    def kept_view(self) -> list[dict]:
+        """The kept conversations, one per slot: tokens (its longest point), points, cache bytes, idle seconds and
+        whether a live request holds it. Read without the engine's lock (as /health): a round old at worst."""
+
+        now, used, busy = time.monotonic(), dict(getattr(self, "used", {})), self._busy()
+        out: dict[int, dict] = {}
+        for ids, st, _, _ in list(self.kept):
+            e = out.get(id(st))
+            if e is None:
+                e = out[id(st)] = {"tokens": 0, "points": 0, "bytes": int(st.cache_bytes()),
+                                   "idle_s": round(now - used[id(st)], 1) if id(st) in used else None,
+                                   "busy": id(st) in busy}
+            e["tokens"] = max(e["tokens"], len(ids))
+            e["points"] += 1
+        return sorted(out.values(), key=lambda e: -e["tokens"])
+
+    def preview(self, prompt: list[int], count: int, *, max_streams: int | None = None) -> dict:
+        """What admitting ``prompt`` now would do, without admitting it (/v1/capacity's POST): the kept prefix it would
+        resume, its worst-case cache bytes, and whether it is admissible now or why not (``reason``: "length", it
+        can never fit; "slots", every seat is live; "memory", the room is promised to live requests)."""
+
+        out = {"prompt_tokens": len(prompt), "cached_tokens": 0, "max_tokens": None, "need_bytes": None,
+               "admissible_now": False, "reason": None, "retry_after_s": None}
+        room = self.capacity - len(prompt) - self.depth - 1
+        if room < 1:
+            out["reason"] = "length"
+            return out
+        count = max(1, min(int(count), room))
+        out["max_tokens"] = count
+        best = prefixes._best(list(self.kept), list(prompt))
+        out["cached_tokens"] = len(best[0]) if best is not None else 0
+        ref, gate = getattr(self, "_ref_state", None), self.memory_gate
+        need = ref.cache_bytes(min(self.capacity, len(prompt) + count)) if ref is not None else 0
+        out["need_bytes"] = need
+        if need > gate.room:
+            out["reason"] = "length"
+        elif self.live() >= (max_streams or self.slots):
+            out.update(reason="slots", retry_after_s=2.0)
+        elif not gate.admits(need) or any(x.waiting for x in list(self.streams.values())):
+            out.update(reason="memory", retry_after_s=5.0)
+        else:
+            out["admissible_now"] = True
+        return out
+
     @torch.no_grad()
     def warm(self) -> None:
         """A synthetic greedy request through prefill (a full chunk, then a partial one cut at the kept point), its drafts and one round, then forgotten, so no request compiles or loads a kernel."""
@@ -296,6 +417,8 @@ class MultiDecoder:
         ref = getattr(self, "_ref_state", None)
         if ref is not None:
             worst_case = ref.cache_bytes(min(self.capacity, len(s.prompt) + s.count))
+            if worst_case > self.memory_gate.room:       # past the whole room: no wait would make it fit
+                raise ContextLengthError(self._too_long(len(s.prompt), s.count))
             if not self.memory_gate.admits(worst_case):
                 raise NoRoom(
                     f"accepting a {len(s.prompt)}-token prompt (up to {s.count} reply tokens) would need more cache "
@@ -305,6 +428,9 @@ class MultiDecoder:
         try:
             t0 = time.perf_counter()
             st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            used = getattr(self, "used", None)
+            if used is not None:
+                used[id(st)] = time.monotonic()
             try:
                 if not self._grow(st, len(s.prompt) + self.depth + 2, alone=not self.streams and not self.filling):
                     raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes",
@@ -745,11 +871,15 @@ class MultiDecoder:
         """Drop finished streams; a slot whose prompt state is kept stays with it, the rest are free again."""
 
         gate = getattr(self, "memory_gate", None)
+        used = getattr(self, "used", None)
         for s in done:
             if gate is not None:
                 gate.unpromise(id(s))      # par-1-fix: its admission reservation, freed once and for all
             self.streams.pop(s.sid, None)
-            if not any(k[1] is s.st for k in self.kept) and all(f is not s.st for f in self.free):
+            if any(k[1] is s.st for k in self.kept):
+                if used is not None:
+                    used[id(s.st)] = time.monotonic()        # its conversation's last use: the LRU clock
+            elif all(f is not s.st for f in self.free):
                 self._shrink(s.st)
                 self.free.append(s.st)
 

@@ -1,4 +1,11 @@
-"""Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy."""
+"""Select and retain prompt prefixes without consuming a longer chain when a spare slot can hold a copy.
+
+A slot's kept chain is one conversation's resume points. When slots or memory run short, the least recently used idle
+slot goes first (``owner.used``: when each slot last started or finished a request), so a conversation that keeps
+coming back keeps its prefix while the one left idle longest runs cold; a slot's inner points (shorter prefixes inside
+its own chain) go before any conversation's longest point. Every removal of a whole chain is counted
+(``owner._evict_kept``) for ``/v1/capacity``.
+"""
 
 
 def _best(kept, prompt, busy=()):
@@ -10,15 +17,28 @@ def _longer(kept, entry):
     return any(k[1] is entry[1] and len(k[0]) > len(entry[0]) for k in kept)
 
 
+def _spare(owner, protect):
+    """A free slot, else the least recently used idle kept slot (never ``protect``), freed and counted; None if none."""
+
+    if owner.free:
+        return owner.free.pop()
+    if owner._evict_kept(None, protect=protect, cause="slots"):
+        return owner.free.pop()
+    return None
+
+
 def slot_for(owner, prompt: list[int], reuse: bool):
-    """Copy a fork into spare capacity; otherwise retain the released idle-slot and memory-pressure behavior."""
+    """Copy a fork into a spare slot (a free one, or the least recently used idle one); else extend a slot's own chain.
+
+    A prompt matching only a shorter point of a slot whose chain goes on (another conversation on the same system
+    prompt) copies that point into a spare slot rather than taking the slot: its longer chain stays kept."""
 
     busy = owner._busy()
     best = _best(owner.kept, prompt) if reuse else None
     fork = best is not None and (id(best[1]) in busy or _longer(owner.kept, best))
     if fork:
-        if owner.free:
-            spare = owner.free.pop()
+        spare = _spare(owner, best[1])
+        if spare is not None:
             try:
                 if owner._grow(spare, len(prompt) + owner.depth + 2, protect=best[1]):
                     spare.copy_prefix(best[1], len(best[0]), best[2]["mtp_len"])
@@ -36,21 +56,34 @@ def slot_for(owner, prompt: list[int], reuse: bool):
         owner.kept = [k for k in owner.kept if k[1] is not best[1]
                       or len(k[0]) <= n and best[0][:len(k[0])] == k[0]]
         return best[1], {"state": best[2], "tail": best[3]}, n
-    if not owner.free:
-        idle = next((k[1] for k in owner.kept if id(k[1]) not in busy), None)
-        if idle is None:
-            raise RuntimeError("no free stream slot")
-        owner._drop_kept(idle)
-        owner.free.append(idle)
-    return owner.free.pop(), None, 0
+    spare = _spare(owner, None)
+    if spare is None:
+        raise RuntimeError("no free stream slot")
+    return spare, None, 0
 
 
 def remember(owner, ids, st, snap, tail) -> None:
-    """Keep each slot's prefix chain, returning displaced idle slots to the free list."""
+    """Keep each slot's prefix chain; past ``owner.keep`` points, inner points go first, then idle slots' whole chains,
+    least recently used first (``owner._evict_kept``: their slots shrink and join the free list)."""
 
     gone = [k[1] for k in owner.kept if k[0] == ids]
     owner.kept = [k for k in owner.kept if k[0] != ids] + [(ids, st, snap, tail)]
+    used = getattr(owner, "used", {})
+
+    def lru(k):
+        return used.get(id(k[1]), 0.0), len(k[0])
+
     while len(owner.kept) > owner.keep:
+        top: dict[int, int] = {}
+        for k in owner.kept:
+            top[id(k[1])] = max(top.get(id(k[1]), 0), len(k[0]))
+        inner = [k for k in owner.kept if len(k[0]) < top[id(k[1])]]
+        if inner:
+            drop = min(inner, key=lru)
+            owner.kept = [k for k in owner.kept if k is not drop]
+            continue
+        if owner._evict_kept(st, protect=None, cause="entries"):
+            continue
         gone.append(owner.kept.pop(0)[1])
     busy = owner._busy()
     for old in gone:

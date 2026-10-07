@@ -357,14 +357,19 @@ class DecodeGraphs:
 
         while self.paid and self.charged - self.refunded + self.est > self.budget and self._evict():
             pass
-        return self.charged - self.refunded + self.est <= self.budget and self.gate.fits(int(self.est))
+        if self.charged - self.refunded + self.est > self.budget:
+            return False
+        if getattr(self.gate, "pooled", False):     # Thor KV pool: the graphs live outside it, in the budget it left
+            return self.gate.outside(int(self.est))
+        return self.gate.fits(int(self.est))
 
     def _charge(self, key: tuple, kind: str, free0: float) -> None:
         """An on-demand graph's own memory (the free memory its capture and upload took) off the gate's room."""
 
         torch.cuda.synchronize()                    # the upload landed
         cost = int(max(0.0, free0 - _free_mib()) * MIB)
-        self.gate.room -= cost
+        if not getattr(self.gate, "pooled", False):  # Thor KV pool: the pool left this budget out already
+            self.gate.room -= cost
         self.charged += cost
         self.paid[key] = [cost, self.calls]
         self.est = max(self.est, float(cost))
@@ -388,7 +393,8 @@ class DecodeGraphs:
         del entry
         torch.cuda.synchronize()
         back = min(cost, int(max(0.0, _free_mib() - free0) * MIB))
-        self.gate.room += back
+        if not getattr(self.gate, "pooled", False):
+            self.gate.room += back
         self.refunded += back
         self.evicted += 1
         return True
