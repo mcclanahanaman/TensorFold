@@ -20,6 +20,8 @@ switch (all on by default) so an A/B can attribute it:
 - ``TENSORFOLD_THOR_DEC2_TABLES``: the attention ``Step`` and DeltaNet ``Tables`` send their device tables from numpy
   (no Python lists), the DeltaNet conv and state pointers come from each state's bases and strides, and the attention
   cache pointers from an array a stream kept until its caches move. The same values.
+- ``TENSORFOLD_THOR_NGRAM_PAIRS``: an NVFP4 table gathers through its pair table (``NVFP4Table.use_pairs``: one lookup
+  a code byte instead of about ten row-sized temporaries a call, fresh host pages each time). The same bits.
 - ``TENSORFOLD_THOR_DEC2_CHECK=1`` (diagnostics, off): every reused window's ids and every fast pointer table are checked
   against the earlier computation (the earlier one is used on a mismatch); the counts print at exit.
 """
@@ -39,6 +41,7 @@ POOL_ENV = "TENSORFOLD_THOR_DEC2_POOL_ROWS"
 AHEAD_ENV = "TENSORFOLD_THOR_DEC2_AHEAD"
 TABLES_ENV = "TENSORFOLD_THOR_DEC2_TABLES"
 CHECK_ENV = "TENSORFOLD_THOR_DEC2_CHECK"
+PAIRS_ENV = "TENSORFOLD_THOR_NGRAM_PAIRS"
 CAPABILITY = (11, 0)
 _NP = {torch.int32: np.int32, torch.int64: np.int64}
 
@@ -112,10 +115,14 @@ def setup(tables, locked: bool) -> str:
     S.batch = mapped and bf16 and S.split > 0
     S.ahead = bf16 and _on(AHEAD_ENV)
     S.check = _on(CHECK_ENV, "0")
+    pairs = [t for t in tables if hasattr(t, "use_pairs")] if _on(PAIRS_ENV) else []
+    for table in pairs:
+        table.use_pairs()
     if S.check:
         atexit.register(lambda: print(f"[dec2] check {S.stats}", flush=True))
     pool = f"batched, pool pieces >= {S.split} rows from {S.pool_rows} rows" if S.batch else "as before"
     return (f"{note}; gathers {pool}; ahead {'on' if S.ahead else 'off'}; tables {'on' if tables_on() else 'off'}"
+            + (f"; NVFP4 rows through the pair table ({PAIRS_ENV}=0: dequantized a call)" if pairs else "")
             + ("; CHECK" if S.check else ""))
 
 

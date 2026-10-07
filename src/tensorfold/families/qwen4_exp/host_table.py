@@ -17,6 +17,7 @@ _PARTS = ("weight", "scales", "biases")
 # a prompt chunk's gather copies big row runs on worker threads (GIL released); bytes stay the same as single-threaded
 GATHER_THREADS = 16
 GATHER_SPLIT = 512
+PAIR_ROWS = 2048                # NVFP4 rows a lookup through the pair table at most (its temporaries stay small)
 
 
 def ngrams_on_host(model_dir: Path, ssd: bool = False) -> bool:
@@ -280,6 +281,7 @@ class NVFP4Table(BF16Table):
         self.wrow = self.width // 2
         self.nbytes = sum(a.nbytes for a in self.values + self.scales)
         self.e2m1, self.e4m3, self.g = E2M1, e4m3(np.arange(256)), np.float32(scale)
+        self.pairs = None           # Thor (sm_110): every (block scale, code byte)'s two values, set by ``use_pairs``
         self._pool = ThreadPoolExecutor(GATHER_THREADS, thread_name_prefix="ngram-gather")
 
     def gather(self, ids: np.ndarray, split: int | None = None) -> np.ndarray:
@@ -287,6 +289,8 @@ class NVFP4Table(BF16Table):
         ``split``: pool pieces (Thor DEC-2)."""
 
         shard, local = self._where(ids)
+        if self.pairs is not None:
+            return self._gather_pairs(shard, local, split)
         codes = np.empty((shard.size, self.width // 2), dtype=np.uint8)
         blocks = np.empty((shard.size, self.width // 16), dtype=np.uint8)
 
@@ -294,10 +298,45 @@ class NVFP4Table(BF16Table):
             codes[at], blocks[at] = self.values[f][local[at]], self.scales[f][local[at]]
 
         _copy_rows(self._pool, shard, copy, split or self.split)
-        nib = np.stack([codes & 0xF, codes >> 4], -1).reshape(shard.size, self.width)
+        return self.dequant(codes, blocks)
+
+    def dequant(self, codes: np.ndarray, blocks: np.ndarray) -> np.ndarray:
+        """Code rows [n, C] (two e2m1 values a byte, the low nibble first) and their block scales [n, C/8] -> [n, 2C]
+        uint16: bf16 bits of the fp32 code x block scale x table scale, rounded once to nearest even."""
+
+        n, width = codes.shape[0], codes.shape[1] * 2
+        nib = np.stack([codes & 0xF, codes >> 4], -1).reshape(n, width)
         v = (self.e2m1[nib] * np.repeat(self.e4m3[blocks], 16, axis=1)).astype(np.float32) * self.g
         f32 = v.astype(np.float32).view(np.uint32).astype(np.uint64)
         return ((f32 + 0x7FFF + ((f32 >> 16) & 1)) >> 16).astype(np.uint16)
+
+    def use_pairs(self) -> None:
+        """Gather through a table of every (block scale byte, code byte)'s two bf16 values from now on: one lookup a code
+        byte, temporaries of at most ``PAIR_ROWS`` rows a piece. ``dequant`` builds the table, so a row's bits are the
+        same (pinned by tests/test_ngram_nvfp4_pairs.py). Thor (sm_110) turns it on at load: ``dequant`` over a whole
+        call's rows made about ten row-sized temporaries, fresh pages each call, and with the KV pool holding the GPU's
+        share the host's 4 KiB faults on them slowed prompts (FR-OPS-17 kvpool-dev3)."""
+
+        if self.pairs is None:
+            byte = np.arange(256, dtype=np.uint8)
+            codes = np.broadcast_to(byte, (256, 256))                # row s: every code byte under block scale s
+            blocks = np.repeat(byte[:, None], 32, axis=1)            # 256 code bytes: 32 blocks of 16 values
+            self.pairs = np.ascontiguousarray(self.dequant(codes, blocks)).view(np.uint32).reshape(-1)
+
+    def _gather_pairs(self, shard: np.ndarray, local: np.ndarray, split: int | None) -> np.ndarray:
+        out = np.empty((shard.size, self.width), dtype=np.uint16)
+        words, blocks, pairs = out.view(np.uint32), self.width // 16, self.pairs   # a word: one code byte's two values
+
+        def copy(f: int, at: np.ndarray) -> None:
+            for lo in range(0, at.size, PAIR_ROWS):
+                part = at[lo:lo + PAIR_ROWS]
+                rows = local[part]
+                key = (self.scales[f][rows].astype(np.intp) << 8)[:, :, None] | \
+                    self.values[f][rows].reshape(part.size, blocks, 8)
+                words[part] = pairs[key.reshape(part.size, -1)]
+
+        _copy_rows(self._pool, shard, copy, split or self.split)
+        return out
 
     def lock(self) -> bool:
         return False
