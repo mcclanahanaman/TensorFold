@@ -92,10 +92,11 @@ def test_flash_parallel_decoder_allocations_are_budgeted(monkeypatch, allocation
                           kv_heads=2, head_dim=64, index_dim=128, index_ratio=4, ple_kernel=4, ngram_size=3,
                           ple_layers=[], heads=8, index_heads=4, index_budget=2048, low=320, experts=8, top_k=2,
                           moe_width=512, shared_width=512, heads_per_ngram=8, ple_dim=512, eos=(0,))
-    weights = SimpleNamespace(cfg=cfg, device="cpu", layers=[SimpleNamespace(index=i, linear=i % 2 == 0)
+    weights = SimpleNamespace(cfg=cfg, device="cpu", layers=[SimpleNamespace(index=i, linear=i % 2 == 0, ple=None)
                                                              for i in range(4)],
-                              mtp=SimpleNamespace(), meta={"world": 1}, head=SimpleNamespace(n=1024), comm=None,
-                              draft_ids=None, draft_head=None)
+                              mtp=SimpleNamespace(layer=SimpleNamespace(ple=None)), meta={"world": 1},
+                              head=SimpleNamespace(n=1024), comm=None, draft_ids=None, draft_head=None)
+    monkeypatch.setattr(multi.thor_graphs, "available", lambda *a: False)    # on sm_110 too: no decode graphs here
     slots, depth, keep = 65536, 3, 8
     from tensorfold.cuda.geometry import indexed_prompt_bytes, indexed_stream_geometry, kv_bytes
     workspace = indexed_prompt_bytes(text, prefill_rows)

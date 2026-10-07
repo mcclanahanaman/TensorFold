@@ -27,6 +27,7 @@ import os
 import torch
 
 ENV = "TENSORFOLD_THOR_KV_POOL"
+TOUCH_ENV = "TENSORFOLD_THOR_KV_POOL_TOUCH"     # diagnostics: =0 leaves the pool's pages untouched until first use
 CAPABILITY = (11, 0)
 GIB = float(1 << 30)
 ALIGN = 2 << 20                  # the pool's size, a whole number of the allocator's 2 MiB rounding
@@ -98,6 +99,9 @@ def reserve(size: int) -> int:
         except torch.OutOfMemoryError:
             size = max(0, size - (512 << 20)) // ALIGN * ALIGN
             continue
+        if os.environ.get(TOUCH_ENV, "1").strip() not in ("0", "off", "false", "no"):
+            block.zero_()                        # every page touched once now, not by the first requests' grows
+            torch.cuda.synchronize()
         del block                                # torch's allocator keeps the segment: later grows split it
         return size
     return 0
