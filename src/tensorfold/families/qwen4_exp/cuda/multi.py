@@ -365,7 +365,9 @@ class MultiDecoder:
     def preview(self, prompt: list[int], count: int, *, max_streams: int | None = None) -> dict:
         """What admitting ``prompt`` now would do, without admitting it (/v1/capacity's POST): the kept prefix it would
         resume, its worst-case cache bytes, and whether it is admissible now or why not (``reason``: "length", it
-        can never fit; "slots", every seat is live; "memory", the room is promised to live requests)."""
+        can never fit; "slots", every seat is live; "memory", the room is promised to live requests). A preview
+        that finds its conversation's kept prefix counts as that conversation's use (the LRU clock): a client
+        about to send its next turn moves to the back of the eviction queue."""
 
         out = {"prompt_tokens": len(prompt), "cached_tokens": 0, "max_tokens": None, "need_bytes": None,
                "admissible_now": False, "reason": None, "retry_after_s": None}
@@ -377,6 +379,9 @@ class MultiDecoder:
         out["max_tokens"] = count
         best = prefixes._best(list(self.kept), list(prompt))
         out["cached_tokens"] = len(best[0]) if best is not None else 0
+        used = getattr(self, "used", None)
+        if best is not None and used is not None:
+            used[id(best[1])] = time.monotonic()
         ref, gate = getattr(self, "_ref_state", None), self.memory_gate
         need = self._worst(ref, len(prompt), count) if ref is not None else 0
         out["need_bytes"] = need

@@ -226,3 +226,14 @@ def test_a_pooled_gate_admits_only_what_still_grows_past_its_reserve():
     assert gate.admits(10 * GIB)                                       # the earlier path: the whole room
     gate.pooled = True
     assert gate.admits(9 * GIB) and not gate.admits(9 * GIB + 1)
+
+
+def test_a_preview_that_finds_its_conversation_moves_it_to_the_back_of_the_queue(allocations):  # noqa: F811
+    multi, state, torch = mods()
+    dec = decoder(multi, state, torch, room=1 << 40)
+    dec.capacity, dec.slots = 65536, 8
+    dec._ref_state = state.State(weights(), 256, 4, "bf16", limit=65536)
+    a, b = kept_slots(dec, state, 2, used=[1.0, 2.0])
+    assert dec.preview([1] * 10 + [5] * 40, 16)["cached_tokens"] == 10          # a's conversation, about to return
+    assert dec.used[id(a)] > 2.0
+    assert dec._evict_kept(None) and [k[1] for k in dec.kept] == [a]           # b goes, not a
