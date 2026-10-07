@@ -82,7 +82,15 @@ def do_turn(i, k, messages, args, prev_prompt):
     retries = 0
     pv = {}
     while True:
-        pv = post_json(args.url + '/v1/capacity', body, timeout=args.turn_timeout)
+        try:
+            pv = post_json(args.url + '/v1/capacity', body, timeout=args.turn_timeout)
+        except (OSError, ValueError) as exc:            # a preview the server could not answer is this turn's error
+            return ({'session': i, 'turn': k, 'prompt_tokens': None, 'cached_tokens': None, 'completion_tokens': None,
+                     'prev_prompt_tokens': prev_prompt, 'preview_prompt_tokens': None, 'preview_cached_tokens': None,
+                     'evicted_before': None, 'evicted_after': None, 'ttft_s': None,
+                     'total_s': round(time.time() - t_start, 3), 'retries': retries, 'waited_s': round(waited, 3),
+                     'error': f'preview: {exc}'[:300], 'killed_mid_stream': False,
+                     'timeout': isinstance(exc, (TimeoutError, socket.timeout)), 'class': 'error'}, '')
         if pv.get('reason') == 'length':
             cls = classify(k, None, None, prev_prompt, pv.get('cached_tokens'), None, None)
             row = {'session': i, 'turn': k, 'ended': 'length', 'preview_prompt_tokens': pv.get('prompt_tokens'),
@@ -244,8 +252,7 @@ def run_session(i, args, rows, timeline, state, lock, out_path):
             row, text = do_turn(i, k, messages, args, last_prompt)
             if row.get('prompt_tokens') is not None:
                 last_prompt = row['prompt_tokens']
-            if text:
-                prev_text = text
+            prev_text = text                            # this turn's reply (empty when it was reasoning only)
             line = (f"[stress] s{i} t{k} class={row['class']} prompt={row.get('prompt_tokens')} "
                     f"cached={row.get('cached_tokens')} ttft={row.get('ttft_s')}s total={row.get('total_s')}s "
                     f"retries={row.get('retries')} waited={row.get('waited_s')}s")
@@ -253,8 +260,13 @@ def run_session(i, args, rows, timeline, state, lock, out_path):
                 rows.append(row)
                 dump(out_path, args, rows, timeline)
             print(line, flush=True)
-            if row.get('ended'):
+            if row.get('ended') or row.get('error'):
                 break
+    except Exception as exc:                            # noqa: BLE001  a harness fault is a failed session, not a hidden one
+        with lock:
+            rows.append({'session': i, 'turn': -1, 'error': f'harness: {exc!r}'[:300], 'killed_mid_stream': False,
+                         'timeout': False, 'retries': 0, 'waited_s': 0.0, 'class': 'error'})
+        print(f'[stress] s{i} harness error {exc!r}', flush=True)
     finally:
         with lock:
             state['finished'] += 1
