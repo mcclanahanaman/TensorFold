@@ -324,18 +324,31 @@ class NVFP4Table(BF16Table):
             self.pairs = np.ascontiguousarray(self.dequant(codes, blocks)).view(np.uint32).reshape(-1)
 
     def _gather_pairs(self, shard: np.ndarray, local: np.ndarray, split: int | None) -> np.ndarray:
-        out = np.empty((shard.size, self.width), dtype=np.uint16)
-        words, blocks, pairs = out.view(np.uint32), self.width // 16, self.pairs   # a word: one code byte's two values
+        n, split = shard.size, split or self.split
+        out = np.empty((n, self.width), dtype=np.uint16)
+        words, nb, pairs = out.view(np.uint32), self.width // 16, self.pairs   # a word: one code byte's two values
+
+        def lookup(codes: np.ndarray, blocks: np.ndarray, at) -> None:
+            key = (blocks.astype(np.intp) << 8)[:, :, None] | codes.reshape(len(codes), nb, 8)
+            words[at] = pairs[key.reshape(len(codes), -1)]
+
+        if GATHER_THREADS > 1 and n >= 2 * split:          # a prompt chunk: each pool piece looks up its own rows
+            def piece(f: int, at: np.ndarray) -> None:
+                for lo in range(0, at.size, PAIR_ROWS):
+                    part = at[lo:lo + PAIR_ROWS]
+                    lookup(self.values[f][local[part]], self.scales[f][local[part]], part)
+
+            _copy_rows(self._pool, shard, piece, split)
+            return out
+        codes = np.empty((n, self.width // 2), dtype=np.uint8)    # fewer rows: copied by shard, then one lookup
+        blocks = np.empty((n, nb), dtype=np.uint8)
 
         def copy(f: int, at: np.ndarray) -> None:
-            for lo in range(0, at.size, PAIR_ROWS):
-                part = at[lo:lo + PAIR_ROWS]
-                rows = local[part]
-                key = (self.scales[f][rows].astype(np.intp) << 8)[:, :, None] | \
-                    self.values[f][rows].reshape(part.size, blocks, 8)
-                words[part] = pairs[key.reshape(part.size, -1)]
+            codes[at], blocks[at] = self.values[f][local[at]], self.scales[f][local[at]]
 
-        _copy_rows(self._pool, shard, copy, split or self.split)
+        _copy_rows(self._pool, shard, copy, split)
+        for lo in range(0, n, PAIR_ROWS):
+            lookup(codes[lo:lo + PAIR_ROWS], blocks[lo:lo + PAIR_ROWS], slice(lo, lo + PAIR_ROWS))
         return out
 
     def lock(self) -> bool:
