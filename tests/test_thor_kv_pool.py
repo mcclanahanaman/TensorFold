@@ -237,3 +237,34 @@ def test_a_preview_that_finds_its_conversation_moves_it_to_the_back_of_the_queue
     assert dec.preview([1] * 10 + [5] * 40, 16)["cached_tokens"] == 10          # a's conversation, about to return
     assert dec.used[id(a)] > 2.0
     assert dec._evict_kept(None) and [k[1] for k in dec.kept] == [a]           # b goes, not a
+
+
+def test_lock_tables_locks_every_format_all_or_nothing(monkeypatch, tmp_path):
+    import ctypes
+
+    import numpy as np
+
+    thor_kv = importlib.import_module("tensorfold.families.qwen4_exp.cuda.thor_kv")
+    arrs = [np.zeros(4096, dtype=np.uint8) for _ in range(3)]
+    table = SimpleNamespace(values=arrs[:2], scales=arrs[2:], prefetch=lambda: None)
+    calls = []
+
+    def Libc(fail_at=None):
+        def mlock(at, n):
+            calls.append(("mlock", at))
+            return -1 if len([c for c in calls if c[0] == "mlock"]) == fail_at else 0
+
+        def munlock(at, n):
+            calls.append(("munlock", at))
+            return 0
+
+        return SimpleNamespace(mlock=mlock, munlock=munlock)
+
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: Libc())
+    ok, note = thor_kv.lock_tables([table], read=True)
+    assert ok and [c[1] for c in calls] == [a.ctypes.data for a in arrs] and "locked in memory" in note
+    calls.clear()
+    monkeypatch.setattr(ctypes, "CDLL", lambda *a, **k: Libc(fail_at=3))
+    ok, note = thor_kv.lock_tables([table], read=True)
+    assert not ok and calls[-2:] == [("munlock", arrs[0].ctypes.data), ("munlock", arrs[1].ctypes.data)]
+    assert "stay evictable" in note

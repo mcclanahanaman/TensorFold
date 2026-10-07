@@ -47,36 +47,43 @@ def available(device: int = 0) -> bool:
     return tuple(torch.cuda.get_device_capability(device)) == CAPABILITY and unified(torch)
 
 
+def _arrays(table) -> list:
+    """A host table's mapped arrays, whatever its format (bf16 or FP8 values, NVFP4 codes and scales, MLX words)."""
+
+    return [a for name in ("values", "scales", "words", "biases") for a in (getattr(table, name, None) or [])]
+
+
 def lock_tables(tables, read: bool) -> tuple[bool, str]:
-    """Lock every table's pages in memory (reading them first unless ``read``): whether all locked, and the note."""
+    """Lock every table's pages in memory (reading them first unless ``read``): whether all locked, and the note.
+    All or nothing: on a refusal what was locked is unlocked again (the earlier path's evictable pages)."""
+
+    import ctypes
 
     from .thor_dec2 import _status
 
     tables = list(tables)
-    size = sum(int(getattr(t, "nbytes", 0)) for t in tables)
+    arrays = [a for t in tables for a in _arrays(t)]
+    size = sum(a.nbytes for a in arrays)
+    if not arrays:
+        return False, "n-gram tables not locked (no mapped arrays)"
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.mlock.argtypes = libc.munlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
     before = _status()
+    if not read:
+        for table in tables:
+            table.prefetch()                     # eight readers first: mlock alone faults the pages in one by one
     done = []
-    for table in tables:
-        if not read:
-            table.prefetch()
-        if not table.lock():
-            for t in done:                       # all or nothing: an unlocked table is the earlier path's
-                _unlock(t)
-            return False, (f"n-gram tables not locked (the memory-lock limit refused {size / GIB:.1f} GiB; "
-                           "raise `ulimit -l`, or the tables' pages stay evictable)")
-        done.append(table)
+    for arr in arrays:
+        if libc.mlock(arr.ctypes.data, arr.nbytes) != 0:
+            err = ctypes.get_errno()
+            for a in done:
+                libc.munlock(a.ctypes.data, a.nbytes)
+            return False, (f"n-gram tables not locked ({os.strerror(err)} locking {size / GIB:.1f} GiB; "
+                           "`ulimit -l` must allow it), their pages stay evictable")
+        done.append(arr)
     after = _status()
     return True, (f"n-gram tables locked in memory: {size / GIB:.2f} GiB, MemAvailable "
                   f"{before.get('MemAvailable', 0) / 2**20:.2f} -> {after.get('MemAvailable', 0) / 2**20:.2f} GiB")
-
-
-def _unlock(table) -> None:
-    import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    libc.munlock.argtypes = (ctypes.c_void_p, ctypes.c_size_t)
-    for arr in getattr(table, "values", []):
-        libc.munlock(arr.ctypes.data, arr.nbytes)
 
 
 def reserve(size: int) -> int:
