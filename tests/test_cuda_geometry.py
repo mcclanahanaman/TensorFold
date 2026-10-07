@@ -39,8 +39,12 @@ def allocations(monkeypatch):
     triton.jit = lambda fn=None, **kw: fn if fn is not None else (lambda f: f)   # @jit and @jit(...)
     triton.cdiv = lambda a, b: (a + b - 1) // b
     triton.next_power_of_2 = lambda n: 1 << (n - 1).bit_length()
+    extra = ModuleType("triton.language.extra")       # thor_glue's ``from triton.language.extra import libdevice``
+    extra.libdevice = SimpleNamespace()
+    lang.extra = extra
     monkeypatch.setitem(sys.modules, "triton", triton)
     monkeypatch.setitem(sys.modules, "triton.language", lang)
+    monkeypatch.setitem(sys.modules, "triton.language.extra", extra)
     recorded = []
     def allocate(shape, **kw):
         tensor = Allocation(shape, kw.get("dtype", "fp32"), kw.get("device", "cpu"))

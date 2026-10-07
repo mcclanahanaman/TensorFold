@@ -95,7 +95,7 @@ def test_flash_parallel_decoder_allocations_are_budgeted(monkeypatch, allocation
     weights = SimpleNamespace(cfg=cfg, device="cpu", layers=[SimpleNamespace(index=i, linear=i % 2 == 0)
                                                              for i in range(4)],
                               mtp=SimpleNamespace(), meta={"world": 1}, head=SimpleNamespace(n=1024), comm=None,
-                              draft_ids=None)
+                              draft_ids=None, draft_head=None)
     slots, depth, keep = 65536, 3, 8
     from tensorfold.cuda.geometry import indexed_prompt_bytes, indexed_stream_geometry, kv_bytes
     workspace = indexed_prompt_bytes(text, prefill_rows)
