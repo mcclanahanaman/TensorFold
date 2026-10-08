@@ -245,3 +245,17 @@ def test_require_refusal_fails_a_run_that_saw_none(tmp_path):
     s = doc["summary"]
     assert s["refused"] == 0 and s["errors"] == 0 and s["killed"] == 0
     assert s["pass"] is False and rc == 1
+
+
+def test_an_extra_session_s_cold_turn_is_unpreviewed_not_announced():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("session_stress", TOOL)
+    tool = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(tool)
+    base = {'error': None, 'killed_mid_stream': False, 'timeout': False, 'retries': 0, 'waited_s': 0.0,
+            'prompt_tokens': 100, 'cached_tokens': 0, 'refusals': []}
+    rows = [{**base, 'session': 0, 'turn': 1, 'class': 'announced_cold', 'extra': False},
+            {**base, 'session': 9, 'turn': 1, 'class': 'unpreviewed_cold', 'extra': True}]
+    s = tool.summarize(rows, [])
+    assert (s['announced_cold'], s['unpreviewed_cold'], s['unexplained'], s['followups']) == (1, 1, 0, 2)
+    assert s['pass'] is True

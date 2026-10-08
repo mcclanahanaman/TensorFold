@@ -200,6 +200,8 @@ def do_turn(i, k, messages, args, prev_prompt, extra=False, preview=True):
         ct = (usage.get('prompt_tokens_details') or {}).get('cached_tokens') or 0
     comp = usage.get('completion_tokens') if usage else None
     cls = classify(k, err, ct, prev_prompt, p_cached, ev_after, ev_before)
+    if not preview and cls == 'announced_cold':        # a client that never asked: its cold turn was not announced
+        cls = 'unpreviewed_cold'
     row = {'session': i, 'turn': k, 'prompt_tokens': pt, 'cached_tokens': ct, 'completion_tokens': comp,
            'prev_prompt_tokens': prev_prompt, 'preview_prompt_tokens': p_tokens, 'preview_cached_tokens': p_cached,
            'evicted_before': ev_before, 'evicted_after': ev_after, 'ttft_s': ttft,
@@ -231,6 +233,7 @@ def summarize(rows, timeline, require_refusal=False):
     s = {'sessions': len({r['session'] for r in rows}), 'turns_sent': len(sent), 'followups': len(follow),
          'warm': sum(1 for r in follow if r['class'] == 'warm'),
          'announced_cold': sum(1 for r in follow if r['class'] == 'announced_cold'),
+         'unpreviewed_cold': sum(1 for r in follow if r['class'] == 'unpreviewed_cold'),
          'raced': sum(1 for r in follow if r['class'] == 'raced'),
          'unexplained': sum(1 for r in follow if r['class'] == 'unexplained'),
          'errors': sum(1 for r in rows if r.get('error')),
