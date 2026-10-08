@@ -65,6 +65,15 @@ def of(app) -> dict[str, Any]:
         "evicted_kept_by": dict(getattr(decoder, "evicted_by", {}) or {}),
         "waits_total": int(getattr(gate, "waits", 0) or 0), "ended_total": int(getattr(gate, "ends", 0) or 0),
     })
+    waiting = getattr(scheduler, "waiting", None)
+    refused = dict(getattr(scheduler, "refused", {}) or {})
+    queued = (waiting.qsize() if waiting is not None else 0) + (getattr(scheduler, "held", None) is not None)
+    body.update({        # requests queued for a seat or room, the bounded wait (None: unbounded) and its refusals
+        "queued_requests": queued,
+        "admission_wait_s": getattr(scheduler, "max_wait_s", None),
+        "refused_total": sum(refused.values()), "refused_by": refused,
+    })
+    seats = live + prefilling            # a prefilling request holds its seat as a decoding one does
     if gate is not None:
         free_cache_bytes = max(0, gate.room - gate.reserved_total)
         tokens = getattr(decoder, "room_tokens", None)
@@ -80,9 +89,9 @@ def of(app) -> dict[str, Any]:
         })
         body["memavailable_mib"] = _memavailable_mib()
         body["pool_headroom_mib"] = _pool_mib(gate)
-        body["overloaded"] = live >= max_streams or free_cache_bytes <= 0
+        body["overloaded"] = seats >= max_streams or free_cache_bytes <= 0
     else:
-        body["overloaded"] = live >= max_streams
+        body["overloaded"] = seats >= max_streams
     return body
 
 

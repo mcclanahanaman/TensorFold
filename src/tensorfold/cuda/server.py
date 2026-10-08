@@ -388,8 +388,12 @@ class App:
                         float(min_p))
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
-            prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None) -> dict[str, Any]:
-        """One reply; once ``cancelled()`` holds, a waiting request raises ``RequestCancelled`` unstarted, a running one stops at its next round and raises it after ``generate``."""
+            prepared: PreparedRequest | None = None, cancelled: Callable[[], bool] | None = None,
+            admitted: Callable[[], None] | None = None) -> dict[str, Any]:
+        """One reply; once ``cancelled()`` holds, a waiting request raises ``RequestCancelled`` unstarted, a running one stops at its next round and raises it after ``generate``.
+
+        ``admitted`` runs once the request takes its seat (before its first token); an engine that takes it may then
+        refuse the request while it waits for a seat or room (a CapacityError, before anything was emitted)."""
 
         arrived = time.perf_counter()
         prepared = prepared if prepared is not None else self.prepare(body, chat)
@@ -493,6 +497,12 @@ class App:
         gates = [g for g in (gate, budget, Yield(turns) if yielding else None) if g is not None]
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
+        # the first run tells ``admitted`` when it takes its seat (and may be refused while it waits); a run after a
+        # gate's cut continues a reply already under way, so it waits its turn and is never refused
+        start = [admitted] if admitted is not None else []
+        if start and "admitted" not in inspect.signature(self.engine.generate).parameters:
+            start = []                      # this engine does not report admission: the request starts now
+            admitted()
 
         def generate(ids: list[int], count: int, feed: Callable[[list[int]], bool]) -> Any:
             if yielding and cached:                 # a run after a cut: foreground requests waiting go first
@@ -510,6 +520,8 @@ class App:
                 same = list(ids) == list(prepared.vision.token_ids)
                 extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
                                                                        self.vision.frontend.config)
+            if start:
+                extra["admitted"] = start.pop()
             stats = self.engine.generate(ids, count, sampling, feed, **extra)
             if not cached:
                 cached.append(int((stats or {}).get("cached") or 0))

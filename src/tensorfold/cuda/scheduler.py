@@ -3,13 +3,38 @@
 
 from __future__ import annotations
 
+import heapq
 import itertools
+import math
+import os
 import queue
 import threading
+import time
 from typing import Any, Callable
 
 from .memory_gate import NoRoom
 from .streams import Stream
+
+
+WAIT_ENV = "TENSORFOLD_ADMISSION_WAIT_S"
+SLOTS_RETRY_S = 2.0             # Retry-After for a request refused because every seat stayed live (as the preview's)
+MEMORY_RETRY_S = 5.0            # ... because the cache room stayed promised to live requests
+
+
+def admission_wait_s() -> float | None:
+    """The longest a request that accepts a refusal waits for a seat or for cache room before its HTTP 503
+    (``TENSORFOLD_ADMISSION_WAIT_S``, seconds; 0 refuses at once). Unset or empty: requests wait until admitted."""
+
+    value = os.environ.get(WAIT_ENV, "").strip()
+    if not value:
+        return None
+    try:
+        wait = float(value)
+    except ValueError:
+        wait = -1.0
+    if not (math.isfinite(wait) and wait >= 0):
+        raise ValueError(f"{WAIT_ENV}: seconds, 0 or more, not {value!r}")
+    return wait
 
 
 class Waiting(queue.PriorityQueue):
@@ -47,9 +72,13 @@ class Waiting(queue.PriorityQueue):
 
 
 class Scheduler:
-    def __init__(self, decoder: Any, *, max_streams: int = 4) -> None:
+    def __init__(self, decoder: Any, *, max_streams: int = 4, max_wait_s: float | None = None) -> None:
         self.decoder = decoder
         self.max_streams = max_streams
+        # a request submitted with ``admitted`` is refused (NoRoom: 503 + Retry-After + reason) once it has waited
+        # this long for a seat or for room; None (TENSORFOLD_ADMISSION_WAIT_S unset): every request waits its turn
+        self.max_wait_s = admission_wait_s() if max_wait_s is None else float(max_wait_s)
+        self.refused = {"slots": 0, "memory": 0}     # requests refused after that wait, by reason (/v1/capacity)
         self.waiting = Waiting()
         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
         self.boxes: dict[int, queue.Queue] = {}
@@ -68,18 +97,27 @@ class Scheduler:
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
-               constraint: Any = None, background: bool = False, probabilities: Any = None) -> dict:
-        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats."""
+               constraint: Any = None, background: bool = False, probabilities: Any = None,
+               admitted: Callable[[], None] | None = None) -> dict:
+        """Decode one request; ``emit`` runs on the calling thread and returns True to stop. Returns its stats.
+
+        ``admitted`` (on the calling thread, when the request takes its seat, before any token) also lets the request
+        be refused while it waits: past ``max_wait_s`` it raises NoRoom ("slots" or "memory", with a retry hint)."""
 
         box: queue.Queue = queue.Queue()
         stream = Stream(list(prompt), max(1, count), sampling, draft=draft, stop_eos=stop_eos, vision=vision,
                         constraint=constraint, background=background, probabilities=probabilities)
+        if admitted is not None and self.max_wait_s is not None:
+            stream.queued = time.monotonic()
         cancel = [False]
         stream.emit = lambda new: (box.put(("tokens", new)), cancel[0])[1]
         self.waiting.put((stream, box))
         while True:
             kind, value = box.get()
-            if kind == "tokens":
+            if kind == "admitted":
+                if admitted is not None:
+                    admitted()
+            elif kind == "tokens":
                 if not cancel[0] and emit(value):
                     cancel[0] = True                 # the client left: the stream ends after its next round
             elif kind == "error":
@@ -102,7 +140,7 @@ class Scheduler:
         for _, box in boxes:
             while True:
                 kind, value = box.get()
-                if kind == "tokens":
+                if kind in ("tokens", "admitted"):
                     continue
                 if kind == "error":
                     error = error or value
@@ -139,9 +177,41 @@ class Scheduler:
             except Exception as exc:                 # noqa: BLE001  (this request fails, the others go on)
                 self.boxes.pop(id(stream)).put(("error", exc))
                 continue
+            stream.queued = None
+            box.put(("admitted", None))
             if stream.done:
                 done.append(stream)
         return done
+
+    def _expire(self) -> None:
+        """Refuse the requests that accept a refusal and have waited ``max_wait_s`` for admission: NoRoom with the
+        reason ("slots": every seat stayed live; "memory": the room stayed promised) and its retry hint. A request
+        that has started (a background replay) or that waits patiently (``queued`` None) is never refused."""
+
+        if self.max_wait_s is None:
+            return
+        now = time.monotonic()
+        late = lambda s: s.queued is not None and now - s.queued >= self.max_wait_s   # noqa: E731
+        out = []
+        if self.held is not None and late(self.held[0]):
+            out.append((*self.held, "memory"))          # held: admission found no room for it
+            self.held = None
+        full = self.decoder.live() >= self.max_streams
+        with self.waiting.mutex:
+            items = self.waiting.queue
+            gone = [e for e in items if e[2] is not None and late(e[2][0])]
+            if gone:
+                items[:] = [e for e in items if e[2] is None or not late(e[2][0])]
+                heapq.heapify(items)
+        out += [(*e[2], "slots" if full else "memory") for e in gone]
+        for stream, box, reason in out:
+            retry = SLOTS_RETRY_S if reason == "slots" else MEMORY_RETRY_S
+            self.refused[reason] = self.refused.get(reason, 0) + 1
+            what = (f"all {self.max_streams} seats stayed busy" if reason == "slots" else
+                    "the cache room stayed promised to the live requests")
+            box.put(("error", NoRoom(f"this server is at capacity: {what} for {self.max_wait_s:g} s while this "
+                                     f"request waited; retry after {retry:g} s", reason=reason,
+                                     retry_after_s=retry)))
 
     def _yield(self) -> None:
         """Lanes full, a foreground request waiting: the newest background stream (no grammar or images) re-queues."""
@@ -171,6 +241,7 @@ class Scheduler:
             if idle and first is None:
                 return                                                                # close()
             done = self._admit(first)
+            self._expire()                           # after admission: a seat freed this round goes to a waiter first
             try:
                 done += self.decoder.round()
             except Exception as exc:                 # noqa: BLE001  (the live requests fail)

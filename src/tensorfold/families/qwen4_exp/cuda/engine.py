@@ -473,8 +473,11 @@ class FlashNextEngine:
 
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,
-                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None) -> dict[str, Any]:
-        """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones."""
+                 stop_eos: bool = True, background: bool = False, probabilities=None, *, vision=None,
+                 admitted: Callable[[], None] | None = None) -> dict[str, Any]:
+        """``draft=False``: one token a round, no MTP drafts; ``background``: last, yielding lanes to waiting ones;
+        ``admitted``: called when the request takes its seat, and a request that passes it may be refused while it
+        waits (``--parallel``: the scheduler's bounded wait, ``TENSORFOLD_ADMISSION_WAIT_S``)."""
 
         max_tokens = self._limit(prompt, max_tokens)
         if probabilities is not None and not self.supports_logprobs:
@@ -490,7 +493,10 @@ class FlashNextEngine:
             return self.scheduler.submit(list(prompt), max_tokens, sampling, draft, on_tokens, stop_eos=stop_eos,
                                          **grammar, **({"background": True} if background else {}),
                                          probabilities=probabilities,
-                                         **({"vision": vision} if vision is not None else {}))
+                                         **({"vision": vision} if vision is not None else {}),
+                                         **({"admitted": admitted} if admitted is not None else {}))
+        if admitted is not None:             # one request at a time: it starts now
+            admitted()
         hit = self._resume(prompt) if draft else None
         points = None
         if self.tp == 2:                     # rank 0 decodes exactly what it hands rank 1

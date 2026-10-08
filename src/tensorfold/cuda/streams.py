@@ -43,6 +43,7 @@ class Stream:
     prefill_s: float = 0.0
     started: float = 0.0
     finished: float = 0.0
+    queued: float | None = None                           # monotonic time a request that may be refused was queued
 
     def take(self, new: list[int], eos: Sequence[int] = ()) -> None:
         """Append a round's tokens and emit them; the stream ends at its count, an end token or a stop."""

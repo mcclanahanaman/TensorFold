@@ -238,13 +238,30 @@ On CUDA's `--parallel` decoder every admitted request is promised its worst case
 its prompt, its `max_tokens` and the drafts' rows reach, plus one layer's buffers for the last grow's copy. Admission
 never ends an already-admitted, already-decoding request to make room for a new one. A request whose worst case does
 not fit what the live requests' promises leave waits in the server's queue, first in line, until a live request
-finishes; one whose worst case exceeds the whole cache room, so that no wait would ever make it fit, is refused at
-once with HTTP 400 `context_length_exceeded` and OpenAI's wording ("This server's maximum context length is N
-tokens ..."), naming the largest prompt-plus-reply this server's memory holds for one request. A transient refusal
-is HTTP 503 with `Retry-After` (seconds, an integer, rounded up) and an `error` object whose `reason` is a short
-machine-readable tag: `"memory"` (cache room) or `"slots"` (every `--parallel` seat is in use). A non-streamed
-request gets the `Retry-After` header; a request that asked to stream gets the same `error` object (with `reason`)
-as its stream's error event, since a header cannot follow an already-open stream.
+finishes, and a request that finds every `--parallel` seat in use waits behind it; one whose worst case exceeds the
+whole cache room, so that no wait would ever make it fit, is refused at once with HTTP 400 `context_length_exceeded`
+and OpenAI's wording ("This server's maximum context length is N tokens ..."), naming the largest prompt-plus-reply
+this server's memory holds for one request. A transient refusal is HTTP 503 with `Retry-After` (seconds, an integer,
+rounded up) and an `error` object whose `reason` is a short machine-readable tag: `"memory"` (cache room) or
+`"slots"` (every `--parallel` seat is in use).
+
+How long a request may wait is the server's choice:
+
+- **Unbounded (the default).** Every request waits in the queue until it is admitted; nothing is refused for
+  waiting. The only transient refusal is a request that finds no room while nothing else is live.
+- **Bounded: `TENSORFOLD_ADMISSION_WAIT_S=N`** (seconds; `0` refuses at once). A `/v1/chat/completions` or
+  `/v1/completions` request that has waited N seconds without being admitted is refused with HTTP 503, `Retry-After`
+  and its `reason`: `"slots"` with `Retry-After: 2` when every seat stayed in use, `"memory"` with `Retry-After: 5`
+  when the cache room stayed promised to the live requests. A seat that frees goes to a waiting request before any
+  refusal, in arrival order. With this setting a streamed request's `200` and its first chunk wait until the request
+  takes its seat, so a refusal is the same HTTP 503 with the header, never an error event inside an opened stream.
+  A reply already under way (a continuation after a thinking budget's or a required tool call's cut, or a
+  background request that gave up its seat to a foreground one) waits its turn and is never refused, and the
+  Anthropic and Responses routes keep the unbounded wait. The Jetson AGX Thor recipe
+  ([docs/recipes/thor-sm110.md](recipes/thor-sm110.md)) sets 30 seconds.
+
+Without the bounded wait a request that asked to stream is answered `200` at once, so a refusal reaches it as the same
+`error` object (with `reason`) in its stream's error event, since a header cannot follow an already-open stream.
 
 Kept conversations (each slot's chain of resume points: a prompt's end, a message start) live in whatever room the
 live requests leave. When a grow needs room, a new request needs a slot, or the kept points pass their cap, the
@@ -269,9 +286,12 @@ client or a router to read before sending, so it can back off before the server 
 | `kept_sessions_total_tokens`, `kept_bytes` | Sums over `kept_sessions` |
 | `evicted_kept_sessions_total`, `evicted_kept_by` | Kept conversations freed since startup, and by cause: `memory` (a grow's room), `slots` (a request's slot), `entries` (past the kept points' cap) |
 | `waits_total`, `ended_total` | Counts of a live stream pausing for room, and of one ending for it (never an admitted stream: see above) |
+| `queued_requests` | Requests waiting for a seat or for room now |
+| `admission_wait_s` | The bounded admission wait in seconds, `null` when unbounded (see above) |
+| `refused_total`, `refused_by` | Requests refused after that wait since startup, and by `reason` (`slots`, `memory`) |
 | `pooled`, `pool_bytes` | Whether the caches come from one pool reserved at load (Jetson AGX Thor), and its size |
 | `memavailable_mib`, `pool_headroom_mib` | The host's `MemAvailable`, and the wide-piece guard's driver headroom (`null` without that guard) |
-| `overloaded` | `true` when every seat is live or `free_cache_bytes` is 0: a new request is likely to wait |
+| `overloaded` | `true` when every seat is taken (decoding or prefilling) or `free_cache_bytes` is 0: a new request is likely to wait |
 
 `POST /v1/capacity` (and `/capacity`) with a request body, the one a client is about to send to
 `/v1/chat/completions` (`messages`) or `/v1/completions` (`prompt`), previews that request without running it:

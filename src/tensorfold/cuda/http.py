@@ -180,14 +180,31 @@ def make_handler(app: App):
                 return {"id": rid, "object": kind, "created": created, "model": model,
                         "choices": [{"index": 0, "text": delta.get("content", ""), "finish_reason": finish}]}
 
+            # a scheduler's bounded admission wait (TENSORFOLD_ADMISSION_WAIT_S) can refuse a queued request: a stream's
+            # headers then wait for its seat, so a refusal is a plain 503 + Retry-After + reason, never an error event
+            scheduler = getattr(getattr(app, "engine", None), "scheduler", None)
+            bounded = getattr(scheduler, "max_wait_s", None) is not None
             if stream:
-                self.send_response(200)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
+                opened = [False]
+
+                def open_stream() -> None:
+                    if opened[0]:
+                        return
+                    opened[0] = True
+                    try:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/event-stream")
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        if chat:
+                            self.wfile.write(f"data: {json.dumps(chunk({'role': 'assistant'}))}\n\n".encode())
+                            self.wfile.flush()
+                    except OSError:             # the client has gone: the reply's next emit says so
+                        pass
 
                 def emit(delta: dict[str, Any]) -> bool:
+                    open_stream()
                     try:
                         self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
                         self.wfile.flush()
@@ -195,21 +212,27 @@ def make_handler(app: App):
                     except OSError:             # reset, broken pipe, timed out, host unreachable: the client has gone
                         return False
 
-                if chat:
-                    emit({"role": "assistant"})
+                if not bounded:
+                    open_stream()
                 try:
-                    result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
+                    result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled,
+                                     **({"admitted": open_stream} if bounded else {}))
                 except RequestCancelled:
                     self.close_connection = True
                     return
                 except RequestError as exc:
+                    if not opened[0]:                   # refused before its seat: the status and headers say so
+                        return self._capacity_json(exc, field)
                     eb = error_body(exc, field)
                     if isinstance(exc, CapacityError) and getattr(exc, "reason", None):
                         eb["reason"] = exc.reason          # par-1-fix: a stream can't carry Retry-After as a header
                     return self._stream_error(eb)
                 except Exception as exc:
                     _log_error(exc)
+                    if not opened[0]:
+                        return self._json(500, {"error": {"message": _error_message(exc), "type": "server_error"}})
                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
+                open_stream()                           # a reply that emitted nothing still opens its stream
                 if result["final"]:
                     emit(result["final"])
                 if result["calls"]:
@@ -238,7 +261,8 @@ def make_handler(app: App):
                 self.close_connection = True
                 return
             try:
-                result = app.run(body, chat, lambda delta: True, prepared=prepared, cancelled=cancelled)
+                result = app.run(body, chat, lambda delta: True, prepared=prepared, cancelled=cancelled,
+                                 **({"admitted": lambda: None} if bounded else {}))
             except RequestCancelled:
                 self.close_connection = True
                 return
