@@ -8,6 +8,13 @@
 // when its way is needed again, a row used meanwhile moves to a main way (CLOCK over the main ways) and an unused one
 // leaves, so a one-pass scan of new rows never displaces rows used twice. ``probation`` 0: CLOCK over all ways, a new
 // row entering with ``init`` uses.
+// Phase 2 (HD-2026-10-07-04): a shard with a negative scale offset is a repacked row file (one record of code bytes, then
+// scale bytes, a row: ONE read a row, two pages when a record straddles one). Arrival reads (``tfnr_prefetch``): a prompt's
+// first rows read ahead of its stage by low-priority threads that yield to every foreground gather, inserted as "ahead"
+// rows (kAhead) whose first use counts as their insertion, so the cache policy sees what it would without them; the stage
+// joins the job (``tfnr_prefetch_wait``) and reads the rest at full width. Snapshot: the cache dumped and loaded set by set.
+#include <algorithm>
+#include <chrono>
 #include <fcntl.h>
 #include <linux/aio_abi.h>
 #include <sys/mman.h>
@@ -51,7 +58,10 @@ long sys_io_getevents(aio_context_t ctx, long lo, long hi, io_event* ev) {
   return syscall(SYS_io_getevents, ctx, lo, hi, ev, nullptr);
 }
 
-struct Shard { int fd; int64_t codes, scales, rows; };
+struct Shard { int fd; int64_t codes, scales, rows; };      // scales < 0: packed records of row bytes from ``codes``
+
+constexpr uint8_t kAhead = 0x80;      // a slot's use byte: read ahead (arrival), not used yet
+constexpr size_t kMaxAhead = size_t(1) << 20;
 
 // One read: [off, off + len) of fd into a page buffer, then ``n`` bytes from ``at`` of it to ``dst``.
 struct Cmd { int fd; uint32_t len; int64_t off; uint8_t* dst; uint32_t at, n; };
@@ -249,6 +259,20 @@ struct Crew {
 
 constexpr int kRecords = 1 << 16;
 
+// An arrival read: a prompt's missing rows, read ahead of its stage; claimed in slices by the arrival threads and by a
+// waiter (all the rest at once); the thread that completes it inserts the rows.
+struct PJob {
+  int64_t ticket = 0;
+  std::vector<int64_t> rows;
+  std::vector<uint8_t> buf;
+  std::vector<Cmd> cmds;
+  std::atomic<int64_t> next{0}, done{0};
+  std::atomic<int> err{0};
+  bool finished = false;              // under pf_m
+  int users = 0;                      // arrival threads holding it (under pf_m)
+  uint64_t t_done = 0;
+};
+
 struct Table {
   std::vector<Shard> shards;
   std::vector<int> fds;
@@ -278,6 +302,15 @@ struct Table {
   std::atomic<int64_t> st[24];
   std::atomic<int64_t> rec_at{0};
   std::vector<int64_t> recs;          // [kRecords, 4]: rows, wall ns, read ns, unique misses
+  // arrival reads
+  std::atomic<int> fg{0};             // foreground gathers running: arrival reads wait for them
+  std::mutex pf_m;
+  std::condition_variable pf_cv, pf_done;
+  std::vector<PJob*> pf_jobs;
+  std::vector<std::thread> pf_threads;
+  std::atomic<bool> pf_stop{false};
+  int64_t pf_ticket = 1;
+  int pf_width = 2, pf_wave = 64;
   // background load (benchmarks)
   std::atomic<bool> bg_stop{false};
   std::vector<std::thread> bg;
@@ -286,6 +319,13 @@ struct Table {
   ~Table() {
     bg_stop.store(true);
     for (auto& b : bg) b.join();
+    {
+      std::lock_guard<std::mutex> lk(pf_m);
+      pf_stop.store(true);
+    }
+    pf_cv.notify_all();
+    for (auto& p : pf_threads) p.join();
+    for (auto* j : pf_jobs) delete j;
     readers.shutdown();
     cpu.shutdown();
     for (auto* r : crew_readers) delete r;
@@ -311,7 +351,9 @@ struct Table {
     lock(s);
     for (int w = 0; w < ways; ++w) {
       if (tags[base + w] == tag) {
-        if (uses[base + w] < 3) ++uses[base + w];
+        uint8_t& u = uses[base + w];
+        if (u & kAhead) { u = fresh(); st[14].fetch_add(1, std::memory_order_relaxed); }   // its first use: an insertion
+        else if (u < 3) ++u;
         if (dst) std::memcpy(dst, data + (base + w) * rb, rb);
         unlock(s);
         return true;
@@ -320,17 +362,31 @@ struct Table {
     unlock(s);
     return false;
   }
+  uint8_t fresh() const { return uint8_t(probation > 0 ? 0 : init); }
+  bool contains(int64_t row) {
+    uint64_t s = set_of(row), base = s * ways;
+    uint32_t tag = uint32_t(row + 1);
+    bool found = false;
+    lock(s);
+    for (int w = 0; w < ways && !found; ++w) found = tags[base + w] == tag;
+    unlock(s);
+    return found;
+  }
   // CLOCK over ways [lo, hi) of a set: the first way with no uses left, taking one use from each way passed.
   int clock(uint64_t s, int lo, int hi) {
     uint64_t base = s * ways;
     int h = hands[2 * s] < lo || hands[2 * s] >= hi ? lo : hands[2 * s];
-    while (uses[base + h]) { --uses[base + h]; h = h + 1 < hi ? h + 1 : lo; }
+    while (uses[base + h]) {
+      uint8_t& u = uses[base + h];
+      u = (u & kAhead) ? 0 : uint8_t(u - 1);
+      h = h + 1 < hi ? h + 1 : lo;
+    }
     hands[2 * s] = uint8_t(h + 1 < hi ? h + 1 : lo);
     return h;
   }
   // Puts a row in its set: an empty way, else (probation) the next probation way, its row moved to a main way first if
   // it was used there, else (no probation) CLOCK over all ways. Whether a row left the cache.
-  bool insert(int64_t row, const uint8_t* src) {
+  bool insert(int64_t row, const uint8_t* src, bool ahead = false) {
     if (!sets) return false;
     uint64_t s = set_of(row), base = s * ways;
     uint32_t tag = uint32_t(row + 1);
@@ -345,7 +401,7 @@ struct Table {
     if (way < 0 && probation > 0) {
       way = hands[2 * s + 1] % probation;                 // the probation FIFO's oldest way
       hands[2 * s + 1] = uint8_t((way + 1) % probation);
-      if (uses[base + way]) {                             // used while on probation: into the main ways
+      if (uses[base + way] & 3) {                         // used while on probation: into the main ways
         int m = clock(s, probation, ways);
         tags[base + m] = tags[base + way];
         uses[base + m] = 1;
@@ -358,7 +414,7 @@ struct Table {
       evicted = true;
     }
     tags[base + way] = tag;
-    uses[base + way] = start;
+    uses[base + way] = ahead ? kAhead : start;
     if (src) std::memcpy(data + (base + way) * rb, src, rb);
     unlock(s);
     return evicted;
@@ -375,11 +431,11 @@ struct Table {
   }
   void give_reader(Reader* r) { std::lock_guard<std::mutex> lk(callers_m); callers.push_back(r); }
 
-  int read(const std::vector<Cmd>& cmds) {
-    if (cmds.empty()) return 0;
+  int read(const Cmd* cmds, int64_t count) {
+    if (count <= 0) return 0;
     Job j;
-    j.cmds = cmds.data();
-    j.count = int64_t(cmds.size());
+    j.cmds = cmds;
+    j.count = count;
     int width = aio ? int((j.count + per_reader - 1) / per_reader) - 1 : int(j.count) - 1;
     if (width > int(readers.threads.size())) width = int(readers.threads.size());
     Reader* mine = take_reader();
@@ -401,6 +457,70 @@ struct Table {
     int64_t a = off & ~int64_t(page - 1), end = off + n;
     uint32_t len = uint32_t(((end - a) + int64_t(page) - 1) & ~int64_t(page - 1));
     cmds.push_back(Cmd{fd, len, a, dst, uint32_t(off - a), n});
+  }
+  // A row's reads into dst (code bytes, then scale bytes): one for a packed record, two for the checkpoint as stored.
+  void commands(std::vector<Cmd>& cmds, int64_t row, uint8_t* dst) const {
+    int64_t f = shard_of(row), local = row - starts[size_t(f)];
+    const Shard& s = shards[size_t(f)];
+    if (s.scales < 0) { add(cmds, s.fd, s.codes + local * rb, uint32_t(rb), dst); return; }
+    add(cmds, s.fd, s.codes + local * cb, uint32_t(cb), dst);
+    add(cmds, s.fd, s.scales + local * sb, uint32_t(sb), dst + cb);
+  }
+
+  // Arrival reads: up to ``width`` of a job's unclaimed reads (all the rest: width < 0) with reader r (nullptr: this
+  // thread and the reader crew); the thread that completes the job inserts its rows (none after an error).
+  void claim(PJob& j, Reader* r, int64_t width) {
+    int64_t total = int64_t(j.cmds.size());
+    int64_t a = j.next.fetch_add(width < 0 ? total : width);
+    if (a >= total) return;
+    int64_t b = width < 0 ? total : std::min(total, a + width);
+    int e;
+    if (r) {
+      Job w;
+      w.cmds = j.cmds.data() + a;
+      w.count = b - a;
+      r->run(w);
+      e = w.err.load();
+    } else {
+      e = read(j.cmds.data() + a, b - a);
+    }
+    if (e) { int z = 0; j.err.compare_exchange_strong(z, e); }
+    if (j.done.fetch_add(b - a) + (b - a) == total) finish(j);
+  }
+  void finish(PJob& j) {
+    if (!j.err.load()) {
+      int64_t ev = 0;
+      for (size_t u = 0; u < j.rows.size(); ++u) ev += insert(j.rows[u], j.buf.data() + u * size_t(rb), true);
+      st[11].fetch_add(ev);
+      st[13].fetch_add(int64_t(j.rows.size()));
+    }
+    std::lock_guard<std::mutex> lk(pf_m);
+    j.finished = true;
+    j.t_done = now_ns();
+    pf_done.notify_all();
+  }
+  void arrival_loop() {
+    Reader r;
+    if (!r.init(pf_wave, 2 * page, aio)) return;
+    std::unique_lock<std::mutex> lk(pf_m);
+    for (;;) {
+      PJob* j = nullptr;
+      pf_cv.wait(lk, [&] {
+        if (pf_stop.load()) return true;
+        for (PJob* q : pf_jobs)
+          if (!q->finished && q->next.load() < int64_t(q->cmds.size())) { j = q; return true; }
+        return false;
+      });
+      if (pf_stop.load()) return;
+      ++j->users;
+      lk.unlock();
+      while (fg.load(std::memory_order_relaxed) > 0 && !pf_stop.load())   // foreground (decode, stage) reads first
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+      claim(*j, &r, pf_wave);
+      lk.lock();
+      --j->users;
+      pf_done.notify_all();
+    }
   }
 };
 
@@ -490,6 +610,11 @@ void tfnr_info(Table* t, int64_t* out) {
 // (pairs[(scale byte << 8) | code byte] = the code byte's two bf16 values). 0, or a positive errno.
 int tfnr_gather(Table* t, const int64_t* ids, int64_t n, const uint32_t* pairs, void* out, int kind) {
   uint64_t t0 = now_ns();
+  struct Busy {
+    std::atomic<int>& c;
+    explicit Busy(std::atomic<int>& x) : c(x) { c.fetch_add(1); }
+    ~Busy() { c.fetch_sub(1); }
+  } busy(t->fg);
   const int rb = t->rb, cb = t->cb, sb = t->sb;
   if (kind == 1 && (pairs == nullptr || cb != 8 * sb)) return EINVAL;
   for (int64_t i = 0; i < n; ++i)
@@ -535,15 +660,9 @@ int tfnr_gather(Table* t, const int64_t* ids, int64_t n, const uint32_t* pairs, 
     t_uraw.resize(size_t(nu) * rb);
     t_cmds.clear();
     t_cmds.reserve(size_t(2 * nu));
-    for (int64_t u = 0; u < nu; ++u) {
-      int64_t row = t_urows[size_t(u)], f = t->shard_of(row), local = row - t->starts[size_t(f)];
-      const Shard& s = t->shards[size_t(f)];
-      uint8_t* dst = t_uraw.data() + size_t(u) * rb;
-      t->add(t_cmds, s.fd, s.codes + local * cb, uint32_t(cb), dst);
-      t->add(t_cmds, s.fd, s.scales + local * sb, uint32_t(sb), dst + cb);
-    }
+    for (int64_t u = 0; u < nu; ++u) t->commands(t_cmds, t_urows[size_t(u)], t_uraw.data() + size_t(u) * rb);
     r0 = now_ns();
-    rc = t->read(t_cmds);
+    rc = t->read(t_cmds.data(), int64_t(t_cmds.size()));
     r1 = now_ns();
     if (rc) { t->st[9].fetch_add(1); t->error = std::string("n-gram row read: ") + std::strerror(rc); return rc; }
     int64_t ev = 0;
@@ -629,11 +748,145 @@ void tfnr_background(Table* t, int threads) {
       x ^= x << 13; x ^= x >> 7; x ^= x << 17;
       int64_t row = int64_t(x % uint64_t(t->rows)), f = t->shard_of(row);
       const Shard& s = t->shards[size_t(f)];
-      int64_t off = (s.codes + (row - t->starts[size_t(f)]) * t->cb) & ~int64_t(t->page - 1);
+      int64_t off = (s.codes + (row - t->starts[size_t(f)]) * (s.scales < 0 ? t->rb : t->cb)) & ~int64_t(t->page - 1);
+
       if (pread(s.fd, buf, t->page, off) < 0 && errno != EINTR) break;
     }
     free(buf);
   });
 }
 
+// Arrival reads: ``threads`` low-priority readers (started at the first job), ``wave`` reads each in flight.
+void tfnr_arrival(Table* t, int threads, int wave) {
+  std::lock_guard<std::mutex> lk(t->pf_m);
+  if (t->pf_threads.empty()) {
+    t->pf_width = threads < 1 ? 1 : threads;
+    t->pf_wave = wave < 1 ? 1 : wave;
+  }
+}
+
+// Starts reading the rows ``ids`` that are not cached (unique, at most 2^20) ahead of their gather: a ticket for
+// ``tfnr_prefetch_wait``, or 0 when nothing needs reading (no cache, all cached).
+int64_t tfnr_prefetch(Table* t, const int64_t* ids, int64_t n) {
+  if (!t->sets || n <= 0) return 0;
+  std::vector<int64_t> rows(ids, ids + n);
+  std::sort(rows.begin(), rows.end());
+  rows.erase(std::unique(rows.begin(), rows.end()), rows.end());
+  auto* j = new PJob();
+  for (int64_t r : rows)
+    if (r >= 0 && r < t->rows && !t->contains(r) && j->rows.size() < kMaxAhead) j->rows.push_back(r);
+  t->st[12].fetch_add(n);
+  if (j->rows.empty()) { delete j; return 0; }
+  j->buf.resize(j->rows.size() * size_t(t->rb));
+  j->cmds.reserve(2 * j->rows.size());
+  for (size_t u = 0; u < j->rows.size(); ++u) t->commands(j->cmds, j->rows[u], j->buf.data() + u * size_t(t->rb));
+  std::lock_guard<std::mutex> lk(t->pf_m);
+  if (t->pf_threads.empty())
+    for (int i = 0; i < t->pf_width; ++i) t->pf_threads.emplace_back([t] { t->arrival_loop(); });
+  uint64_t now = now_ns();                 // jobs never waited for (a refused request): dropped a minute after they end
+  std::vector<PJob*> keep;
+  for (PJob* q : t->pf_jobs) {
+    if (q->finished && q->users == 0 && now - q->t_done > 60000000000ull) delete q;
+    else keep.push_back(q);
+  }
+  t->pf_jobs.swap(keep);
+
+  j->ticket = t->pf_ticket++;
+  t->pf_jobs.push_back(j);
+  t->st[16].fetch_add(1);
+  t->pf_cv.notify_all();
+  return j->ticket;
+}
+
+// Waits for an arrival job, reading all its unclaimed rows at full width first (``help`` 0: drops them unread, and the
+// job's rows are not inserted); 0, or the positive errno of a failed read (its rows are then not cached).
+int tfnr_prefetch_wait(Table* t, int64_t ticket, int help) {
+  if (ticket <= 0) return 0;
+  PJob* j = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(t->pf_m);
+    for (PJob* q : t->pf_jobs) if (q->ticket == ticket) { j = q; break; }
+    if (j) ++j->users;
+  }
+  if (!j) return 0;
+  uint64_t w0 = now_ns();
+  if (help) {
+    t->claim(*j, nullptr, -1);
+  } else {
+    int64_t total = int64_t(j->cmds.size()), a = j->next.fetch_add(total);
+    if (a < total) {
+      int z = 0;
+      j->err.compare_exchange_strong(z, ECANCELED);
+      if (j->done.fetch_add(total - a) + (total - a) == total) t->finish(*j);
+    }
+  }
+  std::unique_lock<std::mutex> lk(t->pf_m);
+  --j->users;
+  t->pf_done.wait(lk, [&] { return j->finished && j->users == 0; });
+  int e = j->err.load();
+  t->pf_jobs.erase(std::remove(t->pf_jobs.begin(), t->pf_jobs.end(), j), t->pf_jobs.end());
+  delete j;
+  t->st[15].fetch_add(int64_t(now_ns() - w0));
+  return e == ECANCELED ? 0 : e;
+}
+
+// Snapshot (warm start): [tags u32 x slots][uses u8 x slots][hands u8 x 2 sets][row bytes x slots], copied set by set
+// under each set's lock; a row read ahead and not used yet is saved as unused. The bytes; the dump returns the rows held.
+int64_t tfnr_snapshot_bytes(Table* t) {
+  uint64_t slots = t->sets * uint64_t(t->ways);
+  return int64_t(slots * (5 + uint64_t(t->rb)) + 2 * t->sets);
+}
+int64_t tfnr_snapshot_dump(Table* t, uint8_t* out) {
+  const uint64_t slots = t->sets * uint64_t(t->ways), W = uint64_t(t->ways), rb = uint64_t(t->rb);
+  uint8_t* tags = out;
+  uint8_t* uses = out + 4 * slots;
+  uint8_t* hands = uses + slots;
+  uint8_t* data = hands + 2 * t->sets;
+  int64_t held = 0;
+  for (uint64_t s = 0; s < t->sets; ++s) {
+    const uint64_t b = s * W;
+    t->lock(s);
+    std::memcpy(tags + 4 * b, t->tags + b, 4 * W);
+    for (uint64_t w = 0; w < W; ++w) uses[b + w] = t->uses[b + w] & 3;
+    hands[2 * s] = t->hands[2 * s];
+    hands[2 * s + 1] = t->hands[2 * s + 1];
+    std::memcpy(data + b * rb, t->data + b * rb, W * rb);
+    t->unlock(s);
+    for (uint64_t w = 0; w < W; ++w) held += t->tags[b + w] != 0;
+  }
+  return held;
+}
+// Loads a dump of this geometry (sets, ways, row bytes). Every slot is checked first (a tag in its own set and in range,
+// use counts and hands in range): EINVAL and nothing loaded on any mismatch; 0 after the load.
+int tfnr_snapshot_load(Table* t, const uint8_t* in, int64_t sets, int ways, int row_bytes) {
+  if (!t->sets || sets < 0 || uint64_t(sets) != t->sets || ways != t->ways || row_bytes != t->rb) return EINVAL;
+  const uint64_t slots = t->sets * uint64_t(t->ways), W = uint64_t(t->ways), rb = uint64_t(t->rb);
+  const uint8_t* tags = in;
+  const uint8_t* uses = in + 4 * slots;
+  const uint8_t* hands = uses + slots;
+  const uint8_t* data = hands + 2 * t->sets;
+  const int pw = t->probation > 0 ? t->probation : 1;
+  for (uint64_t s = 0; s < t->sets; ++s) {
+    if (hands[2 * s] >= W || hands[2 * s + 1] >= uint64_t(pw)) return EINVAL;
+    for (uint64_t w = 0; w < W; ++w) {
+      uint32_t tag;
+      std::memcpy(&tag, tags + 4 * (s * W + w), 4);
+      if (uses[s * W + w] > 3) return EINVAL;
+      if (tag && (int64_t(tag) - 1 >= t->rows || t->set_of(int64_t(tag) - 1) != s)) return EINVAL;
+    }
+  }
+  for (uint64_t s = 0; s < t->sets; ++s) {
+    const uint64_t b = s * W;
+    t->lock(s);
+    std::memcpy(t->tags + b, tags + 4 * b, 4 * W);
+    std::memcpy(t->uses + b, uses + b, W);
+    t->hands[2 * s] = hands[2 * s];
+    t->hands[2 * s + 1] = hands[2 * s + 1];
+    std::memcpy(t->data + b * rb, data + b * rb, W * rb);
+    t->unlock(s);
+  }
+  return 0;
+}
+
 }  // extern "C"
+

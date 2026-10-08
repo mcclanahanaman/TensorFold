@@ -177,3 +177,153 @@ def test_policy_only_table():
     ids = np.arange(0, 3000, dtype=np.int64)
     assert sim.simulate(ids).sum() == 0 and sim.simulate(ids).sum() == 3000
     assert thor_nvme.NVMeTable.policy(4096).info()["probation"] == thor_nvme.PROBATION
+
+
+# Phase 2 (HD-2026-10-07-04): the repacked row file, arrival reads, the cache snapshot.
+
+def _packed(checkpoint, tmp_path):
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools" / "thor"))
+    import ngram_repack
+
+    root, keys, _ = checkpoint
+    index = {"weight_map": {k + s: name for name, k in keys for s in (".weight", ".weight_scale")}}
+    (root / "model.safetensors.index.json").write_text(json.dumps(index))
+    out = tmp_path / "ngram.rows"
+    ngram_repack.build(root, out)
+    return root, keys, out
+
+
+def _open(root, keys, cache_rows, monkeypatch, out):
+    monkeypatch.setenv(thor_nvme.FILE_ENV, str(out))
+    direct = _direct_ok(out)
+    return thor_nvme.open_table(root, keys, lambda n: 0.03125, cache_bytes=cache_rows * thor_nvme.ROW_SLOT,
+                                direct=direct)
+
+
+@pytest.mark.parametrize("cache_rows", [0, 100_000])
+def test_packed_rows_equal_the_mapped_table(checkpoint, tmp_path, monkeypatch, cache_rows):
+    root, keys, out = _packed(checkpoint, tmp_path)
+    got = _open(root, keys, cache_rows, monkeypatch, out)
+    assert got.packed == str(out) and "one read a row" in got.note()
+    ref = NVFP4Table(checkpoint[2], 0.03125)
+    ref.use_pairs()
+    rng = np.random.default_rng(11)
+    ids = np.concatenate([rng.integers(0, ref.rows, 3000), np.arange(ref.rows - 5, ref.rows), np.arange(0, 5),
+                          ref.starts[1:-1], ref.starts[1:-1] - 1])
+    shard, local = ref._where(ids)
+    raw = got.raw(ids)
+    for f in range(len(checkpoint[2])):
+        at = shard == f
+        assert np.array_equal(raw[at, :CODES], ref.values[f][local[at]])
+        assert np.array_equal(raw[at, CODES:], ref.scales[f][local[at]])
+    got.reset_stats()
+    assert np.array_equal(got.gather(ids), ref.gather(ids))
+    s = got.stats()
+    assert s["reads"] == s["unique_misses"] > 0 or cache_rows                       # one read a row
+    if not cache_rows:
+        assert s["reads"] == np.unique(ids).size
+
+
+def test_packed_manifest_refusals(checkpoint, tmp_path, monkeypatch):
+    root, keys, out = _packed(checkpoint, tmp_path)
+    good = json.loads(open(str(out) + ".json").read())
+    for change in ({"rows": good["rows"] + 1}, {"format": "x/2"}, {"record_bytes": 91}, {"revision": "abc"},
+                   {"shards": good["shards"][:-1]},
+                   {"shards": [dict(good["shards"][0], code_offset=good["shards"][0]["code_offset"] + 8)]
+                    + good["shards"][1:]}):
+        with open(str(out) + ".json", "w") as f:
+            json.dump(dict(good, **change), f)
+        if change.get("revision"):                    # a hub snapshot directory named for another revision
+            snap = tmp_path / "snapshots" / "def456"
+            snap.parent.mkdir(exist_ok=True)
+            if not snap.exists():
+                snap.symlink_to(root, target_is_directory=True)
+            with pytest.raises(ValueError, match="revision"):
+                _open(snap, keys, 64, monkeypatch, out)
+            continue
+        with pytest.raises(ValueError):
+            _open(root, keys, 64, monkeypatch, out)
+    with open(str(out) + ".json", "w") as f:
+        json.dump(good, f)
+    _open(root, keys, 64, monkeypatch, out)           # restored: opens
+    data = bytearray(out.read_bytes())                # one byte of row 0 changed: the sample check refuses
+    data[3] ^= 0x40
+    bad = tmp_path / "bad.rows"
+    bad.write_bytes(bytes(data))
+    with open(str(bad) + ".json", "w") as f:
+        json.dump(good, f)
+    with pytest.raises(ValueError, match="row 0 differs"):
+        _open(root, keys, 64, monkeypatch, bad)
+    os.remove(str(out) + ".json")
+    with pytest.raises(ValueError, match="manifest"):
+        _open(root, keys, 64, monkeypatch, out)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_arrival_reads(checkpoint, tmp_path, monkeypatch, packed):
+    root, keys, out = _packed(checkpoint, tmp_path)
+    if packed:
+        got = _open(root, keys, 100_000, monkeypatch, out)
+    else:
+        monkeypatch.delenv(thor_nvme.FILE_ENV, raising=False)
+        got = thor_nvme.open_table(root, keys, lambda n: 0.03125, cache_bytes=100_000 * thor_nvme.ROW_SLOT,
+                                   direct=_direct_ok(checkpoint[2][0][0]))
+    ref = NVFP4Table(checkpoint[2], 0.03125)
+    ref.use_pairs()
+    rng = np.random.default_rng(5)
+    ids = rng.integers(0, ref.rows, 2000)
+    ticket = got.ahead(ids)
+    assert ticket > 0 and got.wait(ticket) == 0
+    assert got.ahead(ids) == 0                        # all cached now: nothing to read
+    got.reset_stats()
+    assert np.array_equal(got.gather(ids), ref.gather(ids))
+    s = got.stats()
+    assert s["hits"] == ids.size and s["reads"] == 0 and s["ahead_used"] == np.unique(ids).size
+    more = rng.integers(0, ref.rows, 3000)            # a cancelled job, then the gather reads what is missing
+    t2 = got.ahead(more)
+    assert got.wait(t2, help=False) == 0 and got.wait(t2) == 0
+    assert np.array_equal(got.gather(more), ref.gather(more))
+    threads = [threading.Thread(target=lambda k=k: got.wait(got.ahead(rng.integers(0, ref.rows, 500 + k))))
+               for k in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert got.stats()["errors"] == 0
+
+
+def test_snapshot_round_trip(checkpoint, tmp_path, monkeypatch):
+    root, keys, out = _packed(checkpoint, tmp_path)
+    a = _open(root, keys, 2048, monkeypatch, out)
+    ref = NVFP4Table(checkpoint[2], 0.03125)
+    ref.use_pairs()
+    ids = np.random.default_rng(3).integers(0, ref.rows, 1500)
+    a.gather(ids)
+    a.gather(ids[:700])                               # some rows used twice: main ways
+    geometry, payload = a.snapshot()
+    assert geometry["held"] > 0 and geometry["rows"] == ref.rows
+    b = _open(root, keys, 2048, monkeypatch, out)
+    assert b.restore(geometry, payload)
+    b.reset_stats()
+    a.reset_stats()
+    assert np.array_equal(b.gather(ids), ref.gather(ids)) and np.array_equal(a.gather(ids), ref.gather(ids))
+    assert b.stats()["hits"] == a.stats()["hits"] > 0          # the same cache, the same hits
+    assert b.snapshot()[1].tobytes() == a.snapshot()[1].tobytes()
+    c = _open(root, keys, 4096, monkeypatch, out)     # another geometry: refused, nothing loaded
+    assert not c.restore(geometry, payload)
+    sets = geometry["sets"]
+    tags = payload[:4 * sets * 16].view(np.uint32).copy()
+    held = np.flatnonzero(tags)
+    for bad_tag in (np.uint32(ref.rows + 5), None):  # out of range; a row in another set
+        broken = payload.copy()
+        t = broken[:4 * sets * 16].view(np.uint32)
+        if bad_tag is None:
+            k = int(held[0])
+            t[k] = t[int(next(j for j in held if j // 16 != k // 16))]
+        else:
+            t[int(held[0])] = bad_tag
+        d = _open(root, keys, 2048, monkeypatch, out)
+        assert not d.restore(geometry, broken)
+        assert d.stats()["hits"] == 0 and d.snapshot()[0]["held"] == 0

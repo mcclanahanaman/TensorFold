@@ -17,6 +17,13 @@ Switches (read at load):
   reader (64), ``TENSORFOLD_THOR_NGRAM_HELPERS`` extra reader threads for prompt-sized bursts (3),
   ``TENSORFOLD_THOR_NGRAM_PAGE`` bytes a read (4096), ``TENSORFOLD_THOR_NGRAM_PROBATION`` probation ways of 16 (4; 0:
   CLOCK over all ways, a new row starting with ``TENSORFOLD_THOR_NGRAM_INIT`` uses, 0).
+- ``TENSORFOLD_THOR_NGRAM_FILE``: a repacked row file (``tools/thor/ngram_repack.py``: one 90-byte record a row, so ONE
+  read a row) used instead of the checkpoint's shards; its manifest (``<file>.json``) must match the checkpoint (format,
+  rows, record bytes, size, source revision, every shard's file, rows, offsets and file size) and a sample of its rows
+  must equal the checkpoint's bytes, else the load refuses.
+- ``TENSORFOLD_THOR_NGRAM_ARRIVAL``: ``0`` turns off the arrival reads (a prompt's first rows read ahead of its stage at
+  low priority; ``..._ARRIVAL_THREADS`` 2 readers, ``..._ARRIVAL_WAVE`` 64 reads each in flight, ``..._ARRIVAL_ROWS``
+  prompt rows ahead, default 8192).
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ from __future__ import annotations
 import ctypes
 import fcntl
 import hashlib
+import json
 import os
 import struct
 import subprocess
@@ -35,6 +43,9 @@ from ..host_table import NVFP4Table, read_header
 
 ENV = "TENSORFOLD_THOR_NGRAM_NVME"
 CACHE_ENV = "TENSORFOLD_THOR_NGRAM_CACHE_GIB"
+FILE_ENV = "TENSORFOLD_THOR_NGRAM_FILE"
+ARRIVAL_ENV = "TENSORFOLD_THOR_NGRAM_ARRIVAL"
+ROWS_FORMAT = "tensorfold-ngram-rows/1"   # tools/thor/ngram_repack.py FORMAT
 CAPABILITY = (11, 0)
 SOURCE = Path(__file__).with_name("thor_nvme.cpp")
 FLAGS = ("-O3", "-std=c++17", "-fPIC", "-shared", "-pthread")
@@ -101,12 +112,66 @@ def library():
     lib.tfnr_background.argtypes = (p, i32)
     lib.tfnr_error.restype = ctypes.c_char_p
     lib.tfnr_error.argtypes = (p,)
+    lib.tfnr_arrival.argtypes = (p, i32, i32)
+    lib.tfnr_prefetch.restype = i64
+    lib.tfnr_prefetch.argtypes = (p, p, i64)
+    lib.tfnr_prefetch_wait.restype = i32
+    lib.tfnr_prefetch_wait.argtypes = (p, i64, i32)
+    lib.tfnr_snapshot_bytes.restype = lib.tfnr_snapshot_dump.restype = i64
+    lib.tfnr_snapshot_bytes.argtypes = (p,)
+    lib.tfnr_snapshot_dump.argtypes = (p, p)
+    lib.tfnr_snapshot_load.restype = i32
+    lib.tfnr_snapshot_load.argtypes = (p, p, i64, i32, i32)
     _LIB = lib
     return lib
 
 
 STATS = ("calls", "lookups", "hits", "missed", "unique_misses", "reads", "bytes_read", "read_ns", "gather_ns", "errors",
-         "inserted", "evicted")
+         "inserted", "evicted", "ahead_ids", "ahead_rows", "ahead_used", "ahead_wait_ns", "ahead_jobs")
+
+
+def _offsets(path, weight: dict, block: dict) -> tuple[int, int]:
+    with open(path, "rb") as f:
+        data = 8 + struct.unpack("<Q", f.read(8))[0]
+    return data + int(weight["data_offsets"][0]), data + int(block["data_offsets"][0])
+
+
+def rows_file(path, model_dir, files: list[tuple[Path, dict, dict]]) -> dict:
+    """The repacked row file's manifest (``<path>.json``) checked against the checkpoint shards ``files``; any mismatch
+    (format, rows, record bytes, file size, source revision, a shard's file, rows, offsets or file size) refuses."""
+
+    where = Path(str(path) + ".json")
+    try:
+        m = json.loads(where.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{FILE_ENV}: no readable manifest {where} ({exc})") from None
+    codes = int(files[0][1]["shape"][1])
+    rows = sum(int(w["shape"][0]) for _, w, _ in files)
+    rb = codes + codes // 8
+    want = {"format": ROWS_FORMAT, "rows": rows, "record_bytes": rb, "code_bytes": codes, "scale_bytes": codes // 8,
+            "size": rows * rb}
+    bad = [f"{k} {m.get(k)!r} != {v!r}" for k, v in want.items() if m.get(k) != v]
+    size = os.stat(path).st_size
+    if size != rows * rb:
+        bad.append(f"file size {size} != {rows * rb}")
+    model_dir = Path(model_dir)
+    revision = model_dir.name if model_dir.parent.name == "snapshots" else None
+    if revision is not None and m.get("revision") != revision:
+        bad.append(f"revision {m.get('revision')!r} != {revision!r}")
+    shards = m.get("shards") or []
+    if len(shards) != len(files):
+        bad.append(f"{len(shards)} shards != {len(files)}")
+    else:
+        for i, (sh, (p, w, b)) in enumerate(zip(shards, files)):
+            code_at, scale_at = _offsets(p, w, b)
+            got = {"file": Path(p).name, "rows": int(w["shape"][0]), "code_offset": code_at, "scale_offset": scale_at,
+                   "file_size": os.stat(p).st_size}
+            bad += [f"shard {i} {k} {sh.get(k)!r} != {v!r}" for k, v in got.items()
+                    if (Path(str(sh.get(k))).name if k == "file" else sh.get(k)) != v]
+    if bad:
+        raise ValueError(f"{FILE_ENV}={path} does not match {model_dir.name}: " + "; ".join(bad[:6])
+                         + f" (rebuild it with tools/thor/ngram_repack.py, or unset {FILE_ENV})")
+    return m
 
 
 class NVMeTable(NVFP4Table):
@@ -115,7 +180,8 @@ class NVMeTable(NVFP4Table):
     nvme = True
 
     def __init__(self, files: list[tuple[Path, dict, dict]], scale: float, *, cache_bytes: int | None = None,
-                 direct: bool = True, aio: bool | None = None) -> None:
+                 direct: bool = True, aio: bool | None = None, packed: str | None = None,
+                 manifest: dict | None = None) -> None:
         from tensorfold.cuda.nvfp4.format import E2M1, e4m3
 
         paths: list[str] = []
@@ -139,6 +205,9 @@ class NVMeTable(NVFP4Table):
             starts.append(starts[-1] + rows)
         self.starts = np.array(starts, dtype=np.int64)
         self.rows = int(self.starts[-1])
+        self.packed, self.manifest = (str(packed), manifest) if packed else (None, None)
+        if packed:                                # one repacked file: one shard of records (scale offset -1)
+            paths, info = [str(packed)], [0, 0, -1, self.rows]
         self.wrow = int(width)
         self.width = 2 * self.wrow
         self.disk_bytes = self.rows * (self.wrow + self.wrow // 8)
@@ -152,7 +221,8 @@ class NVMeTable(NVFP4Table):
         names = (ctypes.c_char_p * len(paths))(*[p.encode() for p in paths])
         shard_info = np.asarray(info, dtype=np.int64)
         self._lib = lib
-        self._h = lib.tfnr_open(len(paths), names, len(files), shard_info.ctypes.data, self.wrow, self.wrow // 8,
+        self._h = lib.tfnr_open(len(paths), names, len(info) // 4, shard_info.ctypes.data, self.wrow, self.wrow // 8,
+
                                 cache_bytes // ROW_SLOT, int(direct), int(io != "threads" if aio is None else aio),
                                 _env_int("TENSORFOLD_THOR_NGRAM_DEPTH", 64), _env_int("TENSORFOLD_THOR_NGRAM_HELPERS", 3),
                                 _env_int("TENSORFOLD_THOR_NGRAM_CPU", 8), _env_int("TENSORFOLD_THOR_NGRAM_PAGE", 4096),
@@ -161,7 +231,35 @@ class NVMeTable(NVFP4Table):
         if not self._h:
             raise OSError(f"n-gram rows from NVMe: {err.value.decode(errors='replace')}"
                           + (f" ({ENV}=0 keeps the tables in memory)" if direct else ""))
+        lib.tfnr_arrival(self._h, _env_int("TENSORFOLD_THOR_NGRAM_ARRIVAL_THREADS", 2),
+                         _env_int("TENSORFOLD_THOR_NGRAM_ARRIVAL_WAVE", 64))
+        self.arrival_rows = _env_int("TENSORFOLD_THOR_NGRAM_ARRIVAL_ROWS", 8192) if os.environ.get(
+            ARRIVAL_ENV, "1").strip().lower() not in ("0", "off", "false", "no") else 0
         self.use_pairs()
+        if packed:
+            self._check_sample(files)
+
+    def _check_sample(self, files, count: int = 64) -> None:
+        """Rows of the repacked file equal the checkpoint's bytes: each shard's first and last row and a seeded sample."""
+
+        rng = np.random.default_rng(int(str((self.manifest or {}).get("sha256", "0"))[:15] or "0", 16))
+        ids = np.unique(np.concatenate([self.starts[:-1], self.starts[1:] - 1, rng.integers(0, self.rows, count)]))
+        got = self.raw(ids)
+        for i, row in enumerate(ids.tolist()):
+            f = int(np.searchsorted(self.starts, row, side="right") - 1)
+            path, w, b = files[f]
+            code_at, scale_at = _offsets(path, w, b)
+            local, cb, sb = row - int(self.starts[f]), self.wrow, self.wrow // 8
+            fd = os.open(path, os.O_RDONLY)
+            try:
+                want = os.pread(fd, cb, code_at + local * cb) + os.pread(fd, sb, scale_at + local * sb)
+            finally:
+                os.close(fd)
+            if bytes(got[i]) != want:
+                raise ValueError(f"{FILE_ENV}={self.packed}: row {row} differs from the checkpoint (rebuild and verify "
+                                 f"it with tools/thor/ngram_repack.py, or unset {FILE_ENV})")
+        self.drop()
+        self.reset_stats()
 
     @classmethod
     def policy(cls, cache_rows: int, probation: int = PROBATION, init: int = 0) -> "NVMeTable":
@@ -189,7 +287,9 @@ class NVMeTable(NVFP4Table):
 
     def note(self) -> str:
         i = self.info()
-        return (f"n-gram rows from NVMe ({self.disk_bytes / 2**30:.2f} GiB on disk, O_DIRECT {i['page']}-byte reads, "
+        packed = (f"repacked file {self.packed} (sha256 {str(self.manifest.get('sha256'))[:12]}, one read a row), "
+                  if self.packed else "the checkpoint's shards as stored (two reads a row), ")
+        return (f"n-gram rows from NVMe: {packed}{self.disk_bytes / 2**30:.2f} GiB, O_DIRECT {i['page']}-byte reads, "
                 f"{'AIO' if i['aio'] else 'pread threads'}, {1 + i['readers']} readers x {i['depth']} deep); row cache "
                 f"{i['cache_rows'] / 1e6:.2f}M rows, {i['cache_bytes'] / 2**30:.2f} GiB, "
                 f"{'locked' if i['locked'] else 'NOT locked'} ({ENV}=0: the tables in memory)")
@@ -259,6 +359,36 @@ class NVMeTable(NVFP4Table):
         self._lib.tfnr_simulate(self._h, flat.ctypes.data, flat.size, hit.ctypes.data)
         return hit
 
+    def ahead(self, ids: np.ndarray) -> int:
+        """Start reading the rows ``ids`` (arrival reads) that are not cached; a ticket for ``wait`` (0: nothing to read)."""
+
+        flat = np.ascontiguousarray(np.asarray(ids, dtype=np.int64).reshape(-1))
+        return int(self._lib.tfnr_prefetch(self._h, flat.ctypes.data, flat.size)) if flat.size else 0
+
+    def wait(self, ticket: int, help: bool = True) -> int:
+        """Wait for an arrival read, reading what is left at full width (``help`` False: drop it); 0 or an errno (a
+        failed arrival read leaves its rows to the gather, which reads them again)."""
+
+        return int(self._lib.tfnr_prefetch_wait(self._h, int(ticket), int(help))) if ticket else 0
+
+    def snapshot(self) -> tuple[dict, np.ndarray]:
+        """The row cache as a dump: (geometry {sets, ways, row_bytes, rows, held}, uint8 payload)."""
+
+        i = self.info()
+        out = np.empty(int(self._lib.tfnr_snapshot_bytes(self._h)), dtype=np.uint8)
+        held = int(self._lib.tfnr_snapshot_dump(self._h, out.ctypes.data))
+        return {"sets": i["cache_rows"] // 16, "ways": 16, "row_bytes": self.wrow + self.wrow // 8, "rows": self.rows,
+                "held": held}, out
+
+    def restore(self, geometry: dict, payload: np.ndarray) -> bool:
+        """Load a ``snapshot`` dump of this cache's geometry; False (nothing loaded) on any mismatch."""
+
+        payload = np.ascontiguousarray(payload, dtype=np.uint8)
+        if geometry.get("rows") != self.rows or payload.size != int(self._lib.tfnr_snapshot_bytes(self._h)):
+            return False
+        return self._lib.tfnr_snapshot_load(self._h, payload.ctypes.data, int(geometry.get("sets", -1)),
+                                            int(geometry.get("ways", -1)), int(geometry.get("row_bytes", -1))) == 0
+
     def background(self, threads: int) -> None:
         """Benchmarks: ``threads`` readers of random pages until called again with 0."""
 
@@ -277,7 +407,11 @@ def open_table(model_dir: Path, shards: list[tuple[str, str]], scale, **kwargs) 
         if key + ".weight_scale" not in h or h[key + ".weight"].get("dtype") != "U8":
             raise ValueError(f"{ENV}: only NVFP4 n-gram shards are read from NVMe ({key} is not); set {ENV}=0")
         files.append((Path(model_dir) / shard, h[key + ".weight"], h[key + ".weight_scale"]))
+    packed = os.environ.get(FILE_ENV, "").strip()
+    if packed and "packed" not in kwargs:
+        kwargs.update(packed=packed, manifest=rows_file(packed, model_dir, files))
     return NVMeTable(files, scale("weight_scale_2"), **kwargs)
 
 
-__all__ = ["CACHE_ENV", "ENV", "NVMeTable", "library", "open_table", "wanted"]
+__all__ = ["ARRIVAL_ENV", "CACHE_ENV", "ENV", "FILE_ENV", "NVMeTable", "library", "open_table", "rows_file", "wanted"]
+
