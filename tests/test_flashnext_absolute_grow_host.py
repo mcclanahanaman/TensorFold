@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 from tensorfold.cuda import capacity
-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, torch_live
+from tensorfold.cuda.memory_gate import MEMORY_RETRY_S, SLOTS_RETRY_S, MemoryGate, NoRoom, torch_live
+from tensorfold.server.errors import CONTEXT_LIMIT, ContextLengthError
 from tensorfold.cuda.streams import Stream
 from tensorfold.families.qwen4_exp.cuda import prefixes
 
@@ -114,19 +115,22 @@ class AbsoluteGrowthTests(unittest.TestCase):
         ))
         ns = {"torch": self.torch, "STEP": 8192, "FIRST": 256, "GIB": GIB,
               "MemoryGate": MemoryGate, "NoRoom": NoRoom, "prefixes": prefixes,
+              "MEMORY_RETRY_S": MEMORY_RETRY_S, "SLOTS_RETRY_S": SLOTS_RETRY_S,
+              "ContextLengthError": ContextLengthError, "CONTEXT_LIMIT": CONTEXT_LIMIT,
               "cuda_limit_bytes": capacity.cuda_limit_bytes, "LIMIT_ENV": capacity.LIMIT_ENV,
               "time": SimpleNamespace(perf_counter=lambda: 1.0), "MIN_GAP": 32,
               "_slot": lambda *args: SimpleNamespace(), "prefill_begin": lambda *args, **kw: 0,
               "image_rows": SimpleNamespace(begin=lambda *args: None)}
         cls = source_class("src/tensorfold/families/qwen4_exp/cuda/multi.py", "MultiDecoder",
                            {"_grow", "_busy", "_evict_kept", "_drop_kept", "_make_room", "_slot_for",
-                            "_remember", "admit", "live", "finish"}, ns)
+                            "_remember", "_ahead", "admit", "live", "finish"}, ns)
         self.dec = cls()
         self.dec.capacity, self.dec.depth = 81920, 0
         self.dec.free, self.dec.kept, self.dec.streams, self.dec.filling = [first, second], [], {}, []
         self.dec.fills, self.dec.held = {}, {}
         self.dec.next_id, self.dec.keep = 0, 8
-        self.dec.w, self.dec.buf, self.dec.mbuf, self.dec.pbuf = None, None, None, None
+        self.dec.buf, self.dec.mbuf, self.dec.pbuf = None, None, None
+        self.dec.w = SimpleNamespace(layers=[])          # no Thor NVMe n-gram tables: admission starts no reads
         self.dec.prefill_rows, self.dec.points, self.dec.vision = 4096, None, None
         live = torch_live(self.torch, capacity.available_bytes)
         self.dec.memory_gate = MemoryGate(live(), reserve=2 * GIB, live=live)

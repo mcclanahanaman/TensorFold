@@ -4,7 +4,9 @@ A slot's kept chain is one conversation's resume points. When slots or memory ru
 slot goes first (``owner.used``: when each slot last started or finished a request), so a conversation that keeps
 coming back keeps its prefix while the one left idle longest runs cold; a slot's inner points (shorter prefixes inside
 its own chain) go before any conversation's longest point. Every removal of a whole chain is counted
-(``owner._evict_kept``) for ``/v1/capacity``.
+(``owner._evict_kept``, by cause) for ``/v1/capacity``, and so is every point dropped while its chain stays
+(``owner.points_dropped``: an inner point past ``keep``, or, when no idle slot can go, the oldest point, which may be a
+live conversation's own resume point).
 """
 
 
@@ -81,10 +83,12 @@ def remember(owner, ids, st, snap, tail) -> None:
         if inner:
             drop = min(inner, key=lru)
             owner.kept = [k for k in owner.kept if k is not drop]
+            owner.points_dropped = getattr(owner, "points_dropped", 0) + 1
             continue
         if owner._evict_kept(st, protect=None, cause="entries"):
             continue
-        gone.append(owner.kept.pop(0)[1])
+        gone.append(owner.kept.pop(0)[1])            # no idle slot can go: the oldest point, counted as a point
+        owner.points_dropped = getattr(owner, "points_dropped", 0) + 1
     busy = owner._busy()
     for old in gone:
         if old is not st and id(old) not in busy and all(k[1] is not old for k in owner.kept) and \

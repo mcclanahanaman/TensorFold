@@ -239,11 +239,13 @@ its prompt, its `max_tokens` and the drafts' rows reach, plus one layer's buffer
 never ends an already-admitted, already-decoding request to make room for a new one. A request whose worst case does
 not fit what the live requests' promises leave waits in the server's queue, first in line, until a live request
 finishes, and a request that finds every `--parallel` seat in use waits behind it; one whose worst case exceeds the
-whole cache room, so that no wait would ever make it fit, is refused at once with HTTP 400 `context_length_exceeded`
+cache room admission promises against (the whole room; with Jetson AGX Thor's pool, the room less the reserve every
+grow keeps free), so that no wait would ever make it fit, is refused at once with HTTP 400 `context_length_exceeded`
 and OpenAI's wording ("This server's maximum context length is N tokens ..."), naming the largest prompt-plus-reply
-this server's memory holds for one request. A transient refusal is HTTP 503 with `Retry-After` (seconds, an integer,
-rounded up) and an `error` object whose `reason` is a short machine-readable tag: `"memory"` (cache room) or
-`"slots"` (every `--parallel` seat is in use).
+this server's memory holds for one request; so is a prompt that leaves no room for a reply in the window. A transient
+refusal is HTTP 503 with `Retry-After` (seconds, an integer, rounded up; every admission refusal carries one) and an
+`error` object whose `reason` is a short machine-readable tag: `"memory"` (cache room, `Retry-After: 5` unless the
+refusal names its own) or `"slots"` (every `--parallel` seat is in use, `Retry-After: 2`).
 
 How long a request may wait is the server's choice:
 
@@ -279,12 +281,14 @@ client or a router to read before sending, so it can back off before the server 
 | `live_streams`, `prefilling_streams`, `max_streams` | Requests decoding, requests still prefilling, and the `--parallel` seat count |
 | `context_window_tokens` | The served context window |
 | `reserved_bytes`, `held_bytes`, `room_bytes` | Cache bytes promised to admitted requests, allocated now (live and kept), and the total room for growing caches |
-| `free_cache_bytes` | `room_bytes` minus `reserved_bytes`: room still free to promise to a new request (kept conversations give way) |
+| `admission_reserve_bytes` | The part of `room_bytes` admission never promises: the reserve Jetson AGX Thor's pool keeps free for every grow (`0` without the pool) |
+| `free_cache_bytes` | `room_bytes` less `admission_reserve_bytes` and `reserved_bytes`: room still free to promise to a new request (kept conversations give way). A request whose worst case (`need_bytes` in the POST preview below) fits it is admitted now, unless every seat is in use or a live request waits for room; that is the same bound admission uses |
 | `free_cache_tokens_estimate`, `largest_admissible_prompt_tokens_estimate` | `free_cache_bytes` in tokens at this model's bytes per token at the full window; a planning estimate, the second capped by `largest_request_tokens` |
-| `largest_request_tokens` | The most prompt-plus-reply tokens one request's caches can ever hold in `room_bytes` (the window, or less when memory is smaller) |
+| `largest_request_tokens` | The most prompt-plus-reply tokens one request's caches can ever hold in `room_bytes` less `admission_reserve_bytes` (the window, or less when memory is smaller) |
 | `kept_sessions` | One entry per kept conversation: `tokens` (its longest point), `points`, `bytes` (its caches), `idle_s` (seconds since its last use, `null` if never used) and `busy` (a live request holds it); sizes only, no content |
 | `kept_sessions_total_tokens`, `kept_bytes` | Sums over `kept_sessions` |
 | `evicted_kept_sessions_total`, `evicted_kept_by` | Kept conversations freed since startup, and by cause: `memory` (a grow's room), `slots` (a request's slot), `entries` (past the kept points' cap) |
+| `kept_points_dropped_total` | Resume points dropped since startup while their conversation stays kept: an inner point past the kept points' cap, or, when every other conversation is busy, the oldest point (possibly a live conversation's); a later turn resuming there runs from an earlier point |
 | `waits_total`, `ended_total` | Counts of a live stream pausing for room, and of one ending for it (never an admitted stream: see above) |
 | `queued_requests` | Requests waiting for a seat or for room now |
 | `admission_wait_s` | The bounded admission wait in seconds, `null` when unbounded (see above) |

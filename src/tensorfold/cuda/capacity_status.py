@@ -63,6 +63,7 @@ def of(app) -> dict[str, Any]:
         "kept_bytes": sum(int(k.get("bytes") or 0) for k in kept),
         "evicted_kept_sessions_total": int(getattr(gate, "evicted_kept", 0) or 0),
         "evicted_kept_by": dict(getattr(decoder, "evicted_by", {}) or {}),
+        "kept_points_dropped_total": int(getattr(decoder, "points_dropped", 0) or 0),
         "waits_total": int(getattr(gate, "waits", 0) or 0), "ended_total": int(getattr(gate, "ends", 0) or 0),
     })
     waiting = getattr(scheduler, "waiting", None)
@@ -75,7 +76,10 @@ def of(app) -> dict[str, Any]:
     })
     seats = live + prefilling            # a prefilling request holds its seat as a decoding one does
     if gate is not None:
-        free_cache_bytes = max(0, gate.room - gate.reserved_total)
+        # the bound admission promises against (MemoryGate.admits): the room, a pool's less its reserve; the free room
+        # and every estimate below come from it, so what this reports as fitting is what admission admits
+        bound = gate.admission_room() if hasattr(gate, "admission_room") else gate.room
+        free_cache_bytes = max(0, bound - gate.reserved_total)
         tokens = getattr(decoder, "room_tokens", None)
         largest = tokens() if tokens is not None else window
         body.update({
@@ -85,6 +89,7 @@ def of(app) -> dict[str, Any]:
                 min(largest, int(free_cache_bytes / bytes_per_token)) if bytes_per_token else largest,
             "largest_request_tokens": largest,
             "reserved_bytes": gate.reserved_total, "held_bytes": gate.held, "room_bytes": gate.room,
+            "admission_reserve_bytes": gate.room - bound,
             "pooled": bool(getattr(gate, "pooled", False)), "pool_bytes": int(getattr(decoder, "pool_bytes", 0) or 0),
         })
         body["memavailable_mib"] = _memavailable_mib()

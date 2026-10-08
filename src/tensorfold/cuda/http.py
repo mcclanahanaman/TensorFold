@@ -8,6 +8,7 @@ import uuid
 from typing import TYPE_CHECKING, Any
 
 from tensorfold.cuda import capacity_status, health
+from tensorfold.cuda.memory_gate import MEMORY_RETRY_S, SLOTS_RETRY_S, NoRoom
 from tensorfold.server import anthropic, metrics, responses, token_routes
 from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
 from tensorfold.server.decisions import DecisionError
@@ -80,7 +81,10 @@ def make_handler(app: App):
                 reason = getattr(exc, "reason", None)
                 if reason:
                     body["reason"] = reason
-                return self._json(503, {"error": body}, retry_after_s=getattr(exc, "retry_after_s", None))
+                retry = getattr(exc, "retry_after_s", None)
+                if retry is None and isinstance(exc, NoRoom):    # an admission refusal without its own hint: the
+                    retry = SLOTS_RETRY_S if reason == "slots" else MEMORY_RETRY_S   # scheduler's, by reason
+                return self._json(503, {"error": body}, retry_after_s=retry)
             return self._json(400, {"error": body})
 
         def _discard_body(self) -> None:

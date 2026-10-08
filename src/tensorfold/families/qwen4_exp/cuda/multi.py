@@ -12,7 +12,7 @@ from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.capacity import LIMIT_ENV, available_bytes, cuda_limit_bytes
 from tensorfold.cuda.kernels import thor_gdn
 from tensorfold.cuda.markers import MIN_GAP
-from tensorfold.cuda.memory_gate import MemoryGate, NoRoom, driver_pool, torch_live
+from tensorfold.cuda.memory_gate import MEMORY_RETRY_S, SLOTS_RETRY_S, MemoryGate, NoRoom, driver_pool, torch_live
 from tensorfold.server.errors import CONTEXT_LIMIT, ContextLengthError
 from tensorfold.cuda.sampling import sample_streams
 from tensorfold.cuda.streams import Stream, accept
@@ -144,6 +144,7 @@ class MultiDecoder:
         self.keep = keep
         self.used: dict[int, float] = {}                 # id(slot) -> when it last started or finished a request
         self.evicted_by = {"memory": 0, "slots": 0, "entries": 0}     # kept chains freed, by cause (/v1/capacity)
+        self.points_dropped = 0                          # kept points dropped while their chain stays (prefixes.remember)
         thor_graphs.mem_probe(self, "gate")              # diagnostics (TENSORFOLD_THOR_MEM_PROBE=<trigger path>)
         if self.graphs is not None:     # Thor: one-stream short-context graphs, recorded after the gate measured the room
             self.memory_gate.room -= self._prerecord()      # the room pays the graphs' own memory (THOR-DEC-1)
@@ -185,7 +186,7 @@ class MultiDecoder:
                                 f"Growing this request's attention caches to {size} tokens would exceed "
                                 f"{LIMIT_ENV}={limit / GIB:g}: the estimated copy peak is {peak / GIB:.2f} GiB. "
                                 "Shorten the prompt or max_tokens, reduce --context or --parallel, or raise "
-                                f"{LIMIT_ENV} if more GPU memory is available.")
+                                f"{LIMIT_ENV} if more GPU memory is available.", retry_after_s=MEMORY_RETRY_S)
                     break
                 return False
         if self.memory_gate.pool is not None:    # Thor's wide pieces: kept ends go before the n-gram tables' pages
@@ -296,9 +297,9 @@ class MultiDecoder:
         return ref.cache_bytes(rows) + ref.layer_bytes(rows)
 
     def room_tokens(self) -> int:
-        """The most prompt plus reply tokens one request's caches hold within the gate's whole room."""
+        """The most prompt plus reply tokens one request's caches hold within the room admission promises against."""
 
-        ref, room = getattr(self, "_ref_state", None), self.memory_gate.room
+        ref, room = getattr(self, "_ref_state", None), self.memory_gate.admission_room()
         if ref is None:
             return self.capacity
         low, high = 0, self.capacity
@@ -311,9 +312,9 @@ class MultiDecoder:
         return low
 
     def _too_long(self, prompt: int, count: int) -> str:
-        n = self.room_tokens()
+        n, room = self.room_tokens(), self.memory_gate.admission_room()
         return (f"{CONTEXT_LIMIT} {n} tokens for one request at this server's memory setting (its window is "
-                f"{self.capacity} tokens; the caches' pool is {self.memory_gate.room / GIB:.2f} GiB): this request's "
+                f"{self.capacity} tokens; the caches' room is {room / GIB:.2f} GiB): this request's "
                 f"{prompt} prompt tokens with up to {count} reply tokens do not fit it. Shorten the prompt or "
                 "max_tokens.")
 
@@ -385,12 +386,12 @@ class MultiDecoder:
         ref, gate = getattr(self, "_ref_state", None), self.memory_gate
         need = self._worst(ref, len(prompt), count) if ref is not None else 0
         out["need_bytes"] = need
-        if need > gate.room:
+        if need > gate.admission_room():
             out["reason"] = "length"
         elif self.live() >= (max_streams or self.slots):
-            out.update(reason="slots", retry_after_s=2.0)
+            out.update(reason="slots", retry_after_s=SLOTS_RETRY_S)
         elif not gate.admits(need) or any(x.waiting for x in list(self.streams.values())):
-            out.update(reason="memory", retry_after_s=5.0)
+            out.update(reason="memory", retry_after_s=MEMORY_RETRY_S)
         else:
             out["admissible_now"] = True
         return out
@@ -403,6 +404,8 @@ class MultiDecoder:
         self.admit(s)
         if not s.done:
             self.round()                                 # the whole prompt (nothing else decodes), then a round
+        self.memory_gate.unpromise(id(s))                # what admit promised it (no finish() here: torn down by hand)
+        self.held.pop(s.sid, None)
         self.streams.pop(s.sid, None)
         self._drop_kept(s.st)
         self._shrink(s.st)
@@ -437,12 +440,14 @@ class MultiDecoder:
 
         room = self.capacity - len(s.prompt) - self.depth - 1
         if room < 1:
-            # too long for ANY configuration, not a transient capacity refusal: stays a plain refusal (OpenAI's
-            # context_length_exceeded, via refusal()/ContextLengthError elsewhere), not NoRoom/503.
-            raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.capacity}-token context")
+            # too long for ANY configuration, not a transient capacity refusal: OpenAI's context_length_exceeded (HTTP
+            # 400), as the HTTP layer's own window check refuses it before submit, not NoRoom/503.
+            raise ContextLengthError(f"{CONTEXT_LIMIT} {self.capacity - self.depth - 1} tokens: a prompt of "
+                                     f"{len(s.prompt)} tokens leaves no room for a reply; shorten the prompt")
         s.count = max(1, min(s.count, room))
         if any(x.waiting for x in self.streams.values()):
-            raise NoRoom("streams already wait for memory; a new request waits until one finishes", reason="memory")
+            raise NoRoom("streams already wait for memory; a new request waits until one finishes", reason="memory",
+                         retry_after_s=MEMORY_RETRY_S)
         # par-1-fix admission control: reserve this stream's full worst-case extent (its prompt plus its declared
         # max tokens, clamped to the window) before touching a slot, so a later request cannot squeeze a stream
         # already promised that room (see MemoryGate.reserved's docstring). Freed in finish()/drop(). ``_ref_state``
@@ -451,31 +456,33 @@ class MultiDecoder:
         ref = getattr(self, "_ref_state", None)
         if ref is not None:
             worst_case = self._worst(ref, len(s.prompt), s.count)
-            if worst_case > self.memory_gate.room:       # past the whole room: no wait would make it fit
+            if worst_case > self.memory_gate.admission_room():   # past what admission ever promises: no wait helps
                 raise ContextLengthError(self._too_long(len(s.prompt), s.count))
             if not self.memory_gate.admits(worst_case):
                 raise NoRoom(
                     f"accepting a {len(s.prompt)}-token prompt (up to {s.count} reply tokens) would need more cache "
                     f"room than this server's budget allows with its other live and reserved sessions; retry "
-                    "shortly, or after an in-flight session finishes", reason="memory", retry_after_s=5.0)
+                    "shortly, or after an in-flight session finishes", reason="memory", retry_after_s=MEMORY_RETRY_S)
             self.memory_gate.promise(id(s), worst_case)
         try:
             t0 = time.perf_counter()
             st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
-            s.ahead = self._ahead(s)            # Thor NVMe tables: the first uncached rows read from here on
             used = getattr(self, "used", None)
             if used is not None:
                 used[id(st)] = time.monotonic()
             try:
                 if not self._grow(st, len(s.prompt) + self.depth + 2, alone=not self.streams and not self.filling):
                     raise NoRoom(f"a {len(s.prompt)}-token prompt waits for memory until a live stream finishes",
-                                reason="memory")
+                                reason="memory", retry_after_s=MEMORY_RETRY_S)
             except NoRoom:
                 if resume is None:
                     self.free.append(st)
                 else:                                        # the kept prompt end stays kept
                     self._remember(list(s.prompt[:s.cached]), st, resume["state"], resume["tail"])
                 raise
+            # Thor NVMe tables: the first uncached rows read from here on, once no refusal can follow (a request held
+            # for memory is admitted again every scheduler pass and would start its reads again each time)
+            s.ahead = self._ahead(s)
             e = _slot(self.w, st, self.buf, self.mbuf, self.pbuf, self.capacity, self.prefill_rows)
             mtp = s.draft and self.depth > 0 and self.mbuf is not None
             try:
@@ -939,9 +946,12 @@ class MultiDecoder:
 
         gate = getattr(self, "memory_gate", None)
         used = getattr(self, "used", None)
+        held = getattr(self, "held", None)
         for s in done:
             if gate is not None:
                 gate.unpromise(id(s))      # par-1-fix: its admission reservation, freed once and for all
+            if held is not None:
+                held.pop(s.sid, None)      # its kept DeltaNet rows (a lane yield finishes one that is not done)
             self.streams.pop(s.sid, None)
             if any(k[1] is s.st for k in self.kept):
                 if used is not None:
