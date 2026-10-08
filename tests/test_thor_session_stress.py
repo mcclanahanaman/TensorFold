@@ -41,19 +41,25 @@ class Stub:
     s5 t3: the preview says the request would pass the window (length): the session ends there.
     s6: replies stream reasoning only (no content deltas).
     mode "bad": s0 t2 runs cold although announced warm and nothing was evicted (unexplained); s1 t1 is killed mid-stream.
+    mode "overload": the extra sessions (index >= extras_from) never preview; each one's first request is refused 503
+    with Retry-After: 1 and reason "slots", then served. Mode "overload-bad": the same refusal with neither the header
+    nor a reason (a malformed refusal).
     """
 
-    def __init__(self, mode: str = "good") -> None:
+    def __init__(self, mode: str = "good", extras_from: int = 1 << 30) -> None:
         self.mode = mode
+        self.extras_from = extras_from
         self.lock = threading.Lock()
         self.kept: dict[int, int] = {}
         self.evicted = 0
         self.seen: set = set()
         self.live = 0
+        self.previews: dict[int, int] = {}
 
     def preview(self, body: dict) -> dict:
         s, t, p = _session(body["messages"]), _turn(body["messages"]), _tokens(body["messages"])
         with self.lock:
+            self.previews[s] = self.previews.get(s, 0) + 1
             if self.mode == "good" and (s, t) == (2, 2) and ("evict", s, t) not in self.seen:
                 self.seen.add(("evict", s, t))
                 self.kept.pop(2, None)
@@ -105,11 +111,14 @@ def _handler(stub: Stub):
             assert body.get("stream") is True
             s, t, p = _session(body["messages"]), _turn(body["messages"]), _tokens(body["messages"])
             with stub.lock:
+                refuse = None
                 if stub.mode == "good" and (s, t) == (4, 1) and ("503", s, t) not in stub.seen:
                     stub.seen.add(("503", s, t))
-                    refuse = True
-                else:
-                    refuse = False
+                    refuse = ({"error": {"message": "busy", "reason": "memory"}}, {"Retry-After": "1"})
+                elif stub.mode.startswith("overload") and s >= stub.extras_from and ("503", s) not in stub.seen:
+                    stub.seen.add(("503", s))
+                    refuse = (({"error": {"message": "busy", "reason": "slots"}}, {"Retry-After": "1"})
+                              if stub.mode == "overload" else ({"error": {"message": "busy"}}, {}))
                 if stub.mode == "good" and (s, t) == (3, 1):
                     stub.kept.pop(3, None)
                     stub.evicted += 1
@@ -117,10 +126,10 @@ def _handler(stub: Stub):
                     stub.kept.pop(0, None)                  # cold, announced warm, no eviction counted
                 cached = stub.kept.get(s, 0)
                 stub.live += 1
-            if refuse:
+            if refuse is not None:
                 with stub.lock:
                     stub.live -= 1
-                return self._json(503, {"error": {"message": "busy", "reason": "memory"}}, {"Retry-After": "1"})
+                return self._json(503, *refuse)
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
@@ -148,15 +157,17 @@ def _handler(stub: Stub):
     return H
 
 
-def _run(tmp_path, mode: str, sessions: int, turns: int) -> tuple[int, dict, str]:
-    stub = Stub(mode)
+def _run(tmp_path, mode: str, sessions: int, turns: int, *extra: str,
+         stub: Stub | None = None) -> tuple[int, dict, str]:
+    stub = stub or Stub(mode)
     srv = ThreadingHTTPServer(("127.0.0.1", 0), _handler(stub))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     out = tmp_path / f"{mode}.json"
     try:
         proc = subprocess.run([sys.executable, str(TOOL), f"http://127.0.0.1:{srv.server_address[1]}", str(out),
                                "--sessions", str(sessions), "--turns", str(turns), "--plan", "tiny", "--seed", "7",
-                               "--max-wait", "20", "--sample-s", "0.2", "--stagger-s", "0", "--turn-timeout", "30"],
+                               "--max-wait", "20", "--sample-s", "0.2", "--stagger-s", "0", "--turn-timeout", "30",
+                               *extra],
                               capture_output=True, text=True, timeout=120)
     finally:
         srv.shutdown()
@@ -169,6 +180,7 @@ def test_every_classification_once(tmp_path):
     assert (s["sessions"], s["turns_sent"], s["followups"]) == (7, 27, 20)
     assert (s["warm"], s["announced_cold"], s["raced"], s["unexplained"]) == (18, 1, 1, 0)
     assert (s["errors"], s["killed"], s["timeouts"], s["length_ended"], s["retries"]) == (0, 0, 0, 1, 1)
+    assert (s["refused"], s["refused_by"], s["refusals_malformed"], s["extra_sessions"]) == (1, {"memory": 1}, 0, 0)
     assert s["waited_s"] > 0 and s["held_long_max"] >= 1
     assert s["pass"] is True and rc == 0
     assert "session_stress: PASS" in stdout
@@ -176,6 +188,9 @@ def test_every_classification_once(tmp_path):
     assert rows[(2, 2)]["class"] == "announced_cold" and rows[(3, 1)]["class"] == "raced"
     assert rows[(5, 3)].get("ended") == "length" and (5, 4) not in rows
     assert rows[(4, 1)]["retries"] == 1 and rows[(1, 1)]["waited_s"] > 0
+    assert [(x["code"], x["reason"], x["retry_after"]) for x in rows[(4, 1)]["refusals"]] == [(503, "memory", "1")]
+    assert all(r["refusals"] == [] and r["extra"] is False
+               for k, r in rows.items() if k != (4, 1) and not r.get("ended"))
     assert all(rows[(6, t)]["ttft_s"] is not None for t in range(4))
     assert all(r["class"] == "warm" for k, r in rows.items() if k[1] > 0 and k not in ((2, 2), (3, 1), (5, 3)))
     for r in doc["rows"]:
@@ -192,3 +207,41 @@ def test_unexplained_cold_and_a_kill_fail(tmp_path):
     assert s["unexplained"] == 1 and s["killed"] == 1
     assert s["pass"] is False and rc == 1
     assert "session_stress: FAIL" in stdout
+
+
+def test_extra_sessions_skip_the_preview_and_back_off_on_a_503_with_retry_after(tmp_path):
+    stub = Stub("overload", extras_from=2)
+    rc, doc, stdout = _run(tmp_path, "overload", 2, 2, "--extra", "2", "--extra-turns", "2", "--require-refusal",
+                           stub=stub)
+    s = doc["summary"]
+    assert (s["sessions"], s["extra_sessions"], s["turns_sent"], s["extra_turns_done"]) == (4, 2, 8, 4)
+    assert (s["refused"], s["refused_by"], s["refusals_malformed"]) == (2, {"slots": 2}, 0)
+    assert (s["errors"], s["killed"], s["timeouts"], s["retries"]) == (0, 0, 0, 2)
+    assert s["pass"] is True and rc == 0 and "session_stress: PASS" in stdout
+    assert stub.previews.get(2, 0) == 0 and stub.previews.get(3, 0) == 0      # an extra session never previews
+    assert stub.previews.get(0, 0) >= 2 and stub.previews.get(1, 0) >= 2
+    rows = {(r["session"], r["turn"]): r for r in doc["rows"]}
+    for i in (2, 3):
+        first = rows[(i, 0)]
+        assert first["extra"] is True and first["retries"] == 1 and first["waited_s"] >= 1
+        assert [(x["code"], x["reason"], x["retry_after"]) for x in first["refusals"]] == [(503, "slots", "1")]
+        assert first["refusals"][0]["at_s"] >= 0
+        assert rows[(i, 1)]["refusals"] == [] and rows[(i, 1)]["class"] == "warm"
+    assert rows[(0, 0)]["extra"] is False and rows[(0, 0)]["refusals"] == []
+
+
+def test_a_refusal_without_retry_after_or_reason_is_malformed_and_fails(tmp_path):
+    stub = Stub("overload-bad", extras_from=1)
+    rc, doc, stdout = _run(tmp_path, "overload-bad", 1, 1, "--extra", "1", "--extra-turns", "1", stub=stub)
+    s = doc["summary"]
+    assert (s["refused"], s["refusals_malformed"], s["errors"]) == (1, 1, 0)
+    rows = {(r["session"], r["turn"]): r for r in doc["rows"]}
+    assert [(x["code"], x["reason"], x["retry_after"]) for x in rows[(1, 0)]["refusals"]] == [(503, None, None)]
+    assert s["pass"] is False and rc == 1 and "session_stress: FAIL" in stdout
+
+
+def test_require_refusal_fails_a_run_that_saw_none(tmp_path):
+    rc, doc, stdout = _run(tmp_path, "good", 2, 2, "--require-refusal")
+    s = doc["summary"]
+    assert s["refused"] == 0 and s["errors"] == 0 and s["killed"] == 0
+    assert s["pass"] is False and rc == 1
