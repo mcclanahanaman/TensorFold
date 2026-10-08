@@ -279,12 +279,12 @@ client or a router to read before sending, so it can back off before the server 
 | --- | --- |
 | `ok` | `false` only when this engine has no concurrent decoder to report on (a different backend/family) |
 | `live_streams`, `prefilling_streams`, `max_streams` | Requests decoding, requests still prefilling, and the `--parallel` seat count |
-| `context_window_tokens` | The served context window |
+| `context_window_tokens` | The served context window: the most prompt-plus-reply tokens a request may ask for |
 | `reserved_bytes`, `held_bytes`, `room_bytes` | Cache bytes promised to admitted requests, allocated now (live and kept), and the total room for growing caches |
 | `admission_reserve_bytes` | The part of `room_bytes` admission never promises: the reserve Jetson AGX Thor's pool keeps free for every grow (`0` without the pool) |
 | `free_cache_bytes` | `room_bytes` less `admission_reserve_bytes` and `reserved_bytes`: room still free to promise to a new request (kept conversations give way). A request whose worst case (`need_bytes` in the POST preview below) fits it is admitted now, unless every seat is in use or a live request waits for room; that is the same bound admission uses |
 | `free_cache_tokens_estimate`, `largest_admissible_prompt_tokens_estimate` | `free_cache_bytes` in tokens at this model's bytes per token at the full window; a planning estimate, the second capped by `largest_request_tokens` |
-| `largest_request_tokens` | The most prompt-plus-reply tokens one request's caches can ever hold in `room_bytes` less `admission_reserve_bytes` (the window, or less when memory is smaller) |
+| `largest_request_tokens` | The most prompt-plus-reply tokens one request can ever be admitted with: its caches in `room_bytes` less `admission_reserve_bytes`, within `context_window_tokens` (the window, or less when memory is smaller) |
 | `kept_sessions` | One entry per kept conversation: `tokens` (its longest point), `points`, `bytes` (its caches), `idle_s` (seconds since its last use, `null` if never used) and `busy` (a live request holds it); sizes only, no content |
 | `kept_sessions_total_tokens`, `kept_bytes` | Sums over `kept_sessions` |
 | `evicted_kept_sessions_total`, `evicted_kept_by` | Kept conversations freed since startup, and by cause: `memory` (a grow's room), `slots` (a request's slot), `entries` (past the kept points' cap) |

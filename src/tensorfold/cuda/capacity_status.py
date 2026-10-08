@@ -51,14 +51,17 @@ def of(app) -> dict[str, Any]:
     live = len(getattr(decoder, "streams", ()))
     prefilling = len(getattr(decoder, "filling", ()))
     max_streams = int(scheduler.max_streams)
-    window = int(getattr(decoder, "capacity", 0) or 0)
+    window = int(getattr(decoder, "capacity", 0) or 0)       # the rows one stream's caches may reach
     window_bytes = int(getattr(decoder, "window_bytes", 0) or 0)
     bytes_per_token = (window_bytes / window) if window else 0.0
+    # the prompt-plus-reply tokens the server accepts (its window less the drafts' rows): what a client may ask for
+    served = getattr(app, "effective_context_window", None)
+    served = min(served, window) if isinstance(served, int) and served > 0 and window else window
     view = getattr(decoder, "kept_view", None)
     kept = view() if view is not None else [{"tokens": len(ids)} for ids, *_ in list(getattr(decoder, "kept", ()))]
     body.update({
         "live_streams": live, "prefilling_streams": prefilling, "max_streams": max_streams,
-        "context_window_tokens": window, "kept_sessions": kept,
+        "context_window_tokens": served, "kept_sessions": kept,
         "kept_sessions_total_tokens": sum(k["tokens"] for k in kept),
         "kept_bytes": sum(int(k.get("bytes") or 0) for k in kept),
         "evicted_kept_sessions_total": int(getattr(gate, "evicted_kept", 0) or 0),
@@ -81,7 +84,7 @@ def of(app) -> dict[str, Any]:
         bound = gate.admission_room() if hasattr(gate, "admission_room") else gate.room
         free_cache_bytes = max(0, bound - gate.reserved_total)
         tokens = getattr(decoder, "room_tokens", None)
-        largest = tokens() if tokens is not None else window
+        largest = min(tokens(), served) if tokens is not None else served
         body.update({
             "free_cache_bytes": free_cache_bytes,
             "free_cache_tokens_estimate": int(free_cache_bytes / bytes_per_token) if bytes_per_token else None,

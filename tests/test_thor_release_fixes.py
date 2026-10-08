@@ -126,6 +126,18 @@ def test_get_capacity_subtracts_the_pool_reserve_exactly_as_admission_does():
     assert body["admission_reserve_bytes"] == 0 and body["free_cache_bytes"] == GIB
 
 
+def test_get_capacity_reports_the_window_the_server_accepts():
+    from tests.test_thor_admission_capacity import _fake_app
+
+    cap = importlib.import_module("tensorfold.cuda.capacity_status")
+    app = _fake_app(window=262151, window_bytes=4 * GIB)     # the decoder's rows: --context 262144 plus 7 draft rows
+    assert cap.of(app)["context_window_tokens"] == 262151    # an app that does not say what it accepts: as before
+    app.effective_context_window = 262144                    # the CUDA server refuses a prompt plus reply past this
+    body = cap.of(app)
+    assert body["context_window_tokens"] == 262144           # c4e0335: 262151, a request the server refuses as too long
+    assert body["largest_request_tokens"] == 262144 and body["largest_admissible_prompt_tokens_estimate"] == 262144
+
+
 def test_get_and_post_capacity_agree_at_the_admission_boundary(allocations):  # noqa: F811
     multi, state, torch = mods()
     cap = importlib.import_module("tensorfold.cuda.capacity_status")
