@@ -10,6 +10,7 @@ import json
 import os
 import signal
 import struct
+import sys
 import time
 
 import numpy as np
@@ -139,6 +140,7 @@ def test_saver_periodic_and_final(tmp_path):
     s.stop()                                            # idempotent
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="os.kill(pid, SIGTERM) ends the process on Windows")
 def test_saver_sigterm_hook_saves_then_chains(tmp_path):
     t, p = Fake(), tmp_path / "s.snap"
     seen = []
