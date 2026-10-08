@@ -181,6 +181,32 @@ def thor_layers(w) -> list:
                           thor.ThorExperts)]
 
 
+def prerecord_thor(w, b, layers: list) -> tuple[int, int]:
+    """Jetson Thor (sm_110): a decode buffer set's routed-expert CUDA graphs, one for every (layer, rows) its calls can
+    make, recorded now, at load: ``thor.run`` records a key on its first eager call, which on a request cost a capture
+    per layer in the first round of each new window width (a fresh server's first 8-stream waves ran 5-13% slower,
+    FR-OPS-17 dvar-first1). The calls are ``forward.moe_block``'s own (the buffer set's rows, router, plan and slots),
+    on zeroed rows, for every width from 1 to the scratch's rows. Returns (graphs recorded, device bytes they took).
+    ``TENSORFOLD_THOR_FI_MOE_PRERECORD=0`` leaves them to first use."""
+
+    from .state import _MoECfg
+
+    scratch = getattr(getattr(b, "moe", None), "thor", None)
+    if scratch is None or scratch.graphs is None or not layers or thor._off(thor.PRERECORD_ENV):
+        return 0, 0
+    before = len(scratch.graphs)
+    torch.cuda.synchronize()
+    free0 = torch.cuda.mem_get_info()[0]
+    cfg = _MoECfg(w.cfg)
+    b.mixed[:scratch.rows].zero_()
+    for rows in range(1, scratch.rows + 1):
+        for layer in layers:
+            moe(b.mixed[:rows], b.xs_mixed[:rows], layer.moe.router, layer.moe.experts, b.moe, cfg,
+                unscattered=w.comm is None and b.prefill)
+    torch.cuda.synchronize()
+    return len(scratch.graphs) - before, max(0, free0 - torch.cuda.mem_get_info()[0])
+
+
 def attach_thor(w, buf, rows: int) -> None:
     """A buffer set gets the Thor experts' scratch and warms their kernels, at load, not on a request."""
 

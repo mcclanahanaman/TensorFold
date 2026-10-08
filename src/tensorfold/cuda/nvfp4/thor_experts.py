@@ -30,6 +30,7 @@ TACTICS = ((4, 16, 128, (1, 1)), (64, 16, 128, (2, 1)), (512, 32, 128, (2, 1)), 
 _COPY = 512                 # columns a glue step moves
 GRAPHS_ENV = "TENSORFOLD_THOR_FI_MOE_GRAPHS"
 GRAPH_ROWS = 64             # a scratch of at most this many rows (a decode window's, the drafts') records its calls
+PRERECORD_ENV = "TENSORFOLD_THOR_FI_MOE_PRERECORD"   # 0: a decode buffer set's records are made on first use
 
 
 def _fi():

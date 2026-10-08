@@ -408,6 +408,28 @@ class MultiDecoder:
         self._shrink(s.st)
         if all(f is not s.st for f in self.free):
             self.free.append(s.st)
+        self._prerecord_experts()
+
+    def _prerecord_experts(self) -> None:
+        """Thor (sm_110): every decode window width's routed-expert graphs now, before the pool takes the room
+        (``nvfp4_moe.prerecord_thor``): the verification buffers' for the model's layers, the drafts' for the MTP
+        head's. Their memory is gone before ``reserve_pool`` measures what is left, so the room never counts it."""
+
+        from .nvfp4_moe import prerecord_thor, thor_layers
+
+        layers = thor_layers(self.w)
+        if not layers:
+            return
+        head = getattr(getattr(self.w, "mtp", None), "layer", None)
+        t0 = time.perf_counter()
+        n, took = prerecord_thor(self.w, self.buf, [x for x in layers if x is not head])
+        if self.mbuf is not None and head is not None and any(x is head for x in layers):
+            m, more = prerecord_thor(self.w, self.mbuf, [head])
+            n, took = n + m, took + more
+        if n:
+            print(f"[tensorfold] Thor (sm_110): {n} decode expert graphs (every window width, 1 to "
+                  f"{self.buf.moe.thor.rows} rows) recorded at load in {time.perf_counter() - t0:.1f}s, "
+                  f"{took / 2**20:.0f} MiB (TENSORFOLD_THOR_FI_MOE_PRERECORD=0: on first use)", flush=True)
 
     @torch.no_grad()
     def admit(self, s: Stream) -> None:
