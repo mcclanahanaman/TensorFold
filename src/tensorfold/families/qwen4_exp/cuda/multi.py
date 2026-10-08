@@ -462,6 +462,7 @@ class MultiDecoder:
         try:
             t0 = time.perf_counter()
             st, resume, s.cached = self._slot_for(list(s.prompt), s.draft and s.vision is None)
+            s.ahead = self._ahead(s)            # Thor NVMe tables: the first uncached rows read from here on
             used = getattr(self, "used", None)
             if used is not None:
                 used[id(st)] = time.monotonic()
@@ -497,6 +498,35 @@ class MultiDecoder:
         same = resume is not None and self._keep_at(s) == begin         # the same prompt again: its own point
         self.fills[s.sid] = [e, mtp, begin, (resume["state"], resume["tail"]) if same else None]
         self.filling.append(s)
+
+    def _ahead(self, s: Stream) -> list:
+        """Thor NVMe n-gram tables (HD-2026-10-07-04 Phase 2): start reading the rows of the prompt's first
+        ``arrival_rows`` uncached tokens at admission, so the reads overlap it; the pass's stage waits (``_arrivals``).
+        A hint only: the stage's gather reads whatever is still missing, so the rows are the same either way."""
+
+        out = []
+        for layer in self.w.layers:
+            p = layer.ple
+            rows = getattr(getattr(p, "table", None), "arrival_rows", 0) if p is not None else 0
+            start = min(s.cached or 0, len(s.prompt))
+            if not rows or start >= len(s.prompt):
+                continue
+            lo, hi = max(0, start - (p.ngram.n - 1)), min(len(s.prompt), start + rows)
+            try:
+                ids = p.ngram.ids(p.ngram.initial_history(), np.asarray(s.prompt[lo:hi], dtype=np.int64))[start - lo:]
+                out.append((p.table, p.table.ahead(ids)))
+            except Exception:                        # noqa: BLE001  (a hint: never fails the request)
+                continue
+        return out
+
+    @staticmethod
+    def _arrivals(pieces) -> None:
+        """Before a pass's stage: its prompts' arrival reads finished (what is left read now, at full width)."""
+
+        for s, _, _ in pieces:
+            for table, ticket in getattr(s, "ahead", None) or ():
+                table.wait(ticket)
+            s.ahead = None
 
     def _fill(self) -> list[Stream]:
         """Fill ordered prompt pieces until a stream decodes or a waiting request needs admission."""
@@ -554,6 +584,7 @@ class MultiDecoder:
 
         pieces = self._pieces()
         self._note_passed(pieces)
+        self._arrivals(pieces)
         t0 = time.perf_counter()
         try:
             segs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
@@ -711,7 +742,9 @@ class MultiDecoder:
         cuts = []
         if pieces:
             self._note_passed(pieces)
+            self._arrivals(pieces)
             try:
+
                 psegs = stage(self.w, self.pbuf, [(s.st, s.prompt[a:a + n]) for s, a, n in pieces])
                 cuts = self._cuts(pieces, psegs)
             except Exception as exc:                     # noqa: BLE001  (the pass's requests fail, the round goes on)
