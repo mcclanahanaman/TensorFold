@@ -114,9 +114,13 @@ class FlashNextEngine:
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
 
         workspace = vision_workspace() if vision else 0
+        from . import thor_nvme
+
+        nvme = thor_nvme.wanted(ple_on_ssd)         # Thor: the n-gram rows from NVMe, nothing mapped
         self.capacity_plan = admit(model_dir, max_len, context_explicit, torch,
                                    capacity_geometry(geometry, model_dir, vision, rank, workspace),
-                                   vision_weights(indexed_weights(tp, mtp, mapped_tables=not ple_on_ssd), vision, rank),
+                                   vision_weights(indexed_weights(tp, mtp, mapped_tables=not (ple_on_ssd or nvme)),
+                                                  vision, rank),
                                    rank=rank, world=tp,
                                    gather=gather, extra_files=extra_files(model_dir) if exl3 else ())
         self.prefill_rows, prompt_workspace = (PREFILL_ROWS, 0) if exl3 else (chunk, 0) if chunk else prompt_plan(
@@ -202,7 +206,13 @@ class FlashNextEngine:
 
         tables = {id(layer.ple.table): layer.ple.table for layer in w.layers if layer.ple is not None}
         locked = pooled = False
-        if self.concurrent and prefetch and not ple_on_ssd and tables and thor_kv.available():
+        nvme_tables = bool(tables) and all(getattr(t, "nvme", False) for t in tables.values())
+        if self.concurrent and nvme_tables and thor_kv.available():
+            # Thor KV pool over NVMe tables: the row cache was allocated and locked with the tables, before the pool
+            # measures its room (HD-2026-10-07-04)
+            pooled = True
+            print(f"[tensorfold] Thor (sm_110): {'; '.join(t.note() for t in tables.values())}", flush=True)
+        elif self.concurrent and prefetch and not ple_on_ssd and tables and thor_kv.available():
             # Thor KV pool: the tables locked before the decoder measures its room, which then leaves them out
             locked, note = thor_kv.lock_tables(tables.values(), tables_read)
             pooled = locked
@@ -223,7 +233,7 @@ class FlashNextEngine:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
                             kv_dtype=self.kv_dtype, prefill_rows=self.prefill_rows)
         started = time.perf_counter()
-        if prefetch and not ple_on_ssd and not locked:   # the n-gram tables' pages, read now rather than by requests
+        if prefetch and not ple_on_ssd and not locked and not nvme_tables:   # the tables' pages, read now, not by requests
             size = sum(t.nbytes for t in tables.values())
             # pinned pages are no longer reclaimable: lock only what the startup budget leaves room for
             room = self.capacity_plan["budget_bytes"] - self.capacity_plan["total_bytes_estimate"]
@@ -231,7 +241,7 @@ class FlashNextEngine:
                 if not tables_read:
                     table.prefetch()                  # eight readers first: mlock alone faults the pages in one by one
                 locked = room >= size and table.lock()
-        if prefetch and not ple_on_ssd:
+        if prefetch and (not ple_on_ssd or nvme_tables):
             from . import thor_dec2
 
             if thor_dec2.available():   # Thor: the cached pages mapped (lookups never fault) and the DEC-2 host path
@@ -282,7 +292,9 @@ class FlashNextEngine:
                  f"lasts ({self.multi.memory_gate.room / 2**30:.1f} GiB free for their caches, "
                  f"{self.multi.window_bytes / 2**30:.2f} GiB for one at the full window), eager" if self.concurrent else
                  f"{self.context_window}-token prompt/reply window; {self.max_len}-token cache")
-        if ple_on_ssd:
+        if nvme_tables:
+            how = "read from NVMe through a row cache at each lookup"
+        elif ple_on_ssd:
             how = "read from SSD at each lookup"
         elif tables_read:                             # read during the load: the wait after it, then any lock
             how = f"read alongside the weights ({waited:.1f}s after them)" + (

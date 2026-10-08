@@ -108,7 +108,10 @@ def setup(tables, locked: bool) -> str:
     """At load: map the tables' pages (a locked table's are mapped), set the gather and ahead switches; the note."""
 
     tables = list(tables)
-    mapped, note = (True, "n-gram table pages locked") if locked else map_tables(tables)
+    if tables and all(getattr(t, "nvme", False) for t in tables):    # rows from NVMe: nothing to map, never a fault
+        mapped, note = True, "n-gram rows from NVMe through the row cache"
+    else:
+        mapped, note = (True, "n-gram table pages locked") if locked else map_tables(tables)
     bf16 = bool(tables) and all(getattr(t, "bits", 4) == 16 for t in tables)
     S.split = max(0, int(os.environ.get(SPLIT_ENV, "32") or 0))
     S.pool_rows = max(1, int(os.environ.get(POOL_ENV, "384") or 384))

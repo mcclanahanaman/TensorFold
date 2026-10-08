@@ -182,7 +182,10 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
     def ple_nvfp4(name: str, ple_index: int) -> PLEW:
         """A PLE layer with bf16, FP8, NVFP4 or MLX 4-bit n-gram shards and bf16 projections."""
 
-        if ple_on_ssd:
+        from . import thor_nvme
+
+        nvme = thor_nvme.wanted(ple_on_ssd)          # Thor (sm_110): the rows from NVMe through a row cache
+        if ple_on_ssd and not nvme:
             raise ValueError("--ple-on-ssd reads the MLX checkpoint's n-gram shards from disk; an NVFP4 checkpoint's "
                              "tables stay memory-mapped, so drop --ple-on-ssd")
         ngram = cfg.ngram(ple_index)
@@ -190,8 +193,8 @@ def load(model_dir: str | Path, device: str = "cuda", *, mtp: bool = True, tp: t
         ngram.check(raw(base + "layer_multipliers").cpu().numpy(), raw(base + "ngram_heads_offsets").cpu().numpy(),
                     raw(base + "ngram_heads_vocab_sizes").cpu().numpy())
         keys = shard_keys(prefix + base + "ngram_embedding", cfg.ngram_shards, rd.where)
-        table = open_table(model_dir, [(rd.where[k + ".weight"], k) for k in keys],
-                           lambda n: table_scale(base, n))
+        files = [(rd.where[k + ".weight"], k) for k in keys]
+        table = (thor_nvme.open_table if nvme else open_table)(model_dir, files, lambda n: table_scale(base, n))
         if getattr(table, "width", ngram.dims) != ngram.dims:
             raise ValueError(f"the n-gram rows hold {table.width} values, expected {ngram.dims}")
         if table.rows != ngram.rows:
