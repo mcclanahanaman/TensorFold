@@ -163,6 +163,18 @@ class NVMeTable(NVFP4Table):
                           + (f" ({ENV}=0 keeps the tables in memory)" if direct else ""))
         self.use_pairs()
 
+    @classmethod
+    def policy(cls, cache_rows: int, probation: int = PROBATION, init: int = 0) -> "NVMeTable":
+        """The cache policy alone, for trace studies (``simulate`` only: no table, no reads)."""
+
+        self = cls.__new__(cls)
+        self._lib, err = library(), ctypes.create_string_buffer(512)
+        self._h = self._lib.tfnr_open(0, None, 0, None, 80, 10, int(cache_rows), 0, 1, 1, 0, 0, 4096, int(init),
+                                      int(probation), err, len(err))
+        if not self._h:
+            raise OSError(err.value.decode(errors="replace"))
+        return self
+
     def __del__(self) -> None:
         h, self._h = getattr(self, "_h", None), None
         if h:

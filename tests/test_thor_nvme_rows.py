@@ -170,3 +170,10 @@ def test_wanted_needs_the_switch_and_sm110(monkeypatch):
     assert thor_nvme.wanted() is False
     monkeypatch.setenv(thor_nvme.ENV, "0")
     assert thor_nvme.wanted(ple_on_ssd=True) is False
+
+
+def test_policy_only_table():
+    sim = thor_nvme.NVMeTable.policy(4096, probation=0)
+    ids = np.arange(0, 3000, dtype=np.int64)
+    assert sim.simulate(ids).sum() == 0 and sim.simulate(ids).sum() == 3000
+    assert thor_nvme.NVMeTable.policy(4096).info()["probation"] == thor_nvme.PROBATION
