@@ -327,3 +327,43 @@ def test_snapshot_round_trip(checkpoint, tmp_path, monkeypatch):
         d = _open(root, keys, 2048, monkeypatch, out)
         assert not d.restore(geometry, broken)
         assert d.stats()["hits"] == 0 and d.snapshot()[0]["held"] == 0
+
+
+def test_snapshot_file_checked_against_the_row_file(checkpoint, tmp_path, monkeypatch):
+    import hashlib
+    import struct
+
+    from tensorfold.families.qwen4_exp.cuda import thor_nvme_snap as snap
+
+    root, keys, out = _packed(checkpoint, tmp_path)
+    a = _open(root, keys, 2048, monkeypatch, out)
+    ref = NVFP4Table(checkpoint[2], 0.03125)
+    ref.use_pairs()
+    ids = np.random.default_rng(5).integers(0, ref.rows, 1500)
+    a.gather(ids)
+    key = a.manifest["sha256"]
+    path = tmp_path / "cache.snap"
+    assert snap.save(a, path, key)["held"] > 0
+    b = _open(root, keys, 2048, monkeypatch, out)
+    got = snap.load(b, path, key, check=b.check_dump)
+    assert got["loaded"] and b.snapshot()[1].tobytes() == a.snapshot()[1].tobytes()
+    a.reset_stats()
+    b.reset_stats()
+    assert np.array_equal(b.gather(ids), ref.gather(ids)) and np.array_equal(a.gather(ids), ref.gather(ids))
+    assert b.stats()["hits"] == a.stats()["hits"] > 0                # restored: the saved cache's hits
+    # a dump whose bytes are self-consistent (checksum fixed up) but one held row differs from the row file: refused
+    raw = bytearray(path.read_bytes())
+    (n,) = struct.unpack("<I", raw[8:12])
+    header = json.loads(raw[12:12 + n])
+    slots, sets, rb = header["sets"] * header["ways"], header["sets"], header["row_bytes"]
+    body = 12 + n
+    tags = np.frombuffer(bytes(raw[body:body + 4 * slots]), dtype="<u4")
+    slot = int(np.flatnonzero(tags)[0])
+    raw[body + 5 * slots + 2 * sets + slot * rb + 3] ^= 0x10
+    header["sha256"] = hashlib.sha256(bytes(raw[body:])).hexdigest()
+    text = json.dumps(header).encode()
+    path.write_bytes(snap.MAGIC + struct.pack("<I", len(text)) + text + bytes(raw[body:]))
+    c = _open(root, keys, 2048, monkeypatch, out)
+    assert snap.load(c, path, key, check=c.check_dump) == {"loaded": False, "reason": "rows"}
+    assert c.snapshot()[0]["held"] == 0 and (tmp_path / "cache.snap.bad").exists()
+    assert not _open(root, keys, 2048, monkeypatch, out).check_dump({"sets": 1}, np.zeros(8, np.uint8))

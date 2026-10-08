@@ -277,6 +277,13 @@ class FlashNextEngine:
         if self.vision is not None:
             self.vision.warm()
             torch.cuda.empty_cache()
+        self.ngram_savers = []
+        if nvme_tables:                    # the row cache kept across restarts (before the pool measures its room)
+            from . import thor_nvme_snap
+
+            self.ngram_savers, note = thor_nvme_snap.attach(tables.values())
+            if note:
+                print(f"[tensorfold] Thor (sm_110): {note} ({thor_nvme_snap.ENV} unset: none)", flush=True)
         if pooled:                                     # last: nothing after it gives torch's cached blocks back
             print(f"[tensorfold] Thor (sm_110): {self.multi.reserve_pool()} ({thor_kv.ENV}=0: the earlier path)",
                   flush=True)
@@ -482,6 +489,8 @@ class FlashNextEngine:
         if self.scheduler is not None:
             self.scheduler.close()
             self.scheduler = None
+        for saver in getattr(self, "ngram_savers", ()):   # the n-gram row cache's last snapshot
+            saver.stop()
 
     def generate(self, prompt: list[int], max_tokens: int, sampling,
                  on_tokens: Callable[[list[int]], bool | None], draft: bool = True, constraint=None,

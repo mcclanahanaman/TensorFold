@@ -389,6 +389,37 @@ class NVMeTable(NVFP4Table):
         return self._lib.tfnr_snapshot_load(self._h, payload.ctypes.data, int(geometry.get("sets", -1)),
                                             int(geometry.get("ways", -1)), int(geometry.get("row_bytes", -1))) == 0
 
+    def check_dump(self, geometry: dict, payload: np.ndarray, sample: int = 2048) -> bool:
+        """A ``snapshot`` dump's rows equal the repacked row file's bytes (a seeded sample of its held slots, plain reads
+        of the file): a restored cache holds the checkpoint's rows. False for any mismatch, or without a row file."""
+
+        if not self.packed:
+            return False
+        sets, ways, rb = (int(geometry.get(k) or -1) for k in ("sets", "ways", "row_bytes"))
+        slots = sets * ways
+        if sets <= 0 or ways <= 0 or rb != self.wrow + self.wrow // 8 or payload.size != slots * (5 + rb) + 2 * sets:
+            return False
+        payload = np.ascontiguousarray(payload, dtype=np.uint8)
+        tags = payload[:4 * slots].view("<u4")
+        held = np.flatnonzero(tags)
+        if held.size > sample:
+            held = np.random.default_rng(int(held.size)).choice(held, sample, replace=False)
+        rows = tags[held].astype(np.int64) - 1
+        if rows.size and int(rows.max()) >= self.rows:
+            return False
+        data = payload[5 * slots + 2 * sets:].reshape(slots, rb)
+        fd = os.open(self.packed, os.O_RDONLY)
+        try:
+            same = all(os.pread(fd, rb, row * rb) == data[slot].tobytes()
+                       for slot, row in zip(held.tolist(), rows.tolist()))
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            except (AttributeError, OSError):
+                pass
+        finally:
+            os.close(fd)
+        return same
+
     def background(self, threads: int) -> None:
         """Benchmarks: ``threads`` readers of random pages until called again with 0."""
 

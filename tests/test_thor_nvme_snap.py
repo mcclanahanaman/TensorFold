@@ -156,3 +156,49 @@ def test_saver_sigterm_hook_saves_then_chains(tmp_path):
     finally:
         signal.signal(signal.SIGTERM, old)
         s.stop(final=False)
+
+
+# Engineer additions (Phase 2 wiring): the row check, save_now, attach (the engine's switch).
+
+def test_load_refuses_rows_that_differ(tmp_path):
+    a, p = Fake(seed=1), tmp_path / "s.snap"
+    snap.save(a, p, KEY)
+    seen = []
+    got = snap.load(Fake(), p, KEY, check=lambda g, pl: seen.append((g, pl.size)) or False)
+    assert got == {"loaded": False, "reason": "rows"} and seen[0][1] == a.payload.size
+    assert not p.exists() and (tmp_path / "s.snap.bad").exists()      # never loaded again
+    snap.save(a, p, KEY)
+    b = Fake()
+    assert snap.load(b, p, KEY, check=lambda g, pl: True)["loaded"] and len(b.restored) == 1
+
+
+def test_save_now_and_last(tmp_path):
+    t, p = Fake(), tmp_path / "s.snap"
+    s = snap.Saver(t, p, KEY, period_s=3600, min_new_rows=10**9)
+    got = s.save_now()                                  # whatever the cache holds, now
+    assert got["saved"] and s.last == got and s.saves == 1 and _parts(p)[1] == t.payload.tobytes()
+    s.stop(final=False)
+
+
+class Table(Fake):
+    manifest = {"sha256": KEY}
+
+
+def test_attach(tmp_path, monkeypatch):
+    p = tmp_path / "d" / "s.snap"
+    monkeypatch.setattr(snap.signal, "signal", lambda *a: None)       # no process-wide SIGTERM hook from a test
+    monkeypatch.delenv(snap.ENV, raising=False)
+    assert snap.attach([Table()]) == ([], "")                         # off unless asked
+    monkeypatch.setenv(snap.ENV, str(p))
+    monkeypatch.setenv(snap.PERIOD_ENV, "0")
+    savers, note = snap.attach([Fake()])                              # no row file: off, said so
+    assert savers == [] and "needs a repacked row file" in note
+    a = Table(seed=3)
+    savers, note = snap.attach([a])
+    assert "not restored (missing)" in note and savers[0]._thread is None and p.parent.is_dir()
+    savers[0].stop()                                                  # the exit save
+    b = Table(seed=4)
+    b.check_dump = lambda g, pl: pl.tobytes() == a.payload.tobytes()
+    savers, note = snap.attach([b])
+    assert "restored 7 rows" in note and b.restored[0][1].tobytes() == a.payload.tobytes()
+    savers[0].stop(final=False)
