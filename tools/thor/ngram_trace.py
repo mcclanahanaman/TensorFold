@@ -50,26 +50,14 @@ def session_rows(messages, encode, ngram):
     return rows, np.asarray(src, dtype=np.uint8)
 
 
-def _dsh_strings(node, out):
-    if isinstance(node, str):
-        out.append(node)
-    elif isinstance(node, list):
-        for item in node:
-            _dsh_strings(item, out)
-    elif isinstance(node, dict):
-        for key, item in node.items():
-            if key not in _DSH_SKIP_KEYS:
-                _dsh_strings(item, out)
-
-
 def _dsh_walk(node, out):
+    """The review's extract_rows.texts: a 'text'/'arguments' value that is a string is kept; any other value is walked
+    for nested ones (keys in _DSH_SKIP_KEYS are not walked)."""
     if isinstance(node, dict):
         for key, item in node.items():
-            if key in _DSH_SKIP_KEYS:
-                continue
-            if key in _DSH_KEEP_KEYS:
-                _dsh_strings(item, out)
-            else:
+            if key in _DSH_KEEP_KEYS and isinstance(item, str):
+                out.append(item)
+            elif key not in _DSH_SKIP_KEYS:
                 _dsh_walk(item, out)
     elif isinstance(node, list):
         for item in node:
