@@ -8,6 +8,9 @@ from tensorfold.server.errors import CapacityError
 
 from .capacity import cuda_limit_bytes
 
+SLOTS_RETRY_S = 2.0             # Retry-After for a request refused because every seat stayed live (as the preview's)
+MEMORY_RETRY_S = 5.0            # ... because the cache room stayed promised to live requests
+
 
 class NoRoom(CapacityError):
     """A request that can't start until a live stream finishes and frees its caches: HTTP 503, retry shortly.
@@ -53,11 +56,16 @@ class MemoryGate:
     def reserved_total(self) -> int:
         return sum(self.reserved.values())
 
-    def admits(self, extra: int) -> bool:
-        """Whether reserving ``extra`` more bytes (a new stream's full worst-case extent) still fits ``room`` (a pool's
-        less its reserve, which every grow keeps free: then an admitted stream always grows to its worst case)."""
+    def admission_room(self) -> int:
+        """The bytes admission promises against: ``room``, a pool's less its reserve (which every grow keeps free:
+        then an admitted stream always grows to its worst case). /v1/capacity reports against the same bound."""
 
-        return self.reserved_total + int(extra) <= self.room - (self.reserve if self.pooled else 0)
+        return self.room - (self.reserve if self.pooled else 0)
+
+    def admits(self, extra: int) -> bool:
+        """Whether promising ``extra`` more bytes (a new stream's full worst-case extent) fits the admission room."""
+
+        return self.reserved_total + int(extra) <= self.admission_room()
 
     def promise(self, key: int, extra: int) -> None:
         """Ledger ``extra`` bytes against ``key`` (named ``promise``: ``self.reserve`` is already the margin int)."""
@@ -126,4 +134,4 @@ def driver_pool(torch, meminfo: Callable[[], dict | None] = _meminfo) -> Callabl
     return pool
 
 
-__all__ = ["MemoryGate", "NoRoom", "driver_pool", "torch_live"]
+__all__ = ["MEMORY_RETRY_S", "MemoryGate", "NoRoom", "SLOTS_RETRY_S", "driver_pool", "torch_live"]

@@ -12,13 +12,11 @@ import threading
 import time
 from typing import Any, Callable
 
-from .memory_gate import NoRoom
+from .memory_gate import MEMORY_RETRY_S, SLOTS_RETRY_S, NoRoom    # noqa: F401  (the retry hints live with NoRoom)
 from .streams import Stream
 
 
 WAIT_ENV = "TENSORFOLD_ADMISSION_WAIT_S"
-SLOTS_RETRY_S = 2.0             # Retry-After for a request refused because every seat stayed live (as the preview's)
-MEMORY_RETRY_S = 5.0            # ... because the cache room stayed promised to live requests
 
 
 def admission_wait_s() -> float | None:
