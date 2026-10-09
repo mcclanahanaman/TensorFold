@@ -14,8 +14,8 @@ On sm_110 with vision, this path:
 1. **Splits the workspace.** The tower's GPU scratch (``gpu_bytes``) stays in the pool, out of the caches' room, as
    before; the rest (``host_bytes``) is left out of the pool (``reserve_pool`` reserves that much less), as host memory
    for vision requests' buffers. The caches' room is what it was: the workspace is the same size, split. The pool
-   leaves at least ``HOST_FLOOR_BYTES`` out (``pool_host``), what serving vision was measured to take past the idle;
-   that much more comes off the room.
+   leaves at least ``HOST_FLOOR_BYTES`` out (``pool_host``), what serving vision was measured to take past the idle
+   with a client on the same host; that much more comes off the room.
 2. **Budgets it.** A request holds its bound (``request_bytes``: decoded pixels, patches, frames, one image's processor
    temporaries) from before its decode until its tower encode ends; another waits (up to the image wait, then 503 as
    before). A request whose bound exceeds the budget runs alone. ``/v1/capacity`` reports the budget.
@@ -45,8 +45,11 @@ GPU_BYTES = 640 * MIB
 # the host memory the Thor KV pool leaves free for serving vision (its fit's design point), at least the budget's part:
 # over the release's vision MATCH set the server's host memory past its graphs grew up to 551 MiB over its idle (537 on
 # the other start) [vmem-a3-c], MemAvailable fell up to 81 MiB more after the App's init, which a refit cannot see (page
-# cache, counted about half at Thor's idle MemFree) [vmem-a3-c], and one fit step (64 MiB) covers start-to-start spread
-HOST_FLOOR_BYTES = 704 * MIB
+# cache, counted about half at Thor's idle MemFree) [vmem-a3-c], and one fit step (64 MiB) covers start-to-start spread;
+# at 704 MiB the original-set floor, with the gate's own client in the container (~198 MiB of request bodies), was
+# 2,472 / 2,509 MiB, swap not counted: 51-88 MiB under 2.5 GiB [vmem-a6-c3]; 256 MiB more (four fit steps) covers that
+# at 1:1 with 168 MiB to spare for a smaller gain
+HOST_FLOOR_BYTES = 960 * MIB
 TRIM_GAP_S = 0.2                 # a trim at most this often (each vision request asks for one)
 KEEP_ATTR = "_thor_vision_keep"  # set on a prepared prompt whose request may encode it again (``VisionMemory.keep``)
 

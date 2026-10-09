@@ -207,10 +207,11 @@ def test_a_kept_hold_covers_its_continuations_encode(video_tokens):
 def test_the_pool_leaves_out_the_measured_serving_memory_the_budget_unchanged():
     """THOR-KV-FIT's design point leaves at least ``HOST_FLOOR_BYTES`` out of the pool for serving vision (the
     release's 1 GiB workspace splits 640 MiB tower + 384 MiB host); what requests may hold at once stays the part."""
-    assert tvm.HOST_FLOOR_BYTES == 704 * MIB
+    assert tvm.HOST_FLOOR_BYTES == 960 * MIB
     gpu, host = tvm.split(1024 * MIB, tvm.GPU_BYTES)
-    assert (gpu, host) == (640 * MIB, 384 * MIB) and tvm.pool_host(host) == 704 * MIB
-    assert tvm.pool_host(2048 * MIB) == 2048 * MIB and tvm.pool_host(0) == 704 * MIB
+    assert (gpu, host) == (640 * MIB, 384 * MIB) and tvm.pool_host(host) == 960 * MIB
+    assert tvm.pool_host(2048 * MIB) == 2048 * MIB and tvm.pool_host(0) == 960 * MIB
+    assert tvm.pool_host(960 * MIB + 1) == 960 * MIB + 1 and tvm.pool_host(-1) == 960 * MIB
     assert tvm.VisionMemory(host_bytes=host, gpu_bytes=gpu).budget.total == 384 * MIB
 
 
