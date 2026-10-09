@@ -481,6 +481,21 @@ def thor_slices(device: int) -> bool:
     return torch.cuda.get_device_capability(device) == (11, 0)
 
 
+@lru_cache(maxsize=None)
+def thor_rows48(device: int) -> bool:
+    """Thor (sm_110): MXFP8 windows of 33-48 rows run 48-row tiles, not 64 (tiles never change a row's bits).
+
+    At 33-64 rows the 64-row tile runs Flash Next's GDN in_proj [16480, 2560] in 228 us whatever the rows, against
+    181 us for 16-row tiles at up to 16 rows (dpush-5-b4, tools/thor/qmmf_rows_bench.py): its MMAs, 4x the 16-row
+    tile's, bound it, and 16- or 32-row tiles side by side read the weights again (307-445 us). A 48-row tile does
+    3/4 of the 64-row MMAs. TENSORFOLD_THOR_QMMF_ROWS48=0 keeps 64-row tiles."""
+    import os
+
+    if os.environ.get("TENSORFOLD_THOR_QMMF_ROWS48", "1") == "0":
+        return False
+    return torch.cuda.get_device_capability(device) == (11, 0)
+
+
 def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n: int, k: int, npad: int,
             x: torch.Tensor, out: torch.Tensor | None) -> torch.Tensor:
     """x (M, K) bf16 -> (M, n) bf16; K slices from the shape alone, so a row's bits never depend on M."""
@@ -498,6 +513,9 @@ def _matmul(mode: int, w: torch.Tensor, bs: torch.Tensor | None, scale: float, n
     part = torch.empty((sk, m, n), dtype=torch.float32, device=x.device) if meet else None
     # prompt rows: each block sums its tile's slices itself (bm 0), the cluster's order without the cluster
     bm = 0 if sk > 1 and m >= FUSED_ROWS else qmm.bucket(m)
+    if bm == 64 and m <= 48 and mode == MXFP8 and thor_rows48(x.device.index if x.device.index is not None
+                                                              else torch.cuda.current_device()):
+        bm = 48
     _ext().qmmf(x, w, bs, scale, y, part if bm else None, mode, n, sk, npad, bm, False)
     if out is not None and y is not out:
         out.copy_(y)

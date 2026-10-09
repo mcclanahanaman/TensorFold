@@ -339,6 +339,10 @@ void by_rows(int bm, const at::Tensor& x, const at::Tensor& w, const at::Tensor&
         case 16: launch<MODE, 16, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad); break;
         case 32: launch<MODE, 32, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad); break;
         case 64: launch<MODE, 64, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad); break;
+        case 48:                                  // Thor's MXFP8 windows of 33-48 rows (linear.thor_rows): 3/4 the MMAs
+            if constexpr (MODE == MXFP8) launch<MODE, 48, F32, CLUSTER>(x, w, bs, scale, out, part, N, K, SK, npad);
+            else TORCH_CHECK(false, "48-row tiles: MXFP8 weights only");
+            break;
         default: launch<MODE, 64, F32, false, true>(x, w, bs, scale, out, part, N, K, SK, npad); break;   // 0: fused
     }
 }
