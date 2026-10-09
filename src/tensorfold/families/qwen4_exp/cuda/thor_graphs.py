@@ -42,10 +42,18 @@ with a prompt pass stays eager):
   round's pending rows to half 1 first, exact copies), so one graph a window size serves both parities;
 - an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
   them by the picks' width), so a chain step is one replay and one read of host memory.
+- a concurrent forward (two or more streams; DPUSH MS-GRAPH) is keyed by its stream count and rows only
+  (``canonical``), never by a stream's window or slot: its n-gram convs run as one launch that reads each row's window
+  start and each stream's conv tail address from the step's tables, the pooled-key grid spans the widest window and
+  the DeltaNet plan's shared memory the widest chain, so one graph serves every split of its rows over its streams.
+  A concurrent forward with a sparse stream stays eager. Such graphs record on demand like any other key, charged to
+  the same budget. ``TENSORFOLD_THOR_DECODE_GRAPH_MULTI=0`` keeps concurrent forwards eager with their per-stream
+  convs (e4fb57f's path, the kill switch);
 
 Graphs are on by default on Thor (THOR-DEC-1 G-D ruling, 2026-10-03; ``TENSORFOLD_THOR_DECODE_GRAPH=0`` keeps every
 round eager, the r37 path and the kill switch); ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N`` graphs only forwards of at
-most N streams (``_CAP``: the most graphs kept). Events go to stderr as ``[thor-graph] {json}`` lines (``tools/thor/graph_stats.py`` digests them).
+most N streams (default: every forward, or one stream with ``MULTI`` off; ``_CAP``: the most graphs kept). Events go
+to stderr as ``[thor-graph] {json}`` lines (``tools/thor/graph_stats.py`` digests them).
 """
 
 from __future__ import annotations
@@ -79,11 +87,13 @@ DEMAND_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_DEMAND"     # after prerecord, other 
 DEMAND_MIB_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_DEMAND_MIB"
 HOST_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_HOST"         # on-demand graphs' host memory charged too (default on)
 MEM_ENV = "TENSORFOLD_THOR_MEM_PROBE"   # diagnostics: a trigger file path; [thor-mem] breakdowns at startup and on it
+MULTI_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_MULTI"       # concurrent forwards under canonical keys (default on)
 CAPABILITY = (11, 0)
 SCHED_MASK, SCHED_SPIN = 0x07, 0x01  # CU_CTX_SCHED_MASK, CU_CTX_SCHED_SPIN
 CAP = 256                   # graphs kept, verification and MTP together
 MIN_SEEN = 2                # a key's forwards before its graph is recorded (the first runs eagerly)
 STREAMS = 1                 # the most streams a graphed forward holds (more stay eager: their keys rarely repeat)
+MULTI_STREAMS = 64          # ... with MULTI on: every concurrent forward, keyed by its stream count and rows
 SEEN_MAX = 1 << 14          # keys counted before the counts start over
 STATS_EVERY = 512           # forwards between stats events
 DEMAND_MIB = 1024           # the on-demand graphs' memory at most (MiB)
@@ -135,6 +145,26 @@ def spinning(device: int = 0) -> str:
     print("[thor-graph] " + json.dumps({"event": "spin", "mode": mode}, separators=(",", ":")), file=sys.stderr,
           flush=True)
     return mode
+
+
+@functools.lru_cache(maxsize=None)
+def multi_on(device: int = 0) -> bool:
+    """Concurrent forwards (two or more streams) graphed under canonical keys, their n-gram convs one launch (DPUSH
+    MS-GRAPH): sm_110 with graphs on, unless ``TENSORFOLD_THOR_DECODE_GRAPH_MULTI=0`` (e4fb57f's eager concurrent
+    rounds, the kill switch). Decided once."""
+
+    return available(device) and _flag(MULTI_ENV, "1")
+
+
+def canonical(kind: str, segs: Sequence, step, extra: tuple = ()) -> tuple:
+    """A concurrent forward's key (DPUSH MS-GRAPH): its stream count and rows, never a stream's window or slot.
+
+    Every launch of such a forward takes its rows' streams, positions, window starts, conv tails and cache pointers
+    from the step's and tables' device tables (a replay copies this round's in), and sizes its grid by the rows, the
+    streams, the widest window and the context bucket; so any split of the same rows over the same number of streams,
+    in any slots, replays one graph. (Per-stream windows in the key gave keys that never repeated: 0.94-0.98x.)"""
+
+    return (kind, ("multi", len(segs), segs[-1][2]), bool(step.vision), step.context) + tuple(extra)
 
 
 def settle() -> None:
@@ -211,6 +241,7 @@ class _Entry:
     step: _Twin
     tables: _Twin | None
     shx: int = 0                                # fused shared-expert tails this graph captured (each replay runs them)
+    swap: bool = True                           # its forward reads the graph's own conv tails (copied in a replay)
 
 
 class DecodeGraphs:
@@ -221,7 +252,9 @@ class DecodeGraphs:
         self.width = width                          # the DeltaNet fold table's rows a stream (the widest window)
         self.cap = int(os.environ.get(CAP_ENV, "0") or 0) or (CAP if cap is None else cap)
         self.min_seen = max(1, min_seen)
-        self.streams = int(os.environ.get(STREAMS_ENV, "0") or 0) or STREAMS
+        self.multi = multi_on()                     # concurrent forwards too, under canonical keys (MS-GRAPH)
+        self.streams = int(os.environ.get(STREAMS_ENV, "0") or 0) or (MULTI_STREAMS if self.multi else STREAMS)
+        self.multi_eager = 0                        # concurrent forwards left eager (a sparse stream)
         self.pool = torch.cuda.graph_pool_handle()
         self.side = torch.cuda.Stream()             # every capture's stream (a pool block is reused on its own stream)
         self.ple = {"verify": True, "mtp": True} if ple is None else dict(ple)   # kind -> its forward reads conv tails
@@ -254,6 +287,7 @@ class DecodeGraphs:
         self.failed: set[str] = set()
         self.calls = 0
         self._emit({"event": "on", "cap": self.cap, "min_seen": self.min_seen, "streams": self.streams,
+                    "multi": self.multi,
                     "startup": self.startup, "lazy": self.lazy, "rows": self.rows, "demand": self.demand,
                     "demand_mib": round(self.budget / MIB, 1), "ple": self.ple,
                     "free_mib": _free_mib()})
@@ -268,7 +302,7 @@ class DecodeGraphs:
                 "captures": dict(self.captures), "evictions": 0, "capture_s": round(self.capture_s, 4),
                 "graph_mib": round(self.graph_mib, 1),
                 "graphs": len(self.graphs), "hist": dict(self.hist), "missed": dict(self.missed),
-                "ctx": {k: list(v) for k, v in self.ctx.items()},
+                "ctx": {k: list(v) for k, v in self.ctx.items()}, "multi_eager": self.multi_eager,
                 "demand": {"graphs": len(self.paid), "mib": round((self.charged - self.refunded) / MIB, 1),
                            "evicted": self.evicted, "host_mib": round(self.host_mib, 1), "host": self.host},
                 "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1),
@@ -280,6 +314,13 @@ class DecodeGraphs:
         sc = b.attn
         top = sc.budget // sc.ratio
         mtp = kind == "mtp"
+        if self.multi and len(segs) > 1:            # MS-GRAPH: rows and streams only; a sparse stream stays eager
+            if sc.qsa and any(end // sc.ratio > top for end in step.ends):
+                return None
+            k = canonical(kind, segs, step, extra)
+            if tables is not None:
+                k += (tables.cur, bool(tables.folds), tables.plan.slots, tables.plan.max_rows, tables.held.shape[1])
+            return k
         per = []
         for (st, a0, a1), end in zip(segs, step.ends):
             sparse = bool(sc.qsa) and end // sc.ratio > top
@@ -297,7 +338,8 @@ class DecodeGraphs:
     def _miss(self, key: tuple) -> None:
         """Diagnostics: a one-stream forward ran eagerly; ``stats`` counts it by its key, pointers left out."""
 
-        k = str((key[0], tuple(p[:2] for p in key[1])) + key[2:])
+        per = key[1] if key[1][:1] == ("multi",) else tuple(p[:2] for p in key[1])
+        k = str((key[0], per) + key[2:])
         if k not in self.missed and len(self.missed) >= MISSED_MAX:
             k = "other"
         self.missed[k] = self.missed.get(k, 0) + 1
@@ -313,13 +355,21 @@ class DecodeGraphs:
             self._emit(self.stats())
         if len(segs) > self.streams:                # eager as before (the widest fold table changes no bits)
             return fn()
+        if self.multi and len(segs) > 1:            # MS-GRAPH: grids by the widest window, whatever the split
+            step.most = max(step.most, self.width)  # (a pooled-key block past a stream's rows writes nothing)
+            if tables is not None and tables.plan.max_rows < self.width:
+                tables.plan = dataclasses.replace(tables.plan, max_rows=self.width)   # a chain plan: shared memory only
         if tables is not None and tables.cur:       # one parity a graph: this round writes half 0
             gdn_multi.normalize(tables)
         step.context = bucket(max(step.ends))
         key = self.key(kind, segs, b, step, tables, extra)
+        if key is None:                             # a concurrent forward with a sparse stream
+            self.multi_eager += 1
+            return fn()
         h = self.hist.setdefault(f"{kind}{segs[-1][2]}" if len(segs) == 1 else f"{kind}x{len(segs)}", [0, 0])
         h[0] += 1
-        c = self.ctx.setdefault(f"{kind}:{step.context}:{'s' if any(p[1] for p in key[1]) else 'd'}", [0, 0])
+        sparse = key[1][:1] != ("multi",) and any(p[1] for p in key[1])      # (a concurrent key is dense)
+        c = self.ctx.setdefault(f"{kind}:{step.context}:{'s' if sparse else 'd'}", [0, 0])
         c[0] += 1
         entry = self.graphs.get(key)
         if entry is not None:
@@ -421,7 +471,7 @@ class DecodeGraphs:
         entry.step.load(step)
         if entry.tables is not None:
             entry.tables.load(tables)
-        if self.ple.get(kind, True):
+        if self.ple.get(kind, True) and entry.swap:
             for tail, (st, _, _) in zip(self.tails, segs):
                 tail.copy_(st.ple_tail, non_blocking=True)
 
@@ -438,8 +488,10 @@ class DecodeGraphs:
         free0, alloc0, res0 = _free_mib(), torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
         twin_step = _Twin(step)
         twin_tables = _Twin(tables) if tables is not None else None
-        ple = self.ple.get(kind, True)
-        if ple:                                     # the graph reads the tails it owns; this round's are copied in
+        # the graph reads the tails it owns, this round's copied in; a step with a tail table (MS-GRAPH) reads each
+        # stream's own tail through it, so nothing is swapped
+        ple = self.ple.get(kind, True) and getattr(step, "tails", None) is None
+        if ple:
             while len(self.tails) < len(segs):
                 self.tails.append(torch.empty_like(segs[0][0].ple_tail))
             for tail, (st, _, _) in zip(self.tails, segs):
@@ -498,7 +550,7 @@ class DecodeGraphs:
                     "kept_mib": round((torch.cuda.memory_allocated() - alloc0) / MIB, 2),
                     "pool_mib": round((torch.cuda.memory_reserved() - res0) / MIB, 1),
                     "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1), "free_mib": free1})
-        return _Entry(graph, out, twin_step, twin_tables, shx)
+        return _Entry(graph, out, twin_step, twin_tables, shx, swap=ple)
 
     def prerecord(self, dec, mtp_fn: Callable | None = None) -> int:
         """Record the one-stream keys of short contexts now (``dec``: the ``MultiDecoder``, every slot free): a

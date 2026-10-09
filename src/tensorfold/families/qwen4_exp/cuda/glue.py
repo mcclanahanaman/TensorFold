@@ -554,6 +554,56 @@ def ple_conv(gated, pss, norm_conv, tail, conv_w, h, hout, nrow, eps: float, str
 
 
 @triton.jit
+def _ple_conv_multi(GATED, PSS, NC, TAILS, SID, ROW0, CW, H, HOUT, NROW, eps,
+                    D: tl.constexpr, S: tl.constexpr, TAPS: tl.constexpr, DIL: tl.constexpr, BLOCK: tl.constexpr):
+    """``_ple_conv`` over a concurrent step's rows in one launch (Thor DPUSH MS-GRAPH): row ``r`` belongs to stream
+    ``SID[r]``, whose window starts at row ``ROW0[r]`` and whose conv tail is at ``TAILS[SID[r]]``. The same
+    arithmetic in the same order as ``_ple_conv`` on that stream's slice, so the bits are the per-stream launches'."""
+
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    a0 = tl.load(ROW0 + r)
+    tail = tl.load(TAILS + tl.load(SID + r)).to(tl.pointer_type(tl.bfloat16))
+    rl = r - a0                                       # the row within its stream's window
+    W: tl.constexpr = S * D
+    NT: tl.constexpr = (TAPS - 1) * DIL
+    e = c * BLOCK + tl.arange(0, BLOCK)
+    s = (c * BLOCK) // D
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for t in tl.static_range(TAPS):
+        at = rl + t * DIL                             # index into [tail (NT rows); the stream's rows]
+        if at < NT:
+            xv = tl.load(tail + at * W + e).to(tl.float32)
+        else:
+            rr = a0 + at - NT
+            rinv = 1.0 / tl.sqrt(tl.load(PSS + rr * S + s) / D + eps)
+            g = tl.load(GATED + rr * W + e).to(tl.float32)
+            xv = (g * rinv * tl.load(NC + e).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        acc += tl.load(CW + e * TAPS + t).to(tl.float32) * xv
+    conv = acc.to(tl.bfloat16).to(tl.float32)
+    act = _bsilu(conv)
+    g = tl.load(GATED + r * W + e).to(tl.float32)
+    ple = (g + act).to(tl.bfloat16).to(tl.float32)
+    hv = tl.load(H + r * W + e).to(tl.float32)
+    tl.store(HOUT + r * W + e, (hv + ple).to(tl.bfloat16))
+    rinv = 1.0 / tl.sqrt(tl.load(PSS + r * S + s) / D + eps)
+    own = (g * rinv * tl.load(NC + e).to(tl.float32)).to(tl.bfloat16)
+    tl.store(NROW + r * W + e, own)
+
+
+def ple_conv_multi(gated, pss, norm_conv, tails, sid, row0, conv_w, h, hout, nrow, eps: float, streams: int,
+                   dilation: int) -> None:
+    """Every stream's ``ple_conv`` in one launch: ``tails`` holds each stream's conv tail address (int64), ``sid`` and
+    ``row0`` each row's stream and its window's first row (int32); the row tensors span every stream's rows."""
+
+    rows, wide = h.shape
+    taps = conv_w.shape[1]
+    _ple_conv_multi[(rows, wide // 512)](gated, pss, norm_conv, tails, sid, row0, conv_w, h, hout, nrow, eps,
+                                         D=wide // streams, S=streams, TAPS=taps, DIL=dilation, BLOCK=512,
+                                         num_warps=4)
+
+
+@triton.jit
 def _add_streams(E, HS, OUT, D: tl.constexpr, S: tl.constexpr, BLOCK: tl.constexpr):
     """out[r, s, :] = bf16(e[r] + hs[r, s]) (the MTP input: the embedding branch added to each stream)."""
 

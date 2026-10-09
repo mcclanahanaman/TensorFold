@@ -84,6 +84,12 @@ def _to_device(values: np.ndarray, dtype: torch.dtype, device) -> torch.Tensor:
     return shared.to_device(values.tolist(), dtype, device)
 
 
+def _multi() -> bool:
+    from . import thor_graphs                      # (thor_graphs imports the round modules)
+
+    return thor_graphs.multi_on()
+
+
 class Step:
     """A step's row, stream and cache-pointer tables (the MTP head's with ``mtp``), read now: caches may move."""
 
@@ -116,10 +122,20 @@ class Step:
             ptrs = kept
         dev = w.device
         put = thor_dec2.to_dev if fast else _to_device
-        ints = put(np.concatenate([posr, sid, first, counts]), torch.int32, dev)
+        # Thor MS-GRAPH: a concurrent step's n-gram convs in one launch read each row's window start and each
+        # stream's conv tail address from here (a graph replay copies this step's in)
+        tails = n > 1 and getattr(segs[0][0], "ple_tail", None) is not None and _multi()
+        row0 = [np.repeat(np.asarray([a0 for _, a0, _ in segs], np.int32), counts)] if tails else []
+        ints = put(np.concatenate([posr, sid, first, counts] + row0), torch.int32, dev)
         self.posr, self.sid = ints[:rows], ints[rows:2 * rows]
-        self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:]
-        self.ptrs = put(ptrs.ravel(), torch.int64, dev).view(len(layers), PTRS * n)
+        self.first, self.counts = ints[2 * rows:2 * rows + n], ints[2 * rows + n:2 * rows + 2 * n]
+        self.row0 = ints[2 * rows + 2 * n:] if tails else None
+        size = len(layers) * PTRS * n
+        if tails:
+            ptrs = np.concatenate([ptrs.ravel(), np.asarray([st.ple_tail.data_ptr() for st, _, _ in segs], np.int64)])
+        wide = put(ptrs.ravel(), torch.int64, dev)
+        self.ptrs = wide[:size].view(len(layers), PTRS * n)
+        self.tails = wide[size:] if tails else None
         self.n, self.rows, self.segs = n, rows, list(segs)
         self.ends = [p0 + c for p0, c in zip(first, counts)]
         self.most = max(counts)

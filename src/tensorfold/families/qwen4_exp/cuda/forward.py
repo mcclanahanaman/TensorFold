@@ -365,6 +365,11 @@ def ple_block(layer: LayerW, w: Weights, segs: Sequence[Seg], b: Buffers, R: int
         _mm(b.ple_emb[:R], p.value, b.xs_ple[:R], b.ple_vals[:R], b)
     glue.ple_gate(b.ple_keys[:R], b.ple_vals[:R], b.h[:R], p.norm_key, p.norm_query, b.ple_gated[:R],
                   b.ple_pss[:R], c.eps, c.streams)
+    step = None if b.prefill else getattr(b, "attn_step", None)
+    if step is not None and getattr(step, "tails", None) is not None:     # Thor MS-GRAPH: every stream, one launch
+        glue.ple_conv_multi(b.ple_gated[:R], b.ple_pss[:R], p.norm_conv, step.tails, step.sid, step.row0, p.conv,
+                            b.h[:R], b.h[:R], b.ple_nrow[:R], c.eps, c.streams, c.ngram_size)
+        return
     for st, a0, a1 in segs:
         glue.ple_conv(b.ple_gated[a0:a1], b.ple_pss[a0:a1], p.norm_conv, st.ple_tail, p.conv, b.h[a0:a1],
                       b.h[a0:a1], b.ple_nrow[a0:a1], c.eps, c.streams, c.ngram_size)

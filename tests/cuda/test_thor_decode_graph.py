@@ -10,7 +10,7 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA only", allow_module_level=True)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from test_flashnext_forward import V, _model  # noqa: E402
+from test_flashnext_forward import V, _Rand, _bf16_table, _cfg, _model, _ple  # noqa: E402
 from test_flashnext_multi import PROMPTS  # noqa: E402
 
 from tensorfold.cuda.streams import Stream  # noqa: E402
@@ -426,3 +426,67 @@ def test_shx_fuse_keeps_every_rounds_bits(kv_dtype, tmp_path, monkeypatch):
     _same_rounds(on[1], eager[1])
     assert on[2] is not None and on[2].replays.get("verify", 0) > 0, on[2].replays if on[2] else None
     assert not on[2].failed and not off[2].failed
+
+
+def test_ple_conv_multi_keeps_each_streams_bits():
+    """DPUSH MS-GRAPH: one launch over a concurrent step's rows (each row's stream and window start from tables, each
+    stream's conv tail by address) writes the per-stream launches' rows and normed rows, bit for bit."""
+
+    import numpy as np
+
+    from tensorfold.families.qwen4_exp.cuda import glue
+
+    g = torch.Generator(device="cuda").manual_seed(11)
+    S, D, taps, dil = 4, 512, 4, 3
+    wide, nt = S * D, (taps - 1) * dil
+    windows = [3, 1, 7, 2]
+    rows = sum(windows)
+
+    def bf16(*shape, scale=1.0):
+        return (torch.randn(shape, generator=g, device="cuda") * scale).to(torch.bfloat16)
+
+    gated, h, nc, conv = bf16(rows, wide), bf16(rows, wide), bf16(wide), bf16(wide, taps, scale=0.3)
+    pss = torch.rand((rows, S), generator=g, device="cuda") * D + 1.0
+    tails = [bf16(nt, wide) for _ in windows]
+    ref_h, ref_n, starts, a0 = h.clone(), torch.zeros_like(h), [], 0
+    for s, n in enumerate(windows):
+        glue.ple_conv(gated[a0:a0 + n], pss[a0:a0 + n], nc, tails[s], conv, ref_h[a0:a0 + n], ref_h[a0:a0 + n],
+                      ref_n[a0:a0 + n], 1e-6, S, dil)
+        starts.append(a0)
+        a0 += n
+    sid = torch.tensor(np.repeat(np.arange(len(windows)), windows), dtype=torch.int32, device="cuda")
+    row0 = torch.tensor(np.repeat(starts, windows), dtype=torch.int32, device="cuda")
+    ptrs = torch.tensor([t.data_ptr() for t in tails], dtype=torch.int64, device="cuda")
+    out_h, out_n = h.clone(), torch.zeros_like(h)
+    glue.ple_conv_multi(gated, pss, nc, ptrs, sid, row0, conv, out_h, out_h, out_n, 1e-6, S, dil)
+    assert torch.equal(out_h, ref_h)
+    assert torch.equal(out_n, ref_n)
+
+
+@pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
+def test_concurrent_graphs_keep_the_per_stream_rounds_bits(kv_dtype, tmp_path, monkeypatch):
+    """DPUSH MS-GRAPH: with the n-gram layer live, concurrent forwards replayed from graphs keyed by stream count and
+    rows (one conv launch a step) give the eager rounds of e4fb57f's path (MULTI=0: per-stream convs) bit for bit,
+    every round, and both verification forwards and MTP steps of two or more streams replay."""
+
+    c = _cfg(ple=True)
+    table = _bf16_table(tmp_path / "shard_0.safetensors", c.ngram(0).rows, c.ngram(0).dims)
+    w = _model(ple=_ple(c, table, _Rand(3)))
+    samplings = [None, Sampling(seed=1234, top_k=20, top_p=0.95), None, Sampling(seed=7, top_k=20, top_p=0.95)]
+    counts = [48, 30, 40, 16]
+    try:
+        monkeypatch.setenv(thor_graphs.MULTI_ENV, "0")
+        thor_graphs.multi_on.cache_clear()
+        off_out, off_rounds, _ = _decode(w, PROMPTS, counts, samplings, graphs=False, capacity=1024,
+                                         kv_dtype=kv_dtype)
+        monkeypatch.setenv(thor_graphs.MULTI_ENV, "1")
+        thor_graphs.multi_on.cache_clear()
+        on_out, on_rounds, g = _decode(w, PROMPTS, counts, samplings, graphs=True, capacity=1024, kv_dtype=kv_dtype)
+    finally:
+        thor_graphs.multi_on.cache_clear()
+    assert g.multi and g.streams > len(PROMPTS) and not g.failed
+    assert on_out == off_out
+    _same_rounds(on_rounds, off_rounds)
+    multi = {k: v for k, v in g.hist.items() if "x" in k}
+    assert sum(v[1] for k, v in multi.items() if k.startswith("verifyx")) > 0, g.hist
+    assert sum(v[1] for k, v in multi.items() if k.startswith("mtpx")) > 0, g.hist
