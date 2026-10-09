@@ -47,8 +47,10 @@ with a prompt pass stays eager):
   start and each stream's conv tail address from the step's tables, the pooled-key grid spans the widest window and
   the DeltaNet plan's shared memory the widest chain, so one graph serves every split of its rows over its streams.
   A concurrent forward with a sparse stream stays eager. Such graphs record on demand like any other key, charged to
-  the same budget. ``TENSORFOLD_THOR_DECODE_GRAPH_MULTI=0`` keeps concurrent forwards eager with their per-stream
-  convs (e4fb57f's path, the kill switch);
+  the same budget. By default only MTP chain steps (one row a stream) replay graphs, every other concurrent forward
+  runs eagerly with its one-launch convs (``multi_graphed``; ``TENSORFOLD_THOR_DECODE_GRAPH_MULTI=all``: every
+  kind); ``TENSORFOLD_THOR_DECODE_GRAPH_MULTI=0`` keeps concurrent forwards eager with their per-stream convs
+  (e4fb57f's path, the kill switch);
 
 Graphs are on by default on Thor (THOR-DEC-1 G-D ruling, 2026-10-03; ``TENSORFOLD_THOR_DECODE_GRAPH=0`` keeps every
 round eager, the r37 path and the kill switch); ``TENSORFOLD_THOR_DECODE_GRAPH_STREAMS=N`` graphs only forwards of at
@@ -156,6 +158,15 @@ def multi_on(device: int = 0) -> bool:
     return available(device) and _flag(MULTI_ENV, "1")
 
 
+def multi_graphed(kind: str, streams: int, rows: int, every: bool) -> bool:
+    """Whether a concurrent forward replays graphs (MS-GRAPH): by default only MTP chain steps (one row a stream: at
+    most one key a stream count, so nothing churns the budget); ``TENSORFOLD_THOR_DECODE_GRAPH_MULTI=all`` also
+    verification forwards and first MTP steps under ``canonical`` keys (dpush-3-dq1: their keys filled the 1,024 MiB
+    budget at 4-8 streams, 104-124 evictions a session and their recordings cost 2-6%)."""
+
+    return every or (kind == "mtp" and rows == streams)
+
+
 def canonical(kind: str, segs: Sequence, step, extra: tuple = ()) -> tuple:
     """A concurrent forward's key (DPUSH MS-GRAPH): its stream count and rows, never a stream's window or slot.
 
@@ -253,6 +264,7 @@ class DecodeGraphs:
         self.cap = int(os.environ.get(CAP_ENV, "0") or 0) or (CAP if cap is None else cap)
         self.min_seen = max(1, min_seen)
         self.multi = multi_on()                     # concurrent forwards too, under canonical keys (MS-GRAPH)
+        self.multi_all = os.environ.get(MULTI_ENV, "").strip().lower() == "all"   # ... every kind, not chain steps
         self.streams = int(os.environ.get(STREAMS_ENV, "0") or 0) or (MULTI_STREAMS if self.multi else STREAMS)
         self.multi_eager = 0                        # concurrent forwards left eager (a sparse stream)
         self.pool = torch.cuda.graph_pool_handle()
@@ -287,7 +299,7 @@ class DecodeGraphs:
         self.failed: set[str] = set()
         self.calls = 0
         self._emit({"event": "on", "cap": self.cap, "min_seen": self.min_seen, "streams": self.streams,
-                    "multi": self.multi,
+                    "multi": self.multi, "multi_all": self.multi_all,
                     "startup": self.startup, "lazy": self.lazy, "rows": self.rows, "demand": self.demand,
                     "demand_mib": round(self.budget / MIB, 1), "ple": self.ple,
                     "free_mib": _free_mib()})
@@ -355,6 +367,8 @@ class DecodeGraphs:
             self._emit(self.stats())
         if len(segs) > self.streams:                # eager as before (the widest fold table changes no bits)
             return fn()
+        if self.multi and len(segs) > 1 and not multi_graphed(kind, len(segs), segs[-1][2], self.multi_all):
+            return fn()                             # eager (its n-gram convs still one launch)
         if self.multi and len(segs) > 1:            # MS-GRAPH: grids by the widest window, whatever the split
             step.most = max(step.most, self.width)  # (a pooled-key block past a stream's rows writes nothing)
             if tables is not None and tables.plan.max_rows < self.width:

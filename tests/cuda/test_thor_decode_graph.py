@@ -479,14 +479,19 @@ def test_concurrent_graphs_keep_the_per_stream_rounds_bits(kv_dtype, tmp_path, m
         thor_graphs.multi_on.cache_clear()
         off_out, off_rounds, _ = _decode(w, PROMPTS, counts, samplings, graphs=False, capacity=1024,
                                          kv_dtype=kv_dtype)
-        monkeypatch.setenv(thor_graphs.MULTI_ENV, "1")
-        thor_graphs.multi_on.cache_clear()
-        on_out, on_rounds, g = _decode(w, PROMPTS, counts, samplings, graphs=True, capacity=1024, kv_dtype=kv_dtype)
+        runs = {}
+        for policy in ("all", "1"):                  # every concurrent forward; the default (MTP chain steps)
+            monkeypatch.setenv(thor_graphs.MULTI_ENV, policy)
+            thor_graphs.multi_on.cache_clear()
+            runs[policy] = _decode(w, PROMPTS, counts, samplings, graphs=True, capacity=1024, kv_dtype=kv_dtype)
     finally:
         thor_graphs.multi_on.cache_clear()
-    assert g.multi and g.streams > len(PROMPTS) and not g.failed
-    assert on_out == off_out
-    _same_rounds(on_rounds, off_rounds)
-    multi = {k: v for k, v in g.hist.items() if "x" in k}
-    assert sum(v[1] for k, v in multi.items() if k.startswith("verifyx")) > 0, g.hist
-    assert sum(v[1] for k, v in multi.items() if k.startswith("mtpx")) > 0, g.hist
+    for policy, (on_out, on_rounds, g) in runs.items():
+        assert g.multi and g.streams > len(PROMPTS) and not g.failed
+        assert g.multi_all == (policy == "all")
+        assert on_out == off_out
+        _same_rounds(on_rounds, off_rounds)
+        multi = {k: v for k, v in g.hist.items() if "x" in k}
+        assert sum(v[1] for k, v in multi.items() if k.startswith("mtpx")) > 0, g.hist
+        verify = sum(v[1] for k, v in multi.items() if k.startswith("verifyx"))
+        assert verify > 0 if policy == "all" else verify == 0, g.hist

@@ -43,3 +43,12 @@ def test_multi_kill_switch(monkeypatch):
     finally:
         thor_graphs.multi_on.cache_clear()
     assert thor_graphs.STREAMS == 1 and thor_graphs.MULTI_STREAMS >= 8
+
+
+def test_multi_default_graphs_only_mtp_chain_steps():
+    """Default MS-GRAPH: MTP chain steps (one row a stream) only; ``all``: every concurrent forward."""
+
+    assert thor_graphs.multi_graphed("mtp", 4, 4, False)
+    assert not thor_graphs.multi_graphed("mtp", 4, 9, False)          # a first MTP step (kept rows)
+    assert not thor_graphs.multi_graphed("verify", 4, 4, False)
+    assert thor_graphs.multi_graphed("verify", 4, 13, True) and thor_graphs.multi_graphed("mtp", 4, 9, True)
