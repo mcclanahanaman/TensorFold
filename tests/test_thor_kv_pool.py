@@ -191,6 +191,55 @@ def test_pooled_on_demand_graphs_leave_the_room_alone():
     assert not g._afford()
 
 
+def test_on_demand_graphs_charge_the_host_memory_their_executables_keep(monkeypatch):
+    """vmem-a1: an on-demand graph's executable keeps ~5 MiB of driver host memory (glibc) that the free memory never
+    showed; the charge is the free memory's drop plus glibc's in-use growth (at most HOST_MAX_MIB: another thread's
+    allocation in the window), an eviction gives both back (at most the charge), and HOST=0 charges the drop only."""
+    from collections import OrderedDict
+
+    tg = importlib.import_module("tensorfold.families.qwen4_exp.cuda.thor_graphs")
+    mib = 1 << 20
+    free, host = [1000.0], [50.0]
+    monkeypatch.setattr(tg, "_free_mib", lambda: free[0])
+    monkeypatch.setattr(tg, "_host_mib", lambda: host[0])
+    monkeypatch.setattr(tg.torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(tg.DecodeGraphs, "_emit", staticmethod(lambda event: None))
+
+    def graphs(on: bool):
+        g = object.__new__(tg.DecodeGraphs)
+        g.paid, g.graphs, g.charged, g.refunded, g.est, g.budget = OrderedDict(), OrderedDict(), 0, 0, 24 * mib, GIB
+        g.calls, g.evicted, g.host, g.host_mib = 10, 0, on, 0.0
+        g.gate = SimpleNamespace(pooled=False, room=100 * mib, held=0)
+        return g
+
+    A, B = ("verify", (), 0, 4096), ("verify", (), 1, 4096)    # keys: kind, segments, flags, context bucket
+    g = graphs(True)
+    free[0], host[0] = 990.0, 55.0                       # the capture: 10 MiB of free memory, 5 MiB of glibc in use
+    g._charge(A, "verify", 1000.0, 50.0)
+    assert g.paid[A][0] == 15 * mib and g.charged == 15 * mib and g.gate.room == 85 * mib and g.host_mib == 5
+    host[0] = 55.0 + 90                                   # a vision request's 90 MiB array lands in the window
+    g._charge(B, "verify", 990.0, 55.0)
+    assert g.paid[B][0] == tg.HOST_MAX_MIB * mib and g.est == tg.HOST_MAX_MIB * mib
+
+    def reset(dfree, dhost):
+        def run():
+            free[0] += dfree
+            host[0] -= dhost
+        return SimpleNamespace(graph=SimpleNamespace(reset=run))
+
+    g.graphs[A], g.graphs[B] = reset(10, 5), reset(0, 120)
+    g.calls = 10 + tg.RECENT
+    assert g._evict() and g.refunded == 15 * mib and g.gate.room == (85 - tg.HOST_MAX_MIB + 15) * mib
+    assert g._evict() and g.refunded == (15 + tg.HOST_MAX_MIB) * mib     # never more back than its charge
+
+    g = graphs(False)                                     # TENSORFOLD_THOR_DECODE_GRAPH_HOST=0: the earlier charge
+    free[0], host[0] = 990.0, 55.0
+    g._charge(A, "verify", 1000.0, 50.0)
+    assert g.paid[A][0] == 10 * mib and g.host_mib == 5          # measured, not charged
+    g.graphs[A], g.calls = reset(10, 5), 10 + tg.RECENT
+    assert g._evict() and g.refunded == 10 * mib
+
+
 def test_capacity_preview_route_renders_the_body_and_skips_images(allocations):  # noqa: F811
     cap = importlib.import_module("tensorfold.cuda.capacity_status")
     errors = importlib.import_module("tensorfold.server.errors")

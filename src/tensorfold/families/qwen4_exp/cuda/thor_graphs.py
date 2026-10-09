@@ -32,9 +32,12 @@ with a prompt pass stays eager):
 - past the startup set, a one-stream key (a longer context's bucket; a sparse stream's, which holds its slot's pointers;
   a first round's) records on its second forward on demand (PAR-1 s4; ``TENSORFOLD_THOR_DECODE_GRAPH_DEMAND=0`` keeps it
   eager, 8f73033's path and the kill switch) when the memory gate's room, past the streams' caches and its reserve, can
-  pay it: the room is charged the free memory its capture and upload took. The on-demand graphs take at most
-  ``TENSORFOLD_THOR_DECODE_GRAPH_DEMAND_MIB`` (default 1,024 MiB); past it the least recently replayed one, idle for
-  ``RECENT`` forwards, goes, and the room gets back the memory its release returned;
+  pay it: the room is charged the free memory its capture and upload took, and the host memory the driver keeps for
+  its executable (glibc's bytes in use grew by them, at most ``HOST_MAX_MIB`` a graph: on Thor ~5 MiB a graph, 451 MiB
+  over 93 graphs that the free memory never showed [vmem-a1]; ``TENSORFOLD_THOR_DECODE_GRAPH_HOST=0`` charges the free
+  memory only, the earlier path). The on-demand graphs take at most ``TENSORFOLD_THOR_DECODE_GRAPH_DEMAND_MIB``
+  (default 1,024 MiB); past it the least recently replayed one, idle for ``RECENT`` forwards, goes, and the room gets
+  back the memory its release returned;
 - a one-stream verification forward always writes DeltaNet scratch half 0 (``gdn_multi.normalize`` copies last
   round's pending rows to half 1 first, exact copies), so one graph a window size serves both parities;
 - an MTP step's graph may hold its draft picks' reductions and their copy to pinned host memory (``extra`` keys
@@ -74,6 +77,7 @@ ROWS_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_ROWS"
 CAPTURE_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_CAPTURE"   # diagnostics: 0 = prerecord's eager warm-ups only, no graphs
 DEMAND_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_DEMAND"     # after prerecord, other one-stream keys on demand (default on)
 DEMAND_MIB_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_DEMAND_MIB"
+HOST_ENV = "TENSORFOLD_THOR_DECODE_GRAPH_HOST"         # on-demand graphs' host memory charged too (default on)
 MEM_ENV = "TENSORFOLD_THOR_MEM_PROBE"   # diagnostics: a trigger file path; [thor-mem] breakdowns at startup and on it
 CAPABILITY = (11, 0)
 SCHED_MASK, SCHED_SPIN = 0x07, 0x01  # CU_CTX_SCHED_MASK, CU_CTX_SCHED_SPIN
@@ -86,6 +90,7 @@ DEMAND_MIB = 1024           # the on-demand graphs' memory at most (MiB)
 EST_MIB = 24                # an on-demand graph's memory before one is measured (a verification forward's ~20 MiB)
 RECENT = 2048               # forwards an on-demand graph sits unreplayed before it may go
 MISSED_MAX = 64             # eager one-stream keys counted by name in stats (the rest as "other")
+HOST_MAX_MIB = 32           # an on-demand graph's host charge at most (another thread's allocation in the window)
 MIB = float(1 << 20)
 
 
@@ -234,6 +239,8 @@ class DecodeGraphs:
         self.room_at = None                         # its room then (diagnostics)
         self.paid: OrderedDict[tuple, list] = OrderedDict()     # on demand: key -> [bytes charged, last call]
         self.charged = self.refunded = 0            # bytes on-demand graphs took off the room, and gave back
+        self.host = _flag(HOST_ENV, "1")            # their host memory charged too (glibc's in-use growth)
+        self.host_mib = 0.0                         # host memory on-demand captures took (measured even when off)
         self.est = EST_MIB * MIB                    # an on-demand graph's bytes before it is measured (the most seen)
         self.evicted = 0
         self.ctx: dict[str, list[int]] = {}         # one-stream forwards by kind:bucket:sparse: [forwards, replays]
@@ -263,7 +270,7 @@ class DecodeGraphs:
                 "graphs": len(self.graphs), "hist": dict(self.hist), "missed": dict(self.missed),
                 "ctx": {k: list(v) for k, v in self.ctx.items()},
                 "demand": {"graphs": len(self.paid), "mib": round((self.charged - self.refunded) / MIB, 1),
-                           "evicted": self.evicted},
+                           "evicted": self.evicted, "host_mib": round(self.host_mib, 1), "host": self.host},
                 "reserved_mib": round(torch.cuda.memory_reserved() / MIB, 1),
                 "free_mib": _free_mib()}
 
@@ -337,7 +344,7 @@ class DecodeGraphs:
             self._miss(key)
             return fn()
         self.seen.pop(key, None)
-        free0 = _free_mib()
+        free0, host0 = _free_mib(), _host_mib()
         entry = self._record(kind, b, step, tables, fn, segs)
         if entry is None:
             self._miss(key)
@@ -347,7 +354,7 @@ class DecodeGraphs:
         self.replays[kind] = self.replays.get(kind, 0) + 1
         c[1] += 1
         if paid:
-            self._charge(key, kind, free0)
+            self._charge(key, kind, free0, host0)
         return entry.out
 
     def _afford(self) -> bool:
@@ -363,18 +370,24 @@ class DecodeGraphs:
             return self.gate.outside(int(self.est))
         return self.gate.fits(int(self.est))
 
-    def _charge(self, key: tuple, kind: str, free0: float) -> None:
-        """An on-demand graph's own memory (the free memory its capture and upload took) off the gate's room."""
+    def _charge(self, key: tuple, kind: str, free0: float, host0: float | None = None) -> None:
+        """An on-demand graph's own memory (the free memory its capture and upload took, and the host memory the
+        driver keeps for its executable) off the gate's room."""
 
         torch.cuda.synchronize()                    # the upload landed
         cost = int(max(0.0, free0 - _free_mib()) * MIB)
+        host = 0.0 if host0 is None else min(float(HOST_MAX_MIB), max(0.0, _host_mib() - host0))
+        self.host_mib += host
+        if self.host:
+            cost += int(host * MIB)
         if not getattr(self.gate, "pooled", False):  # Thor KV pool: the pool left this budget out already
             self.gate.room -= cost
         self.charged += cost
         self.paid[key] = [cost, self.calls]
         self.est = max(self.est, float(cost))
         self._emit({"event": "demand", "kind": kind, "context": key[3], "graphs": len(self.paid),
-                    "charged_mib": round(cost / MIB, 1), "demand_mib": round((self.charged - self.refunded) / MIB, 1),
+                    "charged_mib": round(cost / MIB, 1), "host_mib": round(host, 1),
+                    "demand_mib": round((self.charged - self.refunded) / MIB, 1),
                     "room_mib": round(self.gate.room / MIB, 1), "held_mib": round(self.gate.held / MIB, 1),
                     "free_mib": _free_mib()})
 
@@ -388,11 +401,14 @@ class DecodeGraphs:
         del self.paid[key]
         entry = self.graphs.pop(key)
         torch.cuda.synchronize()
-        free0 = _free_mib()
+        free0, host0 = _free_mib(), _host_mib()
         entry.graph.reset()
         del entry
         torch.cuda.synchronize()
-        back = min(cost, int(max(0.0, _free_mib() - free0) * MIB))
+        back = int(max(0.0, _free_mib() - free0) * MIB)
+        if self.host:                               # the executable's host memory came back too
+            back += int(min(float(HOST_MAX_MIB), max(0.0, host0 - _host_mib())) * MIB)
+        back = min(cost, back)
         if not getattr(self.gate, "pooled", False):
             self.gate.room += back
         self.refunded += back
@@ -572,6 +588,32 @@ class DecodeGraphs:
 def _free_mib() -> float:
     free, _ = torch.cuda.mem_get_info()
     return round(free / MIB, 1)
+
+
+class _Mallinfo2(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_size_t) for name in ("arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks",
+                                                       "fsmblks", "uordblks", "fordblks", "keepcost")]
+
+
+@functools.lru_cache(maxsize=None)
+def _mallinfo2():
+    try:
+        fn = ctypes.CDLL("libc.so.6").mallinfo2
+    except (OSError, AttributeError):
+        return None
+    fn.restype = _Mallinfo2
+    return fn
+
+
+def _host_mib() -> float:
+    """glibc's bytes in use (its heaps' and its own mmaps'), MiB: what the driver's host allocations, a graph
+    executable's among them, hold; 0 without mallinfo2 (another libc), so nothing is charged."""
+
+    fn = _mallinfo2()
+    if fn is None:
+        return 0.0
+    m = fn()
+    return (m.uordblks + m.hblkhd) / MIB
 
 
 _MEM: list = []                                     # diagnostics: [the decoder, the trigger path]
