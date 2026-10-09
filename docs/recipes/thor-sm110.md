@@ -96,6 +96,8 @@ PENDING-FREEZE: measured on the pre-freeze build (dev runs, not gated); the gate
 | `TENSORFOLD_THOR_NGRAM_PAIRS` | NVFP4 n-gram rows through the pair table | `0`: per-call dequantization |
 | `TENSORFOLD_THOR_DENSE_WEIGHTS` | `copy` (bf16 copies of MXFP8 weights) | `dequant`: no copies (this recipe) |
 | `TENSORFOLD_THOR_DECODE_GRAPH` | decode rounds replay CUDA graphs | `0`: every round eager |
+| `TENSORFOLD_THOR_VISION_MEM` | vision host memory budgeted (the workspace split into the tower's GPU part, kept in the pool, and a host part left out of it; a request holds its bound until its encode; its patch arrays dropped and a trim after it) | `0`: the earlier path (the whole workspace in the pool, 16 preparation slots, arrays kept until the reply ends) |
+| `TENSORFOLD_THOR_VISION_HOST_MIB` | unset: the host part is the workspace less the tower's GPU part | a MiB number: the host part (`0` up to the workspace), the GPU part is the rest |
 | `TENSORFOLD_ADMISSION_WAIT_S` | unset: requests wait until admitted | seconds: the bounded wait (this recipe: 30) |
 
 ## Fixes in this build
