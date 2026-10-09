@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -113,6 +114,37 @@ def plan(streams: Sequence[Sequence[int]], device) -> Plan:
     return Plan(dev[:3 * w].view(w, 3), dev[3 * w:], slots, rows)
 
 
+CHAIN_ENV = "TENSORFOLD_THOR_GDN_CHAIN"
+CHAIN_VARIANTS = 2
+CHAIN_DEFAULT = 1
+CHAIN_MIN_STREAMS = 6
+
+
+@lru_cache(maxsize=None)
+def _chain_variant(index: int, setting: str, many: bool) -> int:
+    if torch.cuda.get_device_capability(index) != (11, 0):
+        return 0
+    if not setting.strip():
+        return CHAIN_DEFAULT if many else 0
+    variant = int(setting)
+    if not 0 <= variant <= CHAIN_VARIANTS:
+        raise ValueError(f"{CHAIN_ENV}={setting}: 0 (tree kernel) or a chain variant 1..{CHAIN_VARIANTS}")
+    return variant
+
+
+def chain_variant(device, streams: int = 1) -> int:
+    """Thor (sm_110) chain windows (no slots: decode verification) of ``streams`` streams: gdn.cu's ``chain_kernel``
+    variant, 0 the tree kernel. Both run the same per-element steps, lane-to-key map and butterfly order (the same
+    bits); the chain kernel folds pending rows through one spread sum, steps states in place and fits 6 blocks an SM.
+    dpush-5 (Thor, CUDA events, tools/thor/gdn_tree_bench.py): 1.05-1.23x the tree kernel at 8 streams with pending
+    rows, 0.93-1.02x at 4 and 1.01-1.10x at 1, so it runs from CHAIN_MIN_STREAMS streams by default.
+    ``TENSORFOLD_THOR_GDN_CHAIN=0`` keeps the tree kernel; 1 (8 rows a warp, 6 blocks an SM) or 2 (5 blocks) force a
+    variant at any stream count. Other GPUs: always 0."""
+
+    return _chain_variant(torch.device(device).index or 0, os.environ.get(CHAIN_ENV, ""),
+                          streams >= CHAIN_MIN_STREAMS)
+
+
 def tree(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, p: Plan,
          state: torch.Tensor | None = None, table: torch.Tensor | None = None,
          pending: Sequence[torch.Tensor] | None = None, final: torch.Tensor | None = None) -> torch.Tensor:
@@ -120,8 +152,9 @@ def tree(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, g: torch.Tensor, bet
 
     if (state is None) == (table is None):
         raise ValueError("pass one stream's state or a table of every stream's")
+    variant = chain_variant(q.device, 1 if table is None else table.numel()) if p.slots == 0 else 0
     return _ext().tree(q, k, v, g, beta, state, table, None if table is None else p.starts, p.entries, p.slots,
-                       p.max_rows, None if pending is None else list(pending), final)
+                       p.max_rows, None if pending is None else list(pending), final, variant)
 
 
 def pointers(tensors: Sequence[torch.Tensor]) -> list[int]:

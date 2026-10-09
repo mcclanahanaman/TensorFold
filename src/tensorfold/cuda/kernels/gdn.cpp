@@ -4,7 +4,7 @@
 void gdn_tree_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                    const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, int, int, int,
                    at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
-                   const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&);
+                   const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, int);
 void gdn_replay_cuda(const at::Tensor&, int, int, const at::Tensor&, const at::Tensor&, const at::Tensor&, int, int,
                      int, bool);
 void gdn_prefill_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -29,7 +29,8 @@ at::Tensor tree(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, c
                 const at::Tensor& beta, const c10::optional<at::Tensor>& state,
                 const c10::optional<at::Tensor>& table, const c10::optional<at::Tensor>& starts,
                 const at::Tensor& plan, int64_t slots, int64_t max_rows,
-                const c10::optional<std::vector<at::Tensor>>& pending, const c10::optional<at::Tensor>& final) {
+                const c10::optional<std::vector<at::Tensor>>& pending, const c10::optional<at::Tensor>& final,
+                int64_t variant) {
     check_rows(q, k, v, g, beta);
     TORCH_CHECK(plan.is_cuda() && plan.is_contiguous() && plan.scalar_type() == at::kInt &&
                 plan.numel() == 3 * q.size(0), "plan: (W, 3) int32 on the device");
@@ -81,7 +82,7 @@ at::Tensor tree(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, c
     c10::cuda::CUDAGuard guard(q.device());
     auto y = at::empty({q.size(0), v.size(1), v.size(2)}, v.options());
     gdn_tree_cuda(q, k, v, g, beta, s, t, st, plan, static_cast<int>(slots), streams, static_cast<int>(max_rows), y,
-                  pk, pv, pg, pb, prows, pcounts, fstate, ftable);
+                  pk, pv, pg, pb, prows, pcounts, fstate, ftable, static_cast<int>(variant));
     return y;
 }
 

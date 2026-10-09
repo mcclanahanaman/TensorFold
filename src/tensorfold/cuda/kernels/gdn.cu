@@ -276,6 +276,155 @@ __global__ void __launch_bounds__(32 * WARPS) tree_kernel(
     }
 }
 
+// Thor (sm_110) decode windows: tree_kernel's chain case (no slots) with the same per-element math, lane-to-key map
+// and butterfly order, so the same bits. The pending rows' R dot products share one spread sum (warp_sum's pairs and
+// order) and R broadcasts instead of R warp sums, and nodes step the state in place. One warp's item: its stream's
+// R state rows from value0 (loaded in ``cur``), pending rows folded in and written back, the chain's read-outs, and
+// the final rows when asked.
+template <typename QK, int R>
+__device__ __forceinline__ void chain_item(float (&cur)[R][4], const QK* __restrict__ q, const QK* __restrict__ k,
+        const __nv_bfloat16* __restrict__ v, const float* __restrict__ g, const float* __restrict__ beta,
+        float* s0, int begin, int end, __nv_bfloat16* __restrict__ y, int hk, int hv, int dv, int stream, int head,
+        int value0, int lane, Pending<QK> pending, float* last, bool vec) {
+    const int key_head = head / (hv / hk);
+    if (pending.k != nullptr) {
+        constexpr int SR = 5 - log2c<R>();                 // after the spread sum lane u << SR holds row u's dot
+        const int n = pending.counts[stream * pending.count_stride];
+        const int* rows = pending.rows + stream * pending.row_stride;
+        Inputs<QK, R> nx;
+        if (n > 0) nx.load(nullptr, pending.k, pending.v, pending.g, pending.beta, rows[0], key_head, head, value0, hk, hv, dv,
+                           lane, false);
+        for (int j = 0; j < n; ++j) {
+            const Inputs<QK, R> in = nx;
+            if (j + 1 < n)
+                nx.load(nullptr, pending.k, pending.v, pending.g, pending.beta, rows[j + 1], key_head, head, value0, hk, hv, dv,
+                        lane, false);
+            float mem[R];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                mem[r] = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    cur[r][i] = cur[r][i] * in.g;
+                    mem[r] = mem[r] + cur[r][i] * in.k[i];
+                }
+            }
+            const float tot = spread_sum<R>(mem, lane);
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const float delta = (in.v[r] - __shfl_sync(0xffffffffu, tot, r << SR)) * in.beta;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) cur[r][i] = cur[r][i] + in.k[i] * delta;
+            }
+        }
+        if (n > 0) {
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                if (value0 + r >= dv) break;
+                *reinterpret_cast<float4*>(s0 + (static_cast<size_t>(head) * dv + value0 + r) * DK + lane * 4) =
+                    make_float4(cur[r][0], cur[r][1], cur[r][2], cur[r][3]);
+            }
+        }
+    }
+    const int count = end - begin;
+    const Feed<QK> f{q + key_head * DK + lane * 4, k + key_head * DK + lane * 4, v + head * dv + value0, g + head,
+                     beta + head, hk * DK, hv * dv, hv};
+    constexpr int SH = 5 - log2c<2 * R>();
+    const int yrow = value0 + (lane >> SH) - R;
+    const bool ylane = (lane & ((1 << SH) - 1)) == 0 && (lane >> SH) >= R && yrow < dv;
+    float pend[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) pend[r] = 0.0f;
+    auto visit = [&](const Inputs<QK, R>& in, Inputs<QK, R>& nx, int e) {
+        if (e + 1 < count) nx.fetch(f, begin + e + 1, true, vec, value0, dv);
+        float both[2 * R];
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            both[r] = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                cur[r][i] = cur[r][i] * in.g;
+                both[r] = both[r] + cur[r][i] * in.k[i];
+            }
+            both[R + r] = pend[r];
+        }
+        const float tot = spread_sum<2 * R>(both, lane);
+        if (e > 0 && ylane)
+            y[static_cast<long long>(begin + e - 1) * f.vs + head * dv + yrow] = __float2bfloat16_rn(tot);
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float delta = (in.v[r] - __shfl_sync(0xffffffffu, tot, r << SH)) * in.beta;
+            pend[r] = 0.0f;
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                cur[r][i] = cur[r][i] + in.k[i] * delta;
+                pend[r] = pend[r] + cur[r][i] * in.q[i];
+            }
+        }
+    };
+    Inputs<QK, R> a, b;
+    if (count > 0) a.fetch(f, begin, true, vec, value0, dv);
+#pragma unroll 1
+    for (int e = 0; e < count; e += 2) {
+        visit(a, b, e);
+        if (e + 1 < count) visit(b, a, e + 1);
+    }
+    if (count > 0) {
+        constexpr int SR = 5 - log2c<R>();
+        const float tot = spread_sum<R>(pend, lane);
+        if ((lane & ((1 << SR) - 1)) == 0 && value0 + (lane >> SR) < dv)
+            y[(static_cast<size_t>(end - 1) * hv + head) * dv + value0 + (lane >> SR)] = __float2bfloat16_rn(tot);
+    }
+    if (last != nullptr && count > 0) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (value0 + r >= dv) break;
+            *reinterpret_cast<float4*>(last + (static_cast<size_t>(head) * dv + value0 + r) * DK + lane * 4) =
+                make_float4(cur[r][0], cur[r][1], cur[r][2], cur[r][3]);
+        }
+    }
+}
+
+// One item a warp, on tree_kernel's grid (row groups, heads, streams). MINB: blocks an SM for __launch_bounds__
+// (dpush-5: 8 rows a warp at 6 blocks an SM, 80 registers and no spills, 1.05-1.23x the tree kernel at 8 streams).
+template <typename QK, int R, int WARPS, int MINB>
+__global__ void __launch_bounds__(32 * WARPS, MINB) chain_kernel(
+        const QK* __restrict__ q, const QK* __restrict__ k, const __nv_bfloat16* __restrict__ v,
+        const float* __restrict__ g, const float* __restrict__ beta, const float* __restrict__ state,
+        const long long* __restrict__ table, const int* __restrict__ starts, int nodes, __nv_bfloat16* __restrict__ y,
+        int hk, int hv, int dv, Pending<QK> pending, float* final_state, const long long* __restrict__ final_table,
+        bool vec) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int head = blockIdx.y, stream = blockIdx.z;
+    const int value0 = (blockIdx.x * WARPS + warp) * R;
+    if (value0 >= dv) return;
+    float* s0 = const_cast<float*>(table ? reinterpret_cast<const float*>(table[stream]) : state);
+    float cur[R][4];
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        const int row = value0 + r < dv ? value0 + r : value0;
+        load4(s0 + (static_cast<size_t>(head) * dv + row) * DK + lane * 4, cur[r]);
+    }
+    float* last = final_table ? reinterpret_cast<float*>(final_table[stream]) : final_state;
+    chain_item<QK, R>(cur, q, k, v, g, beta, s0, starts ? starts[stream] : 0, starts ? starts[stream + 1] : nodes, y,
+                      hk, hv, dv, stream, head, value0, lane, pending, last, vec);
+}
+
+template <typename QK, int R, int WARPS, int MINB>
+void launch_chain(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
+                  const at::Tensor& beta, const float* state, const long long* table, const int* starts, int nodes,
+                  int streams, at::Tensor& y, Pending<QK> pend, float* final_state, const long long* final_table) {
+    const int hk = q.size(1), hv = v.size(1), dv = v.size(2);
+    const bool vec = dv % R == 0 && reinterpret_cast<uintptr_t>(v.data_ptr()) % (2 * (R < 8 ? R : 8)) == 0;
+    const dim3 grid((dv + R * WARPS - 1) / (R * WARPS), hv, streams);
+    chain_kernel<QK, R, WARPS, MINB><<<grid, 32 * WARPS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const QK*>(q.data_ptr()), reinterpret_cast<const QK*>(k.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(v.data_ptr()), g.data_ptr<float>(), beta.data_ptr<float>(),
+        state, table, starts, nodes, reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), hk, hv, dv, pend, final_state,
+        final_table, vec);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 // Commit: each (stream, layer) replays its rows into out[stream][layer], or over its state when out is null.
 template <typename QK, int R, int WARPS>
 __global__ void __launch_bounds__(32 * WARPS) replay_kernel(
@@ -351,7 +500,18 @@ template <typename QK>
 void dispatch_tree(int slots, const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
                    const at::Tensor& beta, const float* state, const long long* table, const int* starts,
                    const at::Tensor& plan, int nodes, int streams, int max_rows, at::Tensor& y, Pending<QK> pend,
-                   float* final_state, const long long* final_table) {
+                   float* final_state, const long long* final_table, int variant) {
+    // Thor decode chains (the caller picks a variant on sm_110 only; 0 keeps tree_kernel): rows a warp, warps, blocks an SM
+#define CHAIN_(R, W, B) launch_chain<QK, R, W, B>(q, k, v, g, beta, state, table, starts, nodes, streams, y, pend, \
+                                                  final_state, final_table)
+    if (slots == 0 && variant > 0) {
+        switch (variant) {
+            case 1: CHAIN_(8, 4, 6); return;
+            case 2: CHAIN_(8, 4, 5); return;
+            default: TORCH_CHECK(false, "unknown chain variant ", variant);
+        }
+    }
+#undef CHAIN_
     // no slots: every window is a chain in row order, no plan to read; more slots, fewer rows a warp to cap memory
 #define TREE(S, R, W, C) launch_tree<QK, S, R, W, C>(q, k, v, g, beta, state, table, starts, plan, nodes, streams, \
                                                      max_rows, y, pend, final_state, final_table)
@@ -377,7 +537,7 @@ void gdn_tree_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
                    const at::Tensor& beta, const at::Tensor& state, const at::Tensor& table, const at::Tensor& starts,
                    const at::Tensor& plan, int slots, int streams, int max_rows, at::Tensor& y, const at::Tensor& pk,
                    const at::Tensor& pv, const at::Tensor& pg, const at::Tensor& pb, const at::Tensor& prows,
-                   const at::Tensor& pcounts, const at::Tensor& fstate, const at::Tensor& ftable) {
+                   const at::Tensor& pcounts, const at::Tensor& fstate, const at::Tensor& ftable, int variant) {
     const float* s = state.defined() ? state.data_ptr<float>() : nullptr;
     const long long* t = table.defined() ? reinterpret_cast<const long long*>(table.data_ptr<int64_t>()) : nullptr;
     const int* st = starts.defined() ? starts.data_ptr<int>() : nullptr;
@@ -386,10 +546,10 @@ void gdn_tree_cuda(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
     const long long* ft = ftable.defined() ? reinterpret_cast<const long long*>(ftable.data_ptr<int64_t>()) : nullptr;
     if (q.scalar_type() == at::kFloat)
         dispatch_tree<float>(slots, q, k, v, g, beta, s, t, st, plan, nodes, streams, max_rows, y,
-                             pending_of<float>(pk, pv, pg, pb, prows, pcounts), fs, ft);
+                             pending_of<float>(pk, pv, pg, pb, prows, pcounts), fs, ft, variant);
     else
         dispatch_tree<__nv_bfloat16>(slots, q, k, v, g, beta, s, t, st, plan, nodes, streams, max_rows, y,
-                                     pending_of<__nv_bfloat16>(pk, pv, pg, pb, prows, pcounts), fs, ft);
+                                     pending_of<__nv_bfloat16>(pk, pv, pg, pb, prows, pcounts), fs, ft, variant);
 }
 
 void gdn_replay_cuda(const at::Tensor& table, int layers, int streams, const at::Tensor& rows,
