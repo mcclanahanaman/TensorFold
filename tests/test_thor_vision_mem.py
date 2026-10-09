@@ -357,3 +357,46 @@ def test_a_kept_prompt_survives_its_encode_and_its_continuation_releases_only_it
     del p
     gc.collect()
     assert m.budget.used == 0
+
+
+@pytest.mark.parametrize("calls", [1, 2])
+def test_encode_returns_the_placeholder_rows_and_feeds_the_tower_the_same_bits(monkeypatch, calls):
+    """The image loop's pixel slice must not shadow the features' rows (vfix-f1b: every image request failed with
+    "cannot access local variable 'rows'"); float32 patches and THOR-VISION-MEM's bf16 ImageRows give the tower the
+    same bf16 bits, in one tower call or one an image."""
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+
+    from tensorfold.vision import qwen_cuda
+    from tensorfold.vision.qwen_cuda import QwenCudaVision, _bf16_rows
+    from tensorfold.vision.qwen_processing import ImageRows
+
+    merge, hidden, width = 2, 8, 3 * 2 * 16 * 16
+    monkeypatch.setattr(qwen_cuda, "MAX_PATCHES", 8 if calls == 2 else qwen_cuda.MAX_PATCHES)
+    prompt = (1, 9, 2, 9, 9, 3)                         # image 1: one token (2 x 2 patches), image 2: two (2 x 4)
+    grid = np.array([[1, 2, 2], [1, 2, 4]])
+    pixels = np.random.default_rng(0).standard_normal((12, width), dtype=np.float32)
+    positions = np.tile(np.arange(len(prompt), dtype=np.int64), (3, 1, 1))
+
+    def run(values):
+        seen = []
+
+        def tower(x, grid_thw, return_dict, **_):
+            seen.append(x.clone())
+            n = int(x.shape[0]) // merge**2
+            return SimpleNamespace(pooler_output=x[::merge**2, :hidden].float() + torch.arange(n)[:, None])
+
+        vision = QwenCudaVision.__new__(QwenCudaVision)
+        vision.config = {"spatial_merge_size": merge, "out_hidden_size": hidden, "in_channels": 3,
+                         "temporal_patch_size": 2, "patch_size": 16}
+        vision.videos, vision.media_tokens, vision.device, vision._thor_attn, vision.tower = False, 9, "cpu", False, tower
+        ready = PreparedVisionPrompt(prompt, values, grid, positions, 0, ((1, 2), (3, 5)), ("a", "b"))
+        return vision._encode(ready, prompt), seen
+
+    plain, seen_plain = run(pixels)
+    rows, seen_rows = run(ImageRows([_bf16_rows(pixels[:4]), _bf16_rows(pixels[4:])]))
+    assert plain.rows == rows.rows == (1, 3, 4) and tuple(plain.features.shape) == (3, hidden)
+    assert len(seen_plain) == len(seen_rows) == calls
+    for a, b in zip(seen_plain, seen_rows):
+        assert a.dtype == b.dtype == torch.bfloat16 and torch.equal(a.view(torch.int16), b.view(torch.int16))
+    assert torch.equal(plain.features.view(torch.int16), rows.features.view(torch.int16))

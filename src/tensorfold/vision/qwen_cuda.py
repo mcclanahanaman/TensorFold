@@ -519,11 +519,12 @@ class QwenCudaVision:
             for begin, end in image_runs(sizes, MAX_PATCHES):
                 done = sum(sizes[:begin])
                 # a copy: the prepared arrays are read-only, and a tensor may not share them; THOR-VISION-MEM's bf16
-                # rows (converted on the host as this conversion does) are copied as they are
-                rows = prepared.pixel_values[done:done + sum(sizes[begin:end])]
-                pixels = (rows.to(device=self.device) if isinstance(rows, torch.Tensor) else
-                          torch.tensor(rows, dtype=torch.bfloat16, device=self.device))
-                del rows
+                # rows (converted on the host as this conversion does) are copied as they are; ``part``, never
+                # ``rows``, which holds the placeholder rows the features are checked and returned against
+                part = prepared.pixel_values[done:done + sum(sizes[begin:end])]
+                pixels = (part.to(device=self.device) if isinstance(part, torch.Tensor) else
+                          torch.tensor(part, dtype=torch.bfloat16, device=self.device))
+                del part
                 grids = torch.tensor(grid[begin:end], dtype=torch.int64, device=self.device)
                 features = self.tower(pixels, grid_thw=grids, return_dict=True,
                                       **self._longest([int(h) * int(w) for _, h, w in grid[begin:end]])).pooler_output
