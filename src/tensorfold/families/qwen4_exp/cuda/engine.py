@@ -173,8 +173,9 @@ class FlashNextEngine:
             if vision_mem:
                 self.vision.use_memory(thor_vision_mem.VisionMemory(host_bytes, tower_bytes))
                 print(f"[tensorfold] Thor (sm_110): vision workspace split {tower_bytes / 2**30:.2f} GiB tower (in the "
-                      f"pool) + {host_bytes / 2**30:.2f} GiB host buffers (out of it), a request holding its host bound "
-                      f"from its decode to its encode, its arrays dropped and glibc trimmed after "
+                      f"pool) + {host_bytes / 2**30:.2f} GiB host buffers (out of it; the pool leaves "
+                      f"{thor_vision_mem.pool_host(host_bytes) / 2**30:.2f} GiB out for serving vision), a request "
+                      f"holding its host bound from its decode to its encode, its arrays dropped and glibc trimmed after "
                       f"({thor_vision_mem.ENV}=0: the earlier path)", flush=True)
             torch.cuda.empty_cache()
             print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
@@ -239,7 +240,8 @@ class FlashNextEngine:
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                       prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace,
-                                      pool=pooled, vision_bytes=tower_bytes, vision_host=host_bytes)
+                                      pool=pooled, vision_bytes=tower_bytes,
+                                      vision_host=thor_vision_mem.pool_host(host_bytes) if vision_mem else 0)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
@@ -300,6 +302,7 @@ class FlashNextEngine:
             print(f"[tensorfold] Thor (sm_110): {self.multi.reserve_pool()} ({thor_kv.ENV}=0: the earlier path)",
                   flush=True)
         warm_s = time.perf_counter() - started
+        self.pooled = pooled
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.served = 0
@@ -345,6 +348,17 @@ class FlashNextEngine:
 
     def _key(self, n: int) -> str:
         return f"tensorfold/flashnext/request/{n}"
+
+    def refit_memory(self) -> str | None:
+        """THOR-KV-FIT: the server built (the CLI calls this past its App's init, before it serves), the Thor KV pool's
+        idle re-landed on its design point (``MultiDecoder.refit_pool``); None without a fitted pool."""
+
+        if not getattr(self, "pooled", False) or self.multi is None:
+            return None
+        from . import thor_kv
+
+        note = self.multi.refit_pool()
+        return None if note is None else f"Thor (sm_110): {note} ({thor_kv.ENV}=0: the earlier path)"
 
     def shutdown(self) -> None:
         """Rank 0: tell rank 1 to leave ``follow``."""

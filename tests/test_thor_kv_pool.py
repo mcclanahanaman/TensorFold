@@ -172,8 +172,9 @@ def test_the_pool_is_the_live_room_past_graphs_and_snapshots(allocations, monkey
     assert "11.00 GiB pool" in note and "1.00 GiB left for on-demand graphs" in note and "0.50 GiB of image" in note
 
 
-def _fit(monkeypatch, host, *, before_swap=0):
-    """thor_kv.fit against a fake host: ``host(pool)`` -> (MemAvailable, SwapFree) once a pool of that size is held."""
+def _fit(monkeypatch, host, *, before_swap=0, before_cached=0):
+    """thor_kv.fit against a fake host: ``host(pool)`` -> (MemAvailable, SwapFree[, SwapCached]) once a pool of that size
+    is held."""
 
     import torch
 
@@ -192,26 +193,28 @@ def _fit(monkeypatch, host, *, before_swap=0):
     monkeypatch.setattr(time, "sleep", lambda s: None)
 
     def read():
-        avail, swap = host(held["pool"])
-        return {"MemAvailable": avail, "SwapFree": swap}
+        avail, swap, *cached = host(held["pool"])
+        return {"MemAvailable": avail, "SwapFree": swap, "SwapCached": cached[0] if cached else 0}
 
     def run(size, target):
-        return thor_kv.fit(reserve(size), target, {"MemAvailable": 0, "SwapFree": before_swap}, read=read)
+        before = {"MemAvailable": 0, "SwapFree": before_swap, "SwapCached": before_cached}
+        return thor_kv.fit(reserve(size), target, before, read=read)
 
     return thor_kv, asked, run
 
 
 def test_the_pool_is_refit_until_the_idle_lands_on_its_design_point(monkeypatch):
-    # the reservation took 1 GiB more than MemAvailable foretold (vmem-a2's on start): the pool comes down by it
+    # the reservation took 1 GiB more than MemAvailable foretold (vmem-a2's on start): the pool comes down by it, the
+    # re-reservation aiming FIT_AIM above the design point
     thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - GIB, 0))
-    target = 4 * GIB
+    target, aim = 4 * GIB, thor_kv.FIT_AIM
     size, steps = run(36 * GIB, target)
-    assert asked == [36 * GIB, 35 * GIB] and size == 35 * GIB
-    assert [s["idle"] for s in steps] == [3 * GIB, 4 * GIB] and steps[-1]["swapped"] == 0
+    assert asked == [36 * GIB, 35 * GIB - aim] and size == 35 * GIB - aim
+    assert [s["idle"] for s in steps] == [3 * GIB, target + aim] and steps[-1]["swapped"] == 0
     # a surplus (the reservation took less): the pool grows by it
     thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool + GIB // 2, 0))
     size, steps = run(36 * GIB, target)
-    assert asked == [36 * GIB, 36 * GIB + GIB // 2] and steps[-1]["idle"] == target
+    assert asked == [36 * GIB, 36 * GIB + GIB // 2 - aim] and steps[-1]["idle"] == target + aim
 
 
 def test_swap_the_reservation_filled_is_not_free_memory(monkeypatch):
@@ -222,9 +225,33 @@ def test_swap_the_reservation_filled_is_not_free_memory(monkeypatch):
                                               "swapped": 3 * GIB // 2, "idle": 4 * GIB}]
 
 
-def test_the_fit_stops_within_its_tolerance_and_its_switch_measures_once(monkeypatch):
-    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - thor_kv.FIT_TOL, 0))
-    assert run(36 * GIB, 4 * GIB)[0] == 36 * GIB and asked == [36 * GIB]
+def test_swapped_pages_still_in_ram_are_not_counted_twice(monkeypatch):
+    # vmem-a3-c: the reservation filled 1600 MiB of swap and 750 MiB of those pages stayed in RAM as swap cache, which
+    # MemAvailable already leaves out: only the 850 MiB on disk count against the idle
+    MIB = 1 << 20
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool + 850 * MIB, 2 * GIB - 1600 * MIB, 760 * MIB),
+                               before_swap=2 * GIB, before_cached=10 * MIB)
+    size, steps = run(36 * GIB, 4 * GIB)
+    assert asked == [36 * GIB] and steps[0]["swapped"] == 850 * MIB and steps[0]["idle"] == 4 * GIB
+    # a swap cache that shrank is no credit: the whole SwapFree drop counts
+    before, now = {"SwapFree": 2 * GIB, "SwapCached": 100 * MIB}, {"SwapFree": GIB, "SwapCached": 50 * MIB}
+    assert thor_kv.swapped(before, now) == GIB
+    assert thor_kv.swapped({"SwapFree": GIB}, {"SwapFree": 2 * GIB, "SwapCached": 5 * MIB}) == 0
+
+
+def test_the_idle_lands_on_or_just_above_its_design_point_and_the_switch_measures_once(monkeypatch):
+    MIB = 1 << 20
+    for over in (0, 32 * MIB, 64 * MIB):                    # anywhere in [target, target + FIT_TOL]: kept
+        thor_kv, asked, run = _fit(monkeypatch, lambda pool, over=over: (40 * GIB - pool + over, 0))
+        assert run(36 * GIB, 40 * GIB - 36 * GIB)[0] == 36 * GIB and asked == [36 * GIB]
+    assert thor_kv.FIT_TOL == 64 * MIB
+    # 2 MiB under the design point is re-reserved (a symmetric window let the refit's App init stay under it)
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - 2 * MIB, 0))
+    size, steps = run(36 * GIB, 4 * GIB)
+    assert asked == [36 * GIB, 36 * GIB - 2 * MIB - thor_kv.FIT_AIM] and steps[-1]["idle"] == 4 * GIB + thor_kv.FIT_AIM
+    # past FIT_TOL above: the pool grows
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool + 66 * MIB, 0))
+    assert run(36 * GIB, 4 * GIB)[0] == 36 * GIB + 66 * MIB - thor_kv.FIT_AIM
     monkeypatch.setenv(thor_kv.FIT_ENV, "0")
     thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - GIB, 0))
     size, steps = run(36 * GIB, 4 * GIB)
@@ -236,6 +263,98 @@ def test_the_fit_stops_within_its_tolerance_and_its_switch_measures_once(monkeyp
     assert len(asked) == 1 + thor_kv.FIT_TRIES
     # not a unified GPU (read None): nothing measured, the pool kept
     assert thor_kv.fit(8 * GIB, 4 * GIB, {"SwapFree": 0}, read=None) == (8 * GIB, [])
+
+
+def test_a_failed_meminfo_read_keeps_the_last_good_one_or_the_pool(monkeypatch):
+    """GLM review LOW 1: ``capacity._meminfo`` returns None on a failed read; the settle loop must not index it."""
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool, 0))
+    reads = iter([{"MemAvailable": 3 * GIB, "SwapFree": 0}, None])
+    assert thor_kv._settled(lambda: next(reads)) == {"MemAvailable": 3 * GIB, "SwapFree": 0}
+    assert thor_kv._settled(lambda: None) is None
+    reads = iter([{"MemAvailable": 3 * GIB, "SwapFree": 0}, None, None, None, None, None, None, None, None])
+    size, steps = thor_kv.fit(36 * GIB, 4 * GIB, {"SwapFree": 0}, read=lambda: next(reads))
+    assert [s["idle"] for s in steps] == [3 * GIB] and asked == [36 * GIB - GIB - thor_kv.FIT_AIM]
+    asked.clear()
+    assert thor_kv.fit(36 * GIB, 4 * GIB, {"SwapFree": 0}, read=lambda: None) == (36 * GIB, []) and asked == []
+
+
+def _pooled(monkeypatch, host, *, allocated=lambda: 0):
+    """A pooled decoder on a fake unified host: ``host(pool)`` -> MemAvailable once a pool of that size is held."""
+    import torch
+
+    multi, state, _ = mods()
+    thor_kv = importlib.import_module("tensorfold.families.qwen4_exp.cuda.thor_kv")
+    capacity = importlib.import_module("tensorfold.cuda.capacity")
+    dec = decoder(multi, state, torch, room=0)
+    dec.capacity, dec.keep, dec.window_bytes, dec.vision_bytes = 65536, 8, 10 * GIB, GIB // 2
+    dec._ref_state = state.State(weights(), 256, 4, "bf16", limit=65536)
+    dec.graphs = SimpleNamespace(budget=GIB, demand=True)
+    dec.vision_host = GIB // 2
+    dec.memory_gate.live = lambda: 12 * GIB
+    held, asked = {"pool": 0}, []
+
+    def reserve(size):
+        size = max(0, int(size)) // thor_kv.ALIGN * thor_kv.ALIGN
+        asked.append(size)
+        held["pool"] = size
+        return size
+
+    monkeypatch.setenv("TENSORFOLD_MEMORY_RESERVE_GIB", "2.5")
+    monkeypatch.setattr(thor_kv, "reserve", reserve)
+    monkeypatch.setattr(thor_kv, "trim_host", lambda: None)
+    monkeypatch.setattr(capacity, "_meminfo", lambda: {"MemTotal": 40 * GIB, "MemAvailable": host(held["pool"]),
+                                                       "SwapFree": 0, "SwapCached": 0})
+    monkeypatch.setattr(capacity, "unified", lambda torch: True)
+    for name in ("synchronize", "empty_cache"):
+        monkeypatch.setattr(torch.cuda, name, lambda: None)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda *a: allocated())
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+    return dec, asked, thor_kv
+
+
+def test_the_pool_is_refit_after_the_servers_own_init(allocations, monkeypatch):  # noqa: F811
+    """THOR-KV-FIT: the CLI builds its App (tokenizer, chat template) after the engine; vmem-a3-c measured 94 MiB of
+    server memory there, after the fit's last reading. ``refit_pool`` reads the idle again and lands it back."""
+    MIB = 1 << 20
+    app = {"bytes": 0}
+    free = int(14.5 * GIB)                                      # MemAvailable without the pool
+    dec, asked, thor_kv = _pooled(monkeypatch, lambda pool: free - pool - app["bytes"])
+    target = int(2.5 * GIB) + GIB + GIB // 2                    # reserve + graphs + vision host
+    note = dec.reserve_pool()
+    assert asked == [11 * GIB - GIB // 2] and free - dec.pool_bytes == target
+    room, first = dec.memory_gate.room, dec.pool_bytes
+    assert "caches from one" in note and "from its design point" in note
+    app["bytes"] = 94 * MIB                                     # the App's init
+    asked.clear()
+    note = dec.refit_pool()
+    idle = free - dec.pool_bytes - app["bytes"]
+    assert asked == [first - 94 * MIB - thor_kv.FIT_AIM] and idle == target + thor_kv.FIT_AIM
+    assert dec.memory_gate.room == room - (first - dec.pool_bytes) and dec.pool_fit[-1]["idle"] == idle
+    assert note.startswith("the pool refit after the server's init: every stream's caches from one") and \
+        f"{dec.pool_bytes / GIB:.2f} GiB pool" in note
+    # within the window already: measured, nothing moves
+    asked.clear()
+    assert "from its design point" in dec.refit_pool() and asked == []
+
+
+def test_the_refit_leaves_the_pool_alone_when_switched_off_or_something_allocated(allocations, monkeypatch):  # noqa: F811
+    MIB = 1 << 20
+    app, alloc = {"bytes": 0}, {"bytes": 5 * GIB}
+    dec, asked, thor_kv = _pooled(monkeypatch, lambda pool: int(14.5 * GIB) - pool - app["bytes"],
+                                  allocated=lambda: alloc["bytes"])
+    dec.reserve_pool()
+    pool, room = dec.pool_bytes, dec.memory_gate.room
+    app["bytes"] = 200 * MIB
+    asked.clear()
+    alloc["bytes"] += 2 * MIB                                   # a tensor allocated since: it may sit in the pool's block
+    note = dec.refit_pool()
+    assert "not refit" in note and asked == [] and dec.pool_bytes == pool and dec.memory_gate.room == room
+    alloc["bytes"] -= 2 * MIB
+    monkeypatch.setenv(thor_kv.FIT_ENV, "0")                    # the kill switch: sized once, as before
+    assert dec.refit_pool() is None and asked == [] and dec.pool_bytes == pool
+    monkeypatch.delenv(thor_kv.FIT_ENV)
+    multi, state, torch = mods()
+    assert decoder(multi, state, torch, room=0).refit_pool() is None     # never pooled: nothing to refit
 
 
 def test_outside_the_pool_asks_the_hosts_memory_past_its_reserve():

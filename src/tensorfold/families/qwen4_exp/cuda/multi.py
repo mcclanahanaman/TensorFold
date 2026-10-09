@@ -345,27 +345,67 @@ class MultiDecoder:
         size = thor_kv.reserve(live - demand - vhost)
         target = host + demand + vhost                   # the idle's design point: what the pool must leave free
         size, steps = thor_kv.fit(size, target, memory, read=read)
-        snaps = self.keep * self._snapshot_bytes()
-        gate.room = max(0, size + gate.held - snaps - self.vision_bytes)
-        gate.reserve = thor_kv.SLACK
-        self.pool_bytes = size
-        self.pool_fit = steps
+        self._pool_fit = (target, memory, read)          # ``refit_pool``'s design point, swap baseline and reader
+        self._pool_set(size, steps, read is not None)
         n = self.room_tokens()
-        idle = ""
-        if steps:
-            last, pools = steps[-1], ", ".join(f"{x['pool'] / GIB:.2f}" for x in steps)
-            idle = (f"; idle free memory {last['idle'] / GIB:.2f} GiB, {(last['idle'] - target) / 2**20:+.0f} MiB from "
-                    f"its design point {target / GIB:.2f} GiB after {len(steps)} reading(s) (pools {pools} GiB"
-                    + (f", {last['swapped'] / 2**20:.0f} MiB swapped out not counted" if last["swapped"] else "")
-                    + f"; {thor_kv.FIT_ENV}=0 sizes once)")
-            if last["idle"] < target - thor_kv.FIT_TOL:
-                idle += " -- BELOW the design point: this start cannot leave it free"
         return (f"every stream's caches from one {size / GIB:.2f} GiB pool reserved at load: {gate.room / GIB:.2f} GiB "
                 f"for caches past {self.keep} kept snapshots and {self.vision_bytes / GIB:.2f} GiB of image tower "
                 f"workspace ({n} tokens, {gate.room / max(1, self.window_bytes):.2f} full {self.capacity}-token "
                 f"windows); {demand / GIB:.2f} GiB left for on-demand graphs, "
                 + (f"{vhost / GIB:.2f} GiB for vision requests' host buffers (THOR-VISION-MEM) " if vhost else "")
-                + f"and {host / GIB:.2f} GiB for the host (TENSORFOLD_MEMORY_RESERVE_GIB){idle}")
+                + f"and {host / GIB:.2f} GiB for the host (TENSORFOLD_MEMORY_RESERVE_GIB){self._idle_note(steps, target)}")
+
+    def refit_pool(self) -> str | None:
+        """THOR-KV-FIT, after the server's own init (the CLI builds its App past the engine: tokenizer, chat template):
+        the idle read again and the pool re-reserved by the miss (``thor_kv.fit``, the same design point and swap
+        baseline), so that init's host memory comes out of the pool, not out of the design point. Only before any
+        request: an allocation since ``reserve_pool`` may hold a piece of the pool's block, and then nothing moves.
+        None when there is nothing to refit (no fitted pool, ``TENSORFOLD_THOR_KV_POOL_FIT=0``). Returns the note."""
+
+        from . import thor_kv
+
+        fitted = getattr(self, "_pool_fit", None)
+        if fitted is None or fitted[2] is None or not thor_kv.fit_on() or not getattr(self, "pool_fit", None):
+            return None
+        if torch.cuda.memory_allocated() > self._pool_allocated:
+            return (f"the pool was not refit after the server's init: {torch.cuda.memory_allocated() - self._pool_allocated} "
+                    "bytes were allocated after it was reserved")
+        target, before, read = fitted
+        torch.cuda.synchronize()
+        size, steps = thor_kv.fit(self.pool_bytes, target, before, read=read)
+        self._pool_set(size, steps, True)
+        gate = self.memory_gate
+        return (f"the pool refit after the server's init: every stream's caches from one {size / GIB:.2f} GiB pool: "
+                f"{gate.room / GIB:.2f} GiB for caches ({self.room_tokens()} tokens){self._idle_note(steps, target)}")
+
+    def _pool_set(self, size: int, steps: list[dict], fitted: bool) -> None:
+        """The gate's room from a pool of ``size`` bytes, and the fit's record; ``fitted`` (a unified GPU's fit): what
+        live tensors hold now, so ``refit_pool`` moves nothing once more is allocated."""
+
+        from . import thor_kv
+
+        gate = self.memory_gate
+        snaps = self.keep * self._snapshot_bytes()
+        gate.room = max(0, size + gate.held - snaps - self.vision_bytes)
+        gate.reserve = thor_kv.SLACK
+        self.pool_bytes = size
+        self.pool_fit = steps
+        self._pool_allocated = torch.cuda.memory_allocated() if fitted else 0
+
+    @staticmethod
+    def _idle_note(steps: list[dict], target: int) -> str:
+        from . import thor_kv
+
+        if not steps:
+            return ""
+        last, pools = steps[-1], ", ".join(f"{x['pool'] / GIB:.2f}" for x in steps)
+        idle = (f"; idle free memory {last['idle'] / GIB:.2f} GiB, {(last['idle'] - target) / 2**20:+.0f} MiB from "
+                f"its design point {target / GIB:.2f} GiB after {len(steps)} reading(s) (pools {pools} GiB"
+                + (f", {last['swapped'] / 2**20:.0f} MiB in swap on disk counted as used" if last["swapped"] else "")
+                + f"; {thor_kv.FIT_ENV}=0 sizes once)")
+        if last["idle"] < target:
+            idle += " -- BELOW the design point: this start cannot leave it free"
+        return idle
 
     def kept_view(self) -> list[dict]:
         """The kept conversations, one per slot: tokens (its longest point), points, cache bytes, idle seconds and
