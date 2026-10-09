@@ -588,7 +588,9 @@ class VideoSpeculation:
                     torch.cuda.current_stream().synchronize()     # the features are ready for any stream
             self.prepared = prepared
         except Exception as exc:  # noqa: BLE001 - the request's own path reports its errors where it always did
-            self.error = exc
+            # kept without its traceback: that holds this frame, whose ``self`` holds the error, a reference cycle that
+            # kept the frame's patches and prompt alive until a full garbage collection
+            self.error = exc.with_traceback(None)
 
     def cancel(self) -> None:
         self.cancelled = True

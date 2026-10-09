@@ -400,3 +400,77 @@ def test_encode_returns_the_placeholder_rows_and_feeds_the_tower_the_same_bits(m
     for a, b in zip(seen_plain, seen_rows):
         assert a.dtype == b.dtype == torch.bfloat16 and torch.equal(a.view(torch.int16), b.view(torch.int16))
     assert torch.equal(plain.features.view(torch.int16), rows.features.view(torch.int16))
+
+
+def test_a_closed_feed_drops_its_frames_and_leaves_no_cycle():
+    """A plan points back at its feed: once the request closes the feed, its frames (views of the video's one array)
+    and the plan go with plain reference counting, never waiting for a full garbage collection [vmem-a1: 45-93 MiB a
+    video until the trim's gc.collect]; a reader after the close gets FeedClosed."""
+    import weakref
+
+    from tensorfold.vision import videos
+
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        into = np.zeros((4, 8, 16, 3), np.uint8)
+        feed = videos.FrameFeed()
+        feed.begin(4, 8, 16, range(4), 2.0)
+        for slot in range(4):
+            feed.frame(slot, into[slot])
+        assert feed.take(0, 4).shape == (4, 8, 16, 3) and feed.plan.feed is feed
+        frames, alive = weakref.ref(into), weakref.ref(feed)
+        feed.close()
+        assert feed.plan is None and feed.frames == []
+        with pytest.raises(videos.FeedClosed):
+            feed.take(0, 1)
+        feed.frame(1, into[1])                           # a scale finishing after the close is dropped
+        del into
+        assert frames() is None
+        del feed
+        assert alive() is None
+    finally:
+        if was:
+            gc.enable()
+
+
+def test_a_failed_speculation_keeps_no_patches_or_frames_alive_once_dropped(monkeypatch):
+    """A video speculation whose feed closes before its next call's frames arrive keeps its error without the
+    traceback (whose frame held the speculation, so the call's patches stayed until a full collection): with the
+    collector off, the call's patches, the frames and the speculation all go when the request drops it."""
+    pytest.importorskip("torch")
+    import weakref
+
+    from tensorfold.vision import qwen_cuda, videos
+    from tests.test_vision_stream import Front
+
+    class Recording(Front):
+        refs: list = []
+
+        def _video_call(self, pixels, n, h, w):
+            self.refs.append(weakref.ref(pixels))
+            return super()._video_call(pixels, n, h, w)
+
+    monkeypatch.setattr(qwen_cuda, "MAX_PATCHES", 16)    # 8 patches a frame group: two groups a tower call
+    was = gc.isenabled()
+    gc.disable()
+    try:
+        front = Recording(True)
+        spec = front.speculate(lambda: "<start><video><end>")
+        into = np.random.default_rng(3).integers(0, 256, (8, 32, 64, 3), dtype=np.uint8)
+        spec.feed.begin(8, 32, 64, range(8), 8.0)
+        for slot in range(4):                            # the first call's two groups; the second call waits
+            spec.feed.frame(slot, into[slot])
+        deadline = time.monotonic() + 30
+        while not front.refs and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(front.refs) == 1
+        spec.cancel()
+        spec.thread.join(30)
+        assert isinstance(spec.error, videos.FeedClosed) and spec.error.__traceback__ is None and spec.prepared is None
+        refs = [front.refs[0], weakref.ref(into), weakref.ref(spec), weakref.ref(spec.feed)]
+        del into, spec
+        assert [r() is None for r in refs] == [True] * 4
+    finally:
+        if was:
+            gc.enable()

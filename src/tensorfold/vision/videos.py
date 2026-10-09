@@ -124,8 +124,13 @@ class FrameFeed:
             self._cond.notify_all()
 
     def close(self) -> None:
+        """The request is done with the feed: its frames and its plan go now. A plan points back at its feed, so the
+        two were a reference cycle that kept every frame (views of the video's one array, THOR-VISION-MEM) alive
+        until a full garbage collection, which a serving process rarely runs (45-93 MiB a video on Thor's MATCH set
+        [vmem-a1]); a reader past the close gets ``FeedClosed`` as before."""
         with self._cond:
             self.closed = True
+            self.plan, self.frames, self.ready = None, [], 0
             self._cond.notify_all()
 
     def wait_plan(self) -> PlannedVideo:
