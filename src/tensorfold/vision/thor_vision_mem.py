@@ -164,15 +164,20 @@ def request_bytes(*, images: int, videos: int, image_tokens: int, video_tokens: 
 
     The bound also covers a gated request's continuation, which encodes again under the request's kept hold: by then
     the decoded pixels, the frames' copies and the processing temporaries are gone, which frees more than that encode's
-    host copy of one tower call takes (a streamed video's calls all ran early: its continuation makes none)."""
+    host copy of one tower call takes (a streamed video's calls all ran early: its continuation makes none).
+
+    One image's patches and one tower call's are ``qwen_cuda``'s caps (``TOKENS_PER_IMAGE``, ``MAX_PATCHES``), read
+    here so a raised cap raises the bound."""
+    from .qwen_cuda import MAX_PATCHES, TOKENS_PER_IMAGE
+
     total = 0
     if images:
         patches = 4 * int(image_tokens)
         total += 3 * int(max_total_pixels) + 2 * patches * patch_width
-        total += 4 * min(patches, 4 * 4096) * patch_width * 3        # one image: float32 patches and two passes
+        total += 4 * min(patches, 4 * TOKENS_PER_IMAGE) * patch_width * 3   # one image: float32 patches, two passes
     if videos:
         total += 2 * int(frame_bytes)
-        total += 4 * min(4 * int(video_tokens), 16384) * patch_width if streamed else 2 * 4 * int(frame_bytes)
+        total += 4 * min(4 * int(video_tokens), MAX_PATCHES) * patch_width if streamed else 2 * 4 * int(frame_bytes)
     return int(total)
 
 

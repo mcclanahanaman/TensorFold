@@ -146,6 +146,23 @@ def test_request_bytes_bounds():
     assert less < img
 
 
+def test_the_bound_follows_the_towers_caps(monkeypatch):
+    """GLM delta review LOW-2: one image's temporaries and a streamed video's tower call are capped by ``qwen_cuda``'s
+    ``TOKENS_PER_IMAGE`` and ``MAX_PATCHES`` (one source): a raised cap raises the bound instead of undercounting."""
+    from tensorfold.vision import qwen_cuda
+
+    w, frames, pixels = 1536, 100 << 20, 32 << 20
+    vid = dict(images=0, videos=1, image_tokens=0, video_tokens=65536, max_total_pixels=0, patch_width=w,
+               frame_bytes=frames, streamed=True)
+    img = dict(images=1, videos=0, image_tokens=65536, video_tokens=0, max_total_pixels=pixels, patch_width=w)
+    for scale in (1, 2):
+        if scale == 2:
+            monkeypatch.setattr(qwen_cuda, "MAX_PATCHES", 2 * qwen_cuda.MAX_PATCHES)
+            monkeypatch.setattr(qwen_cuda, "TOKENS_PER_IMAGE", 2 * qwen_cuda.TOKENS_PER_IMAGE)
+        assert tvm.request_bytes(**vid) == 2 * frames + 4 * scale * 16384 * w
+        assert tvm.request_bytes(**img) == 3 * pixels + 2 * 4 * 65536 * w + 4 * 4 * scale * 4096 * w * 3
+
+
 def test_a_video_off_the_streamed_path_counts_its_whole_patches_and_their_copy():
     """GLM review SHOULD-FIX 1: two videos, a video beside images, or THOR-VISION-STREAM off: ``prepare`` makes every
     video's float32 patches whole (4 bytes a frame byte) and concatenates them, parts and copy alive together."""
