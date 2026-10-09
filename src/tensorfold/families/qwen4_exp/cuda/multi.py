@@ -325,32 +325,47 @@ class MultiDecoder:
         becomes that block (and what the caches already hold) less the kept snapshots' share and the image tower's
         workspace (its calls run beside the rounds, a video's as its frames decode). THOR-VISION-MEM: the workspace's
         host part (``vision_host``) is left out of the block, free for vision requests' host buffers, and only its GPU
-        part comes off the room: the same room as the whole workspace in the block. Returns the note."""
+        part comes off the room: the same room as the whole workspace in the block. The host's idle free memory is then
+        landed on its design point, the host reserve plus those two budgets (``thor_kv.fit``). Returns the note."""
 
-        from tensorfold.cuda.capacity import reserve_bytes, _meminfo
+        from tensorfold.cuda.capacity import reserve_bytes, unified, _meminfo
         from . import thor_kv
 
         gate = self.memory_gate
+        thor_kv.trim_host()                              # the load's freed host memory back first, then measure
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         graphs = getattr(self, "graphs", None)
         demand = int(graphs.budget) if graphs is not None and getattr(graphs, "demand", False) else 0
         live = int(gate.live()) if gate.live is not None else 0
         vhost = int(getattr(self, "vision_host", 0))     # THOR-VISION-MEM's host part stays out of the block
+        memory = _meminfo()
+        host = reserve_bytes(memory["MemTotal"]) if memory else 0
+        read = _meminfo if memory is not None and unified(torch) else None
         size = thor_kv.reserve(live - demand - vhost)
+        target = host + demand + vhost                   # the idle's design point: what the pool must leave free
+        size, steps = thor_kv.fit(size, target, memory, read=read)
         snaps = self.keep * self._snapshot_bytes()
         gate.room = max(0, size + gate.held - snaps - self.vision_bytes)
         gate.reserve = thor_kv.SLACK
         self.pool_bytes = size
-        memory = _meminfo()
-        host = reserve_bytes(memory["MemTotal"]) if memory else 0
+        self.pool_fit = steps
         n = self.room_tokens()
+        idle = ""
+        if steps:
+            last, pools = steps[-1], ", ".join(f"{x['pool'] / GIB:.2f}" for x in steps)
+            idle = (f"; idle free memory {last['idle'] / GIB:.2f} GiB, {(last['idle'] - target) / 2**20:+.0f} MiB from "
+                    f"its design point {target / GIB:.2f} GiB after {len(steps)} reading(s) (pools {pools} GiB"
+                    + (f", {last['swapped'] / 2**20:.0f} MiB swapped out not counted" if last["swapped"] else "")
+                    + f"; {thor_kv.FIT_ENV}=0 sizes once)")
+            if last["idle"] < target - thor_kv.FIT_TOL:
+                idle += " -- BELOW the design point: this start cannot leave it free"
         return (f"every stream's caches from one {size / GIB:.2f} GiB pool reserved at load: {gate.room / GIB:.2f} GiB "
                 f"for caches past {self.keep} kept snapshots and {self.vision_bytes / GIB:.2f} GiB of image tower "
                 f"workspace ({n} tokens, {gate.room / max(1, self.window_bytes):.2f} full {self.capacity}-token "
                 f"windows); {demand / GIB:.2f} GiB left for on-demand graphs, "
                 + (f"{vhost / GIB:.2f} GiB for vision requests' host buffers (THOR-VISION-MEM) " if vhost else "")
-                + f"and {host / GIB:.2f} GiB for the host (TENSORFOLD_MEMORY_RESERVE_GIB)")
+                + f"and {host / GIB:.2f} GiB for the host (TENSORFOLD_MEMORY_RESERVE_GIB){idle}")
 
     def kept_view(self) -> list[dict]:
         """The kept conversations, one per slot: tokens (its longest point), points, cache bytes, idle seconds and

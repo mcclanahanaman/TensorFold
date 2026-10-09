@@ -172,6 +172,72 @@ def test_the_pool_is_the_live_room_past_graphs_and_snapshots(allocations, monkey
     assert "11.00 GiB pool" in note and "1.00 GiB left for on-demand graphs" in note and "0.50 GiB of image" in note
 
 
+def _fit(monkeypatch, host, *, before_swap=0):
+    """thor_kv.fit against a fake host: ``host(pool)`` -> (MemAvailable, SwapFree) once a pool of that size is held."""
+
+    import torch
+
+    thor_kv = importlib.import_module("tensorfold.families.qwen4_exp.cuda.thor_kv")
+    held, asked = {"pool": 0}, []
+
+    def reserve(size):
+        size = max(0, int(size)) // thor_kv.ALIGN * thor_kv.ALIGN
+        asked.append(size)
+        held["pool"] = size
+        return size
+
+    monkeypatch.setattr(thor_kv, "reserve", reserve)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(time, "sleep", lambda s: None)
+
+    def read():
+        avail, swap = host(held["pool"])
+        return {"MemAvailable": avail, "SwapFree": swap}
+
+    def run(size, target):
+        return thor_kv.fit(reserve(size), target, {"MemAvailable": 0, "SwapFree": before_swap}, read=read)
+
+    return thor_kv, asked, run
+
+
+def test_the_pool_is_refit_until_the_idle_lands_on_its_design_point(monkeypatch):
+    # the reservation took 1 GiB more than MemAvailable foretold (vmem-a2's on start): the pool comes down by it
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - GIB, 0))
+    target = 4 * GIB
+    size, steps = run(36 * GIB, target)
+    assert asked == [36 * GIB, 35 * GIB] and size == 35 * GIB
+    assert [s["idle"] for s in steps] == [3 * GIB, 4 * GIB] and steps[-1]["swapped"] == 0
+    # a surplus (the reservation took less): the pool grows by it
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool + GIB // 2, 0))
+    size, steps = run(36 * GIB, target)
+    assert asked == [36 * GIB, 36 * GIB + GIB // 2] and steps[-1]["idle"] == target
+
+
+def test_swap_the_reservation_filled_is_not_free_memory(monkeypatch):
+    # vmem-a2's off start: the reservation swapped 1.5 GiB of the startup heap out; MemAvailable looks 1.5 GiB richer
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool + 3 * GIB // 2, GIB // 2), before_swap=2 * GIB)
+    size, steps = run(36 * GIB, 4 * GIB)
+    assert asked == [36 * GIB] and steps == [{"pool": 36 * GIB, "available": 4 * GIB + 3 * GIB // 2,
+                                              "swapped": 3 * GIB // 2, "idle": 4 * GIB}]
+
+
+def test_the_fit_stops_within_its_tolerance_and_its_switch_measures_once(monkeypatch):
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - thor_kv.FIT_TOL, 0))
+    assert run(36 * GIB, 4 * GIB)[0] == 36 * GIB and asked == [36 * GIB]
+    monkeypatch.setenv(thor_kv.FIT_ENV, "0")
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool - GIB, 0))
+    size, steps = run(36 * GIB, 4 * GIB)
+    assert size == 36 * GIB and asked == [36 * GIB] and steps[0]["idle"] == 3 * GIB and len(steps) == 1
+    # never more than FIT_TRIES re-reservations, whatever the host does
+    monkeypatch.delenv(thor_kv.FIT_ENV)
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (GIB, 0))
+    run(36 * GIB, 4 * GIB)
+    assert len(asked) == 1 + thor_kv.FIT_TRIES
+    # not a unified GPU (read None): nothing measured, the pool kept
+    assert thor_kv.fit(8 * GIB, 4 * GIB, {"SwapFree": 0}, read=None) == (8 * GIB, [])
+
+
 def test_outside_the_pool_asks_the_hosts_memory_past_its_reserve():
     gate = importlib.import_module("tensorfold.cuda.memory_gate").MemoryGate(10, reserve=0)
     assert gate.outside(10**15)                                        # no system reading: never blocks

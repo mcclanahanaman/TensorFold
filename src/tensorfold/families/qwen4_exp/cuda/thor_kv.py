@@ -16,6 +16,13 @@ This path budgets the tables instead:
    into torch's caching allocator. Later grows split that block instead of asking the driver for pages: no reclaim or
    compaction while serving. The memory gate's room is that pool less the kept snapshots' share, so admission and the
    kept-prompt policy work against memory that is really there.
+3. **The idle on its design point** (``fit``): ``MemAvailable`` foretells the pool's cost only roughly (the page cache,
+   the driver's freed-page pool and the kernel's watermarks move with a 28 GiB allocation; FR-OPS-17 vmem-a2: the idle
+   came out 1.05 GiB under the reserve on one start, and 1.6 GiB over it on another whose reservation swapped the
+   startup's heap out). After the reservation the host's free memory is read again and the pool re-reserved by the
+   miss, so every start idles at the reserve plus the on-demand graphs' budget plus the vision host buffers; memory
+   the kernel freed by swapping the server out is not counted, since it comes back at the first touch.
+   ``TENSORFOLD_THOR_KV_POOL_FIT=0`` keeps the one sizing from ``MemAvailable`` before the reservation.
 
 Neither step changes what a request computes: the same caches in the same layout, from a different allocator block.
 """
@@ -32,6 +39,9 @@ CAPABILITY = (11, 0)
 GIB = float(1 << 30)
 ALIGN = 2 << 20                  # the pool's size, a whole number of the allocator's 2 MiB rounding
 SLACK = 256 << 20                # the gate's reserve in the pool: a resize's allocator rounding and small transients
+FIT_ENV = "TENSORFOLD_THOR_KV_POOL_FIT"     # =0: the pool sized once, from MemAvailable before it (the earlier sizing)
+FIT_TOL = 64 << 20               # how far from its design point the idle may land before the pool is re-reserved
+FIT_TRIES = 3                    # re-reservations at most (each one ~1-2 s at startup)
 
 
 def _on() -> bool:
@@ -107,4 +117,62 @@ def reserve(size: int) -> int:
     return 0
 
 
-__all__ = ["ENV", "available", "lock_tables", "reserve"]
+def trim_host() -> None:
+    """Before the pool measures its room: unreachable objects collected, then glibc's ``malloc_trim(0)``, so the
+    load's freed host memory is back with the kernel and the room is measured on what the server really keeps."""
+
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):          # not glibc: nothing to hand back this way
+        pass
+
+
+def _settled(read, *, every: float = 0.2, within: int = 8 << 20, limit: float = 3.0) -> dict:
+    """``read()`` (``/proc/meminfo`` as bytes) once two reads ``every`` seconds apart agree on ``MemAvailable`` within
+    ``within``, or the last read after ``limit`` seconds (the kernel's reclaim after a large allocation, then its boosted
+    watermarks, settle in ~2 s on Thor)."""
+
+    import time
+
+    last, stop = read(), time.monotonic() + limit
+    while time.monotonic() < stop:
+        time.sleep(every)
+        now = read()
+        if abs(now["MemAvailable"] - last["MemAvailable"]) <= within:
+            return now
+        last = now
+    return last
+
+
+def fit(size: int, target: int, before: dict | None, read=None) -> tuple[int, list[dict]]:
+    """Land the host's idle free memory on ``target`` after ``reserve(size)``: read ``MemAvailable`` once it settles and
+    re-reserve the pool by the miss (smaller when the reservation took more than ``MemAvailable`` foretold, larger when
+    it took less), at most ``FIT_TRIES`` times, until the idle is within ``FIT_TOL`` of the target. Swap the kernel
+    filled during the reservation (``before``'s ``SwapFree`` less now's) counts as used: those pages come back at the
+    first touch. ``read`` None (not a unified GPU) or ``FIT_ENV=0`` measures once and keeps the pool.
+
+    Returns the pool's bytes and one record a measurement: the pool then, MemAvailable, the swap filled, the idle."""
+
+    steps: list[dict] = []
+    if read is None or before is None:
+        return size, steps
+    tries = FIT_TRIES if os.environ.get(FIT_ENV, "1").strip().lower() not in ("0", "off", "false", "no") else 0
+    for i in range(tries + 1):
+        now = _settled(read)
+        swapped = max(0, int(before.get("SwapFree", 0)) - int(now.get("SwapFree", 0)))
+        idle = int(now["MemAvailable"]) - swapped
+        steps.append({"pool": size, "available": int(now["MemAvailable"]), "swapped": swapped, "idle": idle})
+        miss = target - idle                   # > 0: the pool took more than MemAvailable foretold
+        if abs(miss) <= FIT_TOL or i == tries or size - miss <= 0:
+            break
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()               # the pool's block back to the driver: nothing holds a piece of it yet
+        size = reserve(size - miss)
+    return size, steps
+
+
+__all__ = ["ENV", "FIT_ENV", "available", "fit", "lock_tables", "reserve", "trim_host"]
