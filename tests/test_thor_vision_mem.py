@@ -137,13 +137,81 @@ def test_request_bytes_bounds():
                             patch_width=w)
     assert img == 3 * (32 << 20) + 2 * 65536 * w + 4 * 16384 * w * 3
     vid = tvm.request_bytes(images=0, videos=1, image_tokens=0, video_tokens=16384, max_total_pixels=0,
-                            patch_width=w, frame_bytes=100 << 20)
+                            patch_width=w, frame_bytes=100 << 20, streamed=True)
     assert vid == 2 * (100 << 20) + 4 * 16384 * w
     assert tvm.request_bytes(images=0, videos=0, image_tokens=0, video_tokens=0, max_total_pixels=0,
                              patch_width=w) == 0
     less = tvm.request_bytes(images=1, videos=0, image_tokens=1024, video_tokens=0, max_total_pixels=1 << 20,
                              patch_width=w)
     assert less < img
+
+
+def test_a_video_off_the_streamed_path_counts_its_whole_patches_and_their_copy():
+    """GLM review SHOULD-FIX 1: two videos, a video beside images, or THOR-VISION-STREAM off: ``prepare`` makes every
+    video's float32 patches whole (4 bytes a frame byte) and concatenates them, parts and copy alive together."""
+    w, frames = 1536, 100 << 20
+    kw = dict(images=0, videos=2, image_tokens=0, video_tokens=16384, max_total_pixels=0, patch_width=w,
+              frame_bytes=frames)
+    assert tvm.request_bytes(**kw) == 2 * frames + 2 * 4 * frames
+    assert tvm.request_bytes(**kw, streamed=True) == 2 * frames + 4 * 16384 * w < tvm.request_bytes(**kw)
+
+
+def _vision(stream: bool):
+    from tensorfold.vision.qwen_cuda import QwenCudaVision
+
+    v = QwenCudaVision.__new__(QwenCudaVision)
+    v.config = {"in_channels": 3, "temporal_patch_size": 2, "patch_size": 16}
+    v.stream_videos = stream
+    return v
+
+
+@pytest.mark.parametrize("images,videos,stream,streamed", [(0, 1, True, True), (0, 1, False, False),
+                                                          (0, 2, True, False), (1, 1, True, False)])
+def test_host_bytes_takes_the_streamed_bound_only_for_one_video_alone(monkeypatch, images, videos, stream, streamed):
+    """The request's bound follows the path ``prepare_images`` takes: THOR-VISION-STREAM for one video and no image."""
+    from types import SimpleNamespace
+
+    monkeypatch.delenv("TENSORFOLD_VIDEO_TOKENS", raising=False)
+    limits = SimpleNamespace(max_visual_tokens=16384, max_total_pixels=32 << 20)
+    frames = 4 * 16384 * 2 * 16 * 16 * 3 * videos
+    want = tvm.request_bytes(images=images, videos=videos, image_tokens=16384, video_tokens=16384,
+                             max_total_pixels=32 << 20, patch_width=1536, frame_bytes=frames, streamed=streamed)
+    assert _vision(stream).host_bytes(images=images, videos=videos, limits=limits) == want
+
+
+@pytest.mark.parametrize("video_tokens", [1024, 4096, 16384])
+def test_a_kept_hold_covers_its_continuations_encode(video_tokens):
+    """GLM review LOW 2: a gated request's continuation encodes again under the request's kept hold. By then its
+    decoded pixels, frame copies and processing temporaries are gone; what stays (its patches: bf16 image rows, a
+    non-streamed video's float32 array, a streamed video's frames) plus that encode's host copy of one tower call
+    (bf16 rows; a streamed video's calls all ran early) fits the bound. A second hold from the budget is not needed,
+    and would wait forever on a kept hold that is the whole budget."""
+    from tensorfold.vision.qwen_cuda import MAX_PATCHES
+
+    w = 1536
+    patches = 4 * 16384
+    img = tvm.request_bytes(images=10, videos=0, image_tokens=16384, video_tokens=0, max_total_pixels=32 << 20,
+                            patch_width=w)
+    assert img >= 2 * patches * w + min(MAX_PATCHES, patches) * 2 * w
+    for n in (1, 2):
+        frames = 4 * video_tokens * w * n                          # T x p x p x 3 RGB bytes a patch (w), 4 a token
+        whole = tvm.request_bytes(images=0, videos=n, image_tokens=0, video_tokens=video_tokens, max_total_pixels=0,
+                                  patch_width=w, frame_bytes=frames)
+        assert whole >= 4 * frames + min(MAX_PATCHES, 4 * video_tokens * n) * 2 * w
+    frames = 4 * video_tokens * w
+    early = tvm.request_bytes(images=0, videos=1, image_tokens=0, video_tokens=video_tokens, max_total_pixels=0,
+                              patch_width=w, frame_bytes=frames, streamed=True)
+    assert early >= frames
+
+
+def test_the_pool_leaves_out_the_measured_serving_memory_the_budget_unchanged():
+    """THOR-KV-FIT's design point leaves at least ``HOST_FLOOR_BYTES`` out of the pool for serving vision (the
+    release's 1 GiB workspace splits 640 MiB tower + 384 MiB host); what requests may hold at once stays the part."""
+    assert tvm.HOST_FLOOR_BYTES == 704 * MIB
+    gpu, host = tvm.split(1024 * MIB, tvm.GPU_BYTES)
+    assert (gpu, host) == (640 * MIB, 384 * MIB) and tvm.pool_host(host) == 704 * MIB
+    assert tvm.pool_host(2048 * MIB) == 2048 * MIB and tvm.pool_host(0) == 704 * MIB
+    assert tvm.VisionMemory(host_bytes=host, gpu_bytes=gpu).budget.total == 384 * MIB
 
 
 def test_trimmer_never_blocks_and_counts():

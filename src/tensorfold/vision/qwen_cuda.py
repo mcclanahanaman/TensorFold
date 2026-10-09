@@ -414,10 +414,12 @@ class QwenCudaVision:
         return thor_vision_mem.request_bytes(
             images=images, videos=videos, image_tokens=min(int(limits.max_visual_tokens), MAX_REQUEST_PATCHES // 4),
             video_tokens=video_tokens, max_total_pixels=int(limits.max_total_pixels), patch_width=width,
-            frame_bytes=frame_bytes * videos)
+            frame_bytes=frame_bytes * videos,     # THOR-VISION-STREAM takes one video and no image (prompts.py)
+            streamed=videos == 1 and not images and bool(getattr(self, "stream_videos", False)))
 
     def video_size(self, frames: int, height: int, width: int) -> tuple[int, int]:
         return self.frontend.video_size(frames, height, width)
+
     @contextmanager
     def _on_gpu(self):
         """The tower on the GPU for the block; when offloaded, one caller at a time, and back to host RAM after."""

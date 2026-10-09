@@ -13,7 +13,9 @@ On sm_110 with vision, this path:
 
 1. **Splits the workspace.** The tower's GPU scratch (``gpu_bytes``) stays in the pool, out of the caches' room, as
    before; the rest (``host_bytes``) is left out of the pool (``reserve_pool`` reserves that much less), as host memory
-   for vision requests' buffers. The caches' room is what it was: the workspace is the same size, split.
+   for vision requests' buffers. The caches' room is what it was: the workspace is the same size, split. The pool
+   leaves at least ``HOST_FLOOR_BYTES`` out (``pool_host``), what serving vision was measured to take past the idle;
+   that much more comes off the room.
 2. **Budgets it.** A request holds its bound (``request_bytes``: decoded pixels, patches, frames, one image's processor
    temporaries) from before its decode until its tower encode ends; another waits (up to the image wait, then 503 as
    before). A request whose bound exceeds the budget runs alone. ``/v1/capacity`` reports the budget.
@@ -40,6 +42,11 @@ MIB = 1 << 20
 # the tower's GPU scratch bound: one MAX_PATCHES call's activations peaked at 0.04-0.53 GiB over its start
 # [par1fix-mem vision_peak], plus the request's features and the call's bf16 input
 GPU_BYTES = 640 * MIB
+# the host memory the Thor KV pool leaves free for serving vision (its fit's design point), at least the budget's part:
+# over the release's vision MATCH set the server's host memory past its graphs grew up to 551 MiB over its idle (537 on
+# the other start) [vmem-a3-c], MemAvailable fell up to 81 MiB more after the App's init, which a refit cannot see (page
+# cache, counted about half at Thor's idle MemFree) [vmem-a3-c], and one fit step (64 MiB) covers start-to-start spread
+HOST_FLOOR_BYTES = 704 * MIB
 TRIM_GAP_S = 0.2                 # a trim at most this often (each vision request asks for one)
 KEEP_ATTR = "_thor_vision_keep"  # set on a prepared prompt whose request may encode it again (``VisionMemory.keep``)
 
@@ -67,6 +74,12 @@ def split(workspace: int, gpu_bytes: int) -> tuple[int, int]:
         return workspace - host, host
     gpu = min(workspace, max(0, int(gpu_bytes)))
     return gpu, workspace - gpu
+
+
+def pool_host(host_bytes: int) -> int:
+    """The host memory the Thor KV pool leaves out for vision: the budget's ``host_bytes``, or ``HOST_FLOOR_BYTES`` when
+    that is more. Only the pool and its design point see it; the budget (what requests hold at once) is unchanged."""
+    return max(0, int(host_bytes), HOST_FLOOR_BYTES)
 
 
 class Hold:
@@ -138,18 +151,25 @@ class HostBudget:
 
 
 def request_bytes(*, images: int, videos: int, image_tokens: int, video_tokens: int, max_total_pixels: int,
-                  patch_width: int, frame_bytes: int = 0) -> int:
+                  patch_width: int, frame_bytes: int = 0, streamed: bool = False) -> int:
     """A vision request's host bound before its decode: the decoded RGB of its images (their pixel limit), their bf16
     patches (the visual-token budget, four patches a token), one image's processor temporaries (the processor's float32
-    passes over the largest image the budget allows, at most ``image_tokens``), and a video's frames, its stacked copy
-    and one tower call's float32 patches (``frame_bytes``: the caller's frame bound)."""
+    passes over the largest image the budget allows, at most ``image_tokens``), and its videos' frames and their stacked
+    copy (``frame_bytes``: the caller's bound for all of them) with their float32 patches. ``streamed`` (one video, no
+    image, THOR-VISION-STREAM on) makes one tower call's patches at a time; otherwise every video's patches are made
+    whole (four float32 bytes a frame byte) and concatenated into one array, the parts and the copy alive together.
+
+    The bound also covers a gated request's continuation, which encodes again under the request's kept hold: by then
+    the decoded pixels, the frames' copies and the processing temporaries are gone, which frees more than that encode's
+    host copy of one tower call takes (a streamed video's calls all ran early: its continuation makes none)."""
     total = 0
     if images:
         patches = 4 * int(image_tokens)
         total += 3 * int(max_total_pixels) + 2 * patches * patch_width
         total += 4 * min(patches, 4 * 4096) * patch_width * 3        # one image: float32 patches and two passes
     if videos:
-        total += 2 * int(frame_bytes) + 4 * min(4 * int(video_tokens), 16384) * patch_width
+        total += 2 * int(frame_bytes)
+        total += 4 * min(4 * int(video_tokens), 16384) * patch_width if streamed else 2 * 4 * int(frame_bytes)
     return int(total)
 
 
@@ -217,7 +237,9 @@ class VisionMemory:
     @staticmethod
     def keep(prepared) -> None:
         """``prepared`` may be encoded again (the server's gated continuation re-encodes its images): its arrays and
-        hold stay until the request drops it (``attach``'s finalizer), not just past its first encode."""
+        hold stay until the request drops it (``attach``'s finalizer), not just past its first encode. The
+        continuation's encode runs under that hold (``request_bytes`` covers it); a second hold from the same budget
+        could wait forever on this one."""
         object.__setattr__(prepared, KEEP_ATTR, True)
 
     def done(self, prepared) -> None:
@@ -258,5 +280,5 @@ def release_arrays(prepared) -> int:
     return freed
 
 
-__all__ = ["ENV", "HOST_ENV", "HostBudget", "Hold", "Trimmer", "VisionMemory", "available", "release_arrays",
-           "request_bytes", "split"]
+__all__ = ["ENV", "HOST_ENV", "HOST_FLOOR_BYTES", "HostBudget", "Hold", "Trimmer", "VisionMemory", "available",
+           "pool_host", "release_arrays", "request_bytes", "split"]
