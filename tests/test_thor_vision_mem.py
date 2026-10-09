@@ -334,3 +334,26 @@ def test_the_workspace_host_part_stays_out_of_the_pool_the_room_unchanged(alloca
         rooms.append(dec.memory_gate.room)
         assert ("host buffers (THOR-VISION-MEM)" in note) == bool(host)
     assert rooms[0] == rooms[1]
+
+
+def test_a_kept_prompt_survives_its_encode_and_its_continuation_releases_only_its_copy():
+    """A gated request (thinking budget, required tool call) encodes its images again in its continuation: the first
+    encode keeps the arrays and the hold; a continued copy's encode drops only the copy's references."""
+    from tensorfold.vision.qwen_processing import continued
+
+    m = tvm.VisionMemory(host_bytes=100, gpu_bytes=0)
+    p = prepared(rows=4, width=8)
+    m.attach(p, m.hold(60, timeout=0))
+    m.keep(p)
+    m.done(p)
+    assert p.pixel_values.shape == (4, 8) and m.budget.used == 60
+    cfg = {"image_token_id": 99, "vision_config": {"spatial_merge_size": 2}}
+    try:
+        q = continued(p, p.token_ids + (7,), cfg)
+    except Exception:                                   # a fixture prompt without real spans: copy the fields
+        q = PreparedVisionPrompt(**{f: getattr(p, f) for f in PreparedVisionPrompt.__dataclass_fields__})
+    m.done(q)
+    assert q.pixel_values.shape == (0, 8) and p.pixel_values.shape == (4, 8) and m.budget.used == 60
+    del p
+    gc.collect()
+    assert m.budget.used == 0

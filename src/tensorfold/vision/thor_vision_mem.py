@@ -18,7 +18,9 @@ On sm_110 with vision, this path:
    temporaries) from before its decode until its tower encode ends; another waits (up to the image wait, then 503 as
    before). A request whose bound exceeds the budget runs alone. ``/v1/capacity`` reports the budget.
 3. **Hands it back.** Right after the encode the prepared prompt's patch arrays are dropped (its features are on the
-   GPU) and ``malloc_trim(0)`` runs on a helper thread, so glibc returns the freed pages at once.
+   GPU) and ``malloc_trim(0)`` runs on a helper thread, so glibc returns the freed pages at once. A request the server
+   may continue past a gate (a thinking budget, a required tool call) encodes its images again, so its arrays and
+   hold stay until it ends (``VisionMemory.keep``).
 
 ``TENSORFOLD_THOR_VISION_MEM=0`` keeps the earlier path (the whole workspace in the pool, 16 preparation slots, the
 arrays kept until the reply ends); any other GPU never takes this path. Nothing here changes what a request computes.
@@ -39,6 +41,7 @@ MIB = 1 << 20
 # [par1fix-mem vision_peak], plus the request's features and the call's bf16 input
 GPU_BYTES = 640 * MIB
 TRIM_GAP_S = 0.2                 # a trim at most this often (each vision request asks for one)
+KEEP_ATTR = "_thor_vision_keep"  # set on a prepared prompt whose request may encode it again (``VisionMemory.keep``)
 
 
 def _on(name: str) -> bool:
@@ -211,8 +214,18 @@ class VisionMemory:
         hold.release()
         self.trimmer.poke()
 
+    @staticmethod
+    def keep(prepared) -> None:
+        """``prepared`` may be encoded again (the server's gated continuation re-encodes its images): its arrays and
+        hold stay until the request drops it (``attach``'s finalizer), not just past its first encode."""
+        object.__setattr__(prepared, KEEP_ATTR, True)
+
     def done(self, prepared) -> None:
-        """After ``prepared``'s encode (or its failure): its patch arrays dropped, its hold released, a trim asked."""
+        """After ``prepared``'s encode (or its failure): its patch arrays dropped, its hold released, a trim asked;
+        a kept prompt (``keep``) only asks the trim."""
+        if getattr(prepared, KEEP_ATTR, False):
+            self.trimmer.poke()
+            return
         self.released_bytes += release_arrays(prepared)
         with self._lock:
             hold = self._holds.pop(id(prepared), None)

@@ -495,6 +495,9 @@ class App:
         # one engine at a time: a background reply yields between rounds (not on two ranks, which decode to the end)
         yielding = background and turns is not None and getattr(self.engine, "tp", 1) == 1
         gates = [g for g in (gate, budget, Yield(turns) if yielding else None) if g is not None]
+        memory = getattr(getattr(self, "vision", None), "memory", None)   # THOR-VISION-MEM: a gated run re-encodes
+        if memory is not None and gates and prepared.vision is not None:
+            memory.keep(prepared.vision)
 
         cached: list[int] = []              # the prompt tokens the first run found cached (usage's cached_tokens)
         # the first run tells ``admitted`` when it takes its seat (and may be refused while it waits); a run after a
