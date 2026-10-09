@@ -236,10 +236,26 @@ def test_swapped_pages_still_in_ram_are_not_counted_twice(monkeypatch):
                                before_swap=2 * GIB, before_cached=10 * MIB)
     size, steps = run(36 * GIB, 4 * GIB)
     assert asked == [36 * GIB] and steps[0]["swapped"] == 850 * MIB and steps[0]["idle"] == 4 * GIB
-    # a swap cache that shrank is no credit: the whole SwapFree drop counts
-    before, now = {"SwapFree": 2 * GIB, "SwapCached": 100 * MIB}, {"SwapFree": GIB, "SwapCached": 50 * MIB}
-    assert thor_kv.swapped(before, now) == GIB
+    # on disk = the used slots less the swap cache: the SwapFree drop less the swap cache's change, either sign
+    # (GLM delta review SF-1: a swap cache that shrank was clamped to no change, undercounting the disk)
+    before = {"SwapFree": 2 * GIB, "SwapCached": 100 * MIB}
+    assert thor_kv.swapped(before, {"SwapFree": GIB, "SwapCached": 50 * MIB}) == GIB + 50 * MIB      # fell: adds
+    assert thor_kv.swapped(before, {"SwapFree": GIB, "SwapCached": 400 * MIB}) == GIB - 300 * MIB    # rose: in RAM
+    assert thor_kv.swapped(before, {"SwapFree": 2 * GIB, "SwapCached": 40 * MIB}) == 60 * MIB        # cache to disk
+    assert thor_kv.swapped(before, {"SwapFree": 2 * GIB + 60 * MIB, "SwapCached": 40 * MIB}) == 0    # slots freed
     assert thor_kv.swapped({"SwapFree": GIB}, {"SwapFree": 2 * GIB, "SwapCached": 5 * MIB}) == 0
+
+
+def test_a_swap_cache_that_falls_in_the_fits_window_counts_on_disk(monkeypatch):
+    # GLM delta review SF-1: the reservation fills 800 MiB of swap slots while 100 MiB of an earlier swap cache leaves
+    # RAM for disk: 900 MiB more is on disk and the idle loses all of it (the clamped fall overstated it by 100 MiB:
+    # the fit grew the pool 68 MiB and idled 68 MiB under its design point)
+    MIB = 1 << 20
+    thor_kv, asked, run = _fit(monkeypatch, lambda pool: (40 * GIB - pool + 900 * MIB, 2 * GIB - 800 * MIB, 200 * MIB),
+                               before_swap=2 * GIB, before_cached=300 * MIB)
+    size, steps = run(36 * GIB, 4 * GIB)
+    assert asked == [36 * GIB] and steps == [{"pool": 36 * GIB, "available": 4 * GIB + 900 * MIB,
+                                              "swapped": 900 * MIB, "idle": 4 * GIB}]
 
 
 def test_the_idle_lands_on_or_just_above_its_design_point_and_the_switch_measures_once(monkeypatch):

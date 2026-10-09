@@ -161,13 +161,14 @@ def _settled(read, *, every: float = 0.2, within: int = 8 << 20, limit: float = 
 
 
 def swapped(before: dict, now: dict) -> int:
-    """Swap filled since ``before`` that is on disk: ``SwapFree``'s drop less ``SwapCached``'s rise. A page swapped
+    """Swap filled since ``before`` that is on disk: ``SwapFree``'s drop less ``SwapCached``'s change. A page swapped
     out but still in RAM (the swap cache) is already out of ``MemAvailable``; counting its swap slot too would count
-    it twice."""
+    it twice. On-disk swap is the used slots less the swap cache, so the change counts with its sign: a swap cache
+    that shrank to disk adds to the drop (one that shrank by freeing its slots raised ``SwapFree`` as much)."""
 
     drop = int(before.get("SwapFree", 0)) - int(now.get("SwapFree", 0))
     cached = int(now.get("SwapCached", 0)) - int(before.get("SwapCached", 0))
-    return max(0, drop - max(0, cached))
+    return max(0, drop - cached)
 
 
 def fit(size: int, target: int, before: dict | None, read=None) -> tuple[int, list[dict]]:
