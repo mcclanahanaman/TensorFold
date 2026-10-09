@@ -100,6 +100,12 @@ def of(app) -> dict[str, Any]:
         body["overloaded"] = seats >= max_streams or free_cache_bytes <= 0
     else:
         body["overloaded"] = seats >= max_streams
+    memory = getattr(getattr(app, "vision", None), "memory", None)
+    if memory is not None:      # THOR-VISION-MEM (sm_110): the vision workspace's host budget and tower part
+        try:
+            body["vision"] = memory.state()
+        except Exception:       # noqa: BLE001 - a capacity read never breaks the server
+            pass
     return body
 
 

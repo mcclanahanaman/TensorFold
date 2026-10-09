@@ -51,7 +51,9 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
         template, sources = split_images(messages, limits=limits, allow_urls=allow_urls, allow_videos=videos)
     except (ImageInputError, ValueError) as exc:
         raise RequestError(str(exc)) from exc
-    slot, early = image_slot(), None
+    memory = getattr(frontend, "memory", None)        # THOR-VISION-MEM (sm_110): a byte budget, not 16 slots
+    hold = vision_hold(frontend, memory, sources, limits) if memory is not None else None
+    slot, early = (image_slot() if hold is None else None), None
     try:
         images = load_images([s for s in sources if isinstance(s, ImageSource)], limits=limits, allow_urls=allow_urls)
         budget = {} if limits.max_visual_tokens == DEFAULT_LIMITS.max_visual_tokens else \
@@ -69,13 +71,37 @@ def prepare_images(frontend, messages, render, *, context_limit=None, limits: Im
             prepared = None if early is None else early.take(budget["videos"][0])
         if prepared is None:
             prepared = frontend.prepare(render(template), images, max_prompt_tokens=context_limit, **budget)
+        del images, budget                              # the decoded pixels and frames: the prepared prompt has them
+        if hold is not None:                            # the prompt's patches keep the bytes until its encode
+            memory.attach(prepared, hold)
+            hold = None
     except (ImageInputError, ValueError, ImportError) as exc:
         raise refusal(str(exc)) from exc                # an image prompt past the window: context_length_exceeded
     finally:
         if early is not None:
             early.cancel()
-        slot.release()
+        if slot is not None:
+            slot.release()
+        if hold is not None:                            # failed before its prompt was made
+            hold.release()
     return RenderedPrompt(list(prepared.token_ids), vision=prepared)
+
+
+def vision_hold(frontend, memory, sources, limits):
+    """THOR-VISION-MEM: hold the request's host bound (``frontend.host_bytes``) in the vision budget, or refuse with 503
+    when the queue is full or the wait (``IMAGE_WAIT_S``) runs out, as ``image_slot`` does."""
+    from tensorfold.vision.images import ImageSource
+
+    images = sum(1 for s in sources if isinstance(s, ImageSource))
+    need = frontend.host_bytes(images=images, videos=len(sources) - images, limits=limits)
+    if not IMAGE_WAITERS.acquire(blocking=False):
+        raise CapacityError('image request queue is full; retry shortly')
+    try:
+        return memory.hold(need, timeout=IMAGE_WAIT_S)
+    except TimeoutError:
+        raise CapacityError('image processing capacity is busy; retry shortly') from None
+    finally:
+        IMAGE_WAITERS.release()
 
 
 def prepare_prompt(app, messages, tools, thinking, prompt, fields):

@@ -41,6 +41,51 @@ class StreamedVisionPrompt(PreparedVisionPrompt):
     video_features: Any = None
 
 
+class ImageRows:
+    """THOR-VISION-MEM: a prompt's image patches as one part an image (``QwenImageProcessor.prepare``'s ``image_rows``),
+    read a slice at a time as ``np.concatenate`` of the parts would give them, never concatenated whole. A slice that
+    covers parts returns their rows joined (``torch.cat`` for tensors); ``nbytes`` is what the parts hold."""
+
+    ndim = 2
+
+    def __init__(self, parts) -> None:
+        self._parts = list(parts)
+        self._starts = np.cumsum([0] + [int(p.shape[0]) for p in self._parts]).tolist()
+        width = int(self._parts[0].shape[1]) if self._parts else 0
+        if any(int(p.shape[1]) != width for p in self._parts):
+            raise ValueError("image patch parts differ in width")
+        self.shape = (self._starts[-1], width)
+        self.dtype = self._parts[0].dtype if self._parts else np.dtype(np.float32)
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(p.numel() * p.element_size()) if hasattr(p, "numel") else int(p.nbytes) for p in self._parts)
+
+    def __len__(self) -> int:
+        return self.shape[0]
+
+    def __getitem__(self, key):
+        if not isinstance(key, slice):
+            raise TypeError("image rows take a slice")
+        start, stop, step = key.indices(self.shape[0])
+        if step != 1:
+            raise ValueError("image rows take a contiguous slice")
+        pieces = []
+        for part, begin, end in zip(self._parts, self._starts, self._starts[1:]):
+            if end <= start or begin >= stop:
+                continue
+            pieces.append(part[max(start, begin) - begin:min(stop, end) - begin])
+        if not pieces:
+            return self._parts[0][0:0] if self._parts else np.zeros((0, self.shape[1]), dtype=np.float32)
+        if len(pieces) == 1:
+            return pieces[0]
+        if hasattr(pieces[0], "numel"):
+            import torch
+
+            return torch.cat(pieces)
+        return np.concatenate(pieces, axis=0)
+
+
 class LazyVideoPatches:
     """THOR-VISION-STREAM: a video's patches [groups * h * w, C * T * p * p] made a run of whole frame groups at a time
     (a slice), from ``frames(begin, end)``. Each patch row depends on its own frame group only, and the arithmetic is
@@ -260,10 +305,14 @@ class QwenImageProcessor:
 
     def prepare(self, rendered_prompt: str, images: Sequence[Any], *, videos: Sequence[Any] = (),
                 max_visual_tokens: int = 4096, max_prompt_tokens: int | None = None,
-                max_image_tokens: int | None = None) -> PreparedVisionPrompt:
+                max_image_tokens: int | None = None, image_rows=None) -> PreparedVisionPrompt:
         """Expand image (and video) markers and calculate request-local rotary metadata without touching the GPU.
         A video marker (``<|vision_start|><|video_pad|><|vision_end|>``) becomes one timestamped block a frame group,
-        ``<t seconds><|vision_start|>pads<|vision_end|>``, as Qwen3-VL's processor writes it."""
+        ``<t seconds><|vision_start|>pads<|vision_end|>``, as Qwen3-VL's processor writes it.
+        ``image_rows`` (THOR-VISION-MEM, the CUDA frontend on sm_110) takes each image's float32 patches as the
+        processor returns them and gives what the prompt keeps instead (bf16 rows); the images' patches then stay one
+        part an image (``ImageRows``), never concatenated, so a request holds its patches once, at the tower's
+        precision."""
         if (not images and not videos) or max_visual_tokens < 1:
             raise ValueError("Image preprocessing needs images and a positive visual-token budget")
         if rendered_prompt.count(self.image_token) != len(images):
@@ -294,7 +343,8 @@ class QwenImageProcessor:
                 raise ValueError("The image processor returned an invalid patch/grid shape")
             if pixels.shape != (int(np.prod(grid[0])), expected_width):
                 raise ValueError("The processed image patches do not match the checkpoint's vision geometry")
-            parts.append(pixels)
+            parts.append(pixels if image_rows is None else image_rows(pixels))
+            del result, pixels                   # THOR-VISION-MEM: this image's float32 patches go now, not at return
             grids.append(grid[0])
         grid = np.asarray(grids, dtype=np.int64).reshape(-1, 3)
         counts = [int(np.prod(row)) // merge**2 for row in grid]
@@ -322,11 +372,13 @@ class QwenImageProcessor:
                              "tokens, which exceeds the context window; reduce image resolution or prompt length")
         video_grid = np.asarray([g for _, g in clips], dtype=np.int64).reshape(-1, 3) if videos else None
         positions, delta, spans, frames = media_positions(tokens, grid, video_grid, self.config)
-        pixels = (np.concatenate(parts, axis=0) if parts else np.zeros((0, expected_width), dtype=np.float32))
+        pixels = (ImageRows(parts) if image_rows is not None and parts else np.concatenate(parts, axis=0) if parts
+                  else np.zeros((0, expected_width), dtype=np.float32))
+        del parts
         lazy = len(clips) == 1 and isinstance(clips[0][0], LazyVideoPatches)     # THOR-VISION-STREAM: one video
         video_pixels = clips[0][0] if lazy else np.concatenate([p for p, _ in clips], axis=0) if videos else None
         for array in (pixels, grid, positions, None if lazy else video_pixels, video_grid):
-            if array is not None:
+            if isinstance(array, np.ndarray):
                 array.setflags(write=False)
         return PreparedVisionPrompt(tokens, pixels, grid, positions, delta, spans,
                                     tuple(image.content_hash for image in images), video_pixels, video_grid, frames,

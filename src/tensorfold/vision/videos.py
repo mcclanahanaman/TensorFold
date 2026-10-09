@@ -17,6 +17,7 @@ from .images import _data_bytes
 from .images_http import ImageInputError, fetch_image
 
 SCALE_THREADS = 0       # THOR-VISION-PREP (the CUDA frontend sets it on sm_110): sampled frames scaled on a pool
+FRAMES_IN_PLACE = False  # THOR-VISION-MEM (the CUDA frontend sets it on sm_110): frames scaled into one array, no stack
 VIDEO_MEDIA_TYPES = {"video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-matroska": "mkv"}
 
 
@@ -188,6 +189,7 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
     """Decode the sampled frames of one video, each scaled to ``size(frames, height, width)`` (bicubic); ``feed``
     (THOR-VISION-STREAM) hears the plan and each sampled frame as it goes."""
     av = _av()
+    into = None
     try:
         with av.open(io.BytesIO(data), mode="r") as container:
             if not container.streams.video:
@@ -210,6 +212,9 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
             out_h, out_w = size(len(wanted), height, width)
             keep = set(int(i) for i in wanted)
             frames, indices = [], []
+            # THOR-VISION-MEM: each sampled frame scaled straight into its row of the video's array (the same pixels),
+            # so the frames are never held twice (a list, then its stacked copy)
+            into = np.empty((len(wanted), out_h, out_w, 3), dtype=np.uint8) if FRAMES_IN_PLACE else None
             if feed is not None:
                 feed.begin(len(wanted), out_h, out_w, wanted, fps)
             # THOR-VISION-PREP: each sampled frame's scale (swscale, the GIL released) on a pool while the next frames
@@ -221,6 +226,8 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
                 if n in keep:
                     scale = functools.partial(frame.to_ndarray, format="rgb24", width=out_w, height=out_h,
                                               interpolation="BICUBIC")
+                    if into is not None:
+                        scale = functools.partial(_scale_into, into, len(frames), scale)
                     frames.append(scale() if pool is None else pool.submit(scale))
                     indices.append(n)
                     if feed is not None:
@@ -236,7 +243,17 @@ def decode_video(data: bytes, size: Callable[[int, int, int], tuple[int, int]], 
                               "WebM") from None
     if len(frames) < 2:
         raise ImageInputError("the video has fewer than two decodable frames")
+    if into is not None:
+        del frames
+        return VideoInput(into if len(indices) == len(into) else np.ascontiguousarray(into[:len(indices)]),
+                          tuple(indices), fps)
     return VideoInput(np.stack(frames), tuple(indices), fps)
+
+
+def _scale_into(into: np.ndarray, slot: int, scale) -> np.ndarray:
+    """THOR-VISION-MEM: one sampled frame scaled (``scale``) and written to row ``slot`` of the video's array."""
+    into[slot] = scale()
+    return into[slot]
 
 
 def load_videos(sources: list[VideoSource], size: Callable[[int, int, int], tuple[int, int]], *,

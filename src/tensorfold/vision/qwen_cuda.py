@@ -281,6 +281,14 @@ def capacity_geometry(base, model_dir, enabled: bool, rank: int, workspace: int 
     return geometry
 
 
+def _bf16_rows(pixels):
+    """THOR-VISION-MEM: one image's float32 patches as host bf16 rows, the bits ``torch.tensor(pixels,
+    dtype=torch.bfloat16, device=...)`` gives the tower (that copy converts on the host, round to nearest even)."""
+    import torch
+
+    return torch.from_numpy(pixels).to(torch.bfloat16)
+
+
 class QwenCudaVision:
     """Only the image tower is loaded; the CUDA family retains all language computation."""
 
@@ -296,6 +304,7 @@ class QwenCudaVision:
         from .qwen_processing import QwenImageProcessor
         from .qwen_checkpoint import vision_key
 
+        self.memory = None              # THOR-VISION-MEM (``thor_vision_mem.VisionMemory``): the engine's, on sm_110
         self.config, self.weight_bytes, schemes = vision_layout(model_dir)
         self.frontend = QwenImageProcessor.from_directory(model_dir)
         raw = json.loads((Path(model_dir) / "config.json").read_text())
@@ -381,7 +390,31 @@ class QwenCudaVision:
 
     def prepare(self, *args, **kwargs):
         kwargs.setdefault("max_image_tokens", TOKENS_PER_IMAGE)
+        if self.memory is not None:     # THOR-VISION-MEM: each image's patches kept as bf16 rows, the tower's bits
+            kwargs.setdefault("image_rows", _bf16_rows)
         return self.frontend.prepare(*args, **kwargs)
+
+    def use_memory(self, memory) -> None:
+        """THOR-VISION-MEM (set by the engine on sm_110): requests hold ``memory``'s host budget until their encode,
+        their arrays are dropped after it, and a video's sampled frames are scaled into one array (the same pixels)."""
+        from . import videos
+
+        self.memory = memory
+        videos.FRAMES_IN_PLACE = True
+
+    def host_bytes(self, *, images: int, videos: int, limits) -> int:
+        """THOR-VISION-MEM: a request's host bound before its decode (``thor_vision_mem.request_bytes``) from its image
+        and video counts and the server's image limits (its visual-token budget and decoded-pixel total)."""
+        from . import thor_vision_mem
+
+        width = self.config["in_channels"] * self.config["temporal_patch_size"] * self.config["patch_size"]**2
+        video_tokens = int(os.environ.get("TENSORFOLD_VIDEO_TOKENS") or 16384)
+        # a video's sampled frames: four patches a token, each patch T frames of p x p RGB pixels
+        frame_bytes = 4 * video_tokens * self.config["temporal_patch_size"] * self.config["patch_size"]**2 * 3
+        return thor_vision_mem.request_bytes(
+            images=images, videos=videos, image_tokens=min(int(limits.max_visual_tokens), MAX_REQUEST_PATCHES // 4),
+            video_tokens=video_tokens, max_total_pixels=int(limits.max_total_pixels), patch_width=width,
+            frame_bytes=frame_bytes * videos)
 
     def video_size(self, frames: int, height: int, width: int) -> tuple[int, int]:
         return self.frontend.video_size(frames, height, width)
@@ -402,11 +435,15 @@ class QwenCudaVision:
                 torch.cuda.empty_cache()
 
     def encode(self, prepared, prompt) -> EncodedVision:
-        if getattr(self, "stream_videos", False):     # THOR-VISION-STREAM: one tower call at a time beside early calls
-            with self._tower_lock:
+        try:
+            if getattr(self, "stream_videos", False):  # THOR-VISION-STREAM: one tower call at a time beside early calls
+                with self._tower_lock:
+                    return self._encode(prepared, prompt)
+            with self._on_gpu():
                 return self._encode(prepared, prompt)
-        with self._on_gpu():
-            return self._encode(prepared, prompt)
+        finally:
+            if self.memory is not None:              # THOR-VISION-MEM: the patches dropped, the hold back, a trim
+                self.memory.done(prepared)
 
     def speculate(self, render, **prepare_options):
         """THOR-VISION-STREAM: a ``VideoSpeculation`` for a one-video request, None when off (``stream_videos``)."""
@@ -481,9 +518,12 @@ class QwenCudaVision:
             # as before, whenever the request fits it), so the scratch stays what one full-size image needs
             for begin, end in image_runs(sizes, MAX_PATCHES):
                 done = sum(sizes[:begin])
-                # a copy: the prepared arrays are read-only, and a tensor may not share them
-                pixels = torch.tensor(prepared.pixel_values[done:done + sum(sizes[begin:end])],
-                                      dtype=torch.bfloat16, device=self.device)
+                # a copy: the prepared arrays are read-only, and a tensor may not share them; THOR-VISION-MEM's bf16
+                # rows (converted on the host as this conversion does) are copied as they are
+                rows = prepared.pixel_values[done:done + sum(sizes[begin:end])]
+                pixels = (rows.to(device=self.device) if isinstance(rows, torch.Tensor) else
+                          torch.tensor(rows, dtype=torch.bfloat16, device=self.device))
+                del rows
                 grids = torch.tensor(grid[begin:end], dtype=torch.int64, device=self.device)
                 features = self.tower(pixels, grid_thw=grids, return_dict=True,
                                       **self._longest([int(h) * int(w) for _, h, w in grid[begin:end]])).pooler_output

@@ -86,7 +86,7 @@ class MultiDecoder:
     def __init__(self, w, *, slots: int, capacity: int, depth: int = DEPTH, confidence: float = CONFIDENCE,
                  stop_eos: bool = True, keep: int = 8, kv_dtype: str = "bf16", prefill_rows: int = PREFILL_ROWS,
                  share: float = SHARE, points=None, vision=None, workspace_bytes: int = 0, pool: bool = False,
-                 vision_bytes: int = 0) -> None:
+                 vision_bytes: int = 0, vision_host: int = 0) -> None:
         if w.comm is not None:
             raise ValueError("concurrent Flash Next runs on one GPU for now")
         self.w, self.depth, self.confidence, self.capacity = w, depth, confidence, capacity
@@ -128,6 +128,7 @@ class MultiDecoder:
         # Thor KV pool (thor_kv: the tables locked, the caches' memory reserved at load by ``reserve_pool``): a grow
         # never takes the driver's pages, so the wide-piece guard has nothing to keep
         self.kv_pool, self.pool_bytes, self.vision_bytes = bool(pool), 0, int(vision_bytes)
+        self.vision_host = int(vision_host)          # THOR-VISION-MEM: the workspace's host part, left out of the pool
         if pool:
             self.memory_gate.pooled = True
             self.memory_gate.system = lambda: available_bytes(torch)
@@ -322,7 +323,9 @@ class MultiDecoder:
         """Thor KV pool (``thor_kv``): after the warm-ups, the gate's live room past the on-demand graphs' budget is
         allocated once into torch's cache, so later grows split it instead of taking the driver's pages; the room
         becomes that block (and what the caches already hold) less the kept snapshots' share and the image tower's
-        workspace (its calls run beside the rounds, a video's as its frames decode). Returns the note."""
+        workspace (its calls run beside the rounds, a video's as its frames decode). THOR-VISION-MEM: the workspace's
+        host part (``vision_host``) is left out of the block, free for vision requests' host buffers, and only its GPU
+        part comes off the room: the same room as the whole workspace in the block. Returns the note."""
 
         from tensorfold.cuda.capacity import reserve_bytes, _meminfo
         from . import thor_kv
@@ -333,7 +336,8 @@ class MultiDecoder:
         graphs = getattr(self, "graphs", None)
         demand = int(graphs.budget) if graphs is not None and getattr(graphs, "demand", False) else 0
         live = int(gate.live()) if gate.live is not None else 0
-        size = thor_kv.reserve(live - demand)
+        vhost = int(getattr(self, "vision_host", 0))     # THOR-VISION-MEM's host part stays out of the block
+        size = thor_kv.reserve(live - demand - vhost)
         snaps = self.keep * self._snapshot_bytes()
         gate.room = max(0, size + gate.held - snaps - self.vision_bytes)
         gate.reserve = thor_kv.SLACK
@@ -344,8 +348,9 @@ class MultiDecoder:
         return (f"every stream's caches from one {size / GIB:.2f} GiB pool reserved at load: {gate.room / GIB:.2f} GiB "
                 f"for caches past {self.keep} kept snapshots and {self.vision_bytes / GIB:.2f} GiB of image tower "
                 f"workspace ({n} tokens, {gate.room / max(1, self.window_bytes):.2f} full {self.capacity}-token "
-                f"windows); {demand / GIB:.2f} GiB left for on-demand graphs and {host / GIB:.2f} GiB for the host "
-                "(TENSORFOLD_MEMORY_RESERVE_GIB)")
+                f"windows); {demand / GIB:.2f} GiB left for on-demand graphs, "
+                + (f"{vhost / GIB:.2f} GiB for vision requests' host buffers (THOR-VISION-MEM) " if vhost else "")
+                + f"and {host / GIB:.2f} GiB for the host (TENSORFOLD_MEMORY_RESERVE_GIB)")
 
     def kept_view(self) -> list[dict]:
         """The kept conversations, one per slot: tokens (its longest point), points, cache bytes, idle seconds and

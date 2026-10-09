@@ -114,6 +114,12 @@ class FlashNextEngine:
         from tensorfold.vision.qwen_cuda import capacity_geometry, weight_transform as vision_weights
 
         workspace = vision_workspace() if vision else 0
+        from tensorfold.vision import thor_vision_mem
+
+        # THOR-VISION-MEM (sm_110): the workspace split, the tower's GPU part in the pool, the rest left for host buffers
+        vision_mem = bool(vision) and rank == 0 and tp == 1 and thor_vision_mem.available()
+        tower_bytes, host_bytes = (thor_vision_mem.split(workspace, thor_vision_mem.GPU_BYTES) if vision_mem
+                                   else (workspace, 0))
         from . import thor_nvme
 
         nvme = thor_nvme.wanted(ple_on_ssd)         # Thor: the n-gram rows from NVMe, nothing mapped
@@ -164,6 +170,12 @@ class FlashNextEngine:
 
             self.vision = QwenCudaVision(model_dir, torch.device("cuda", 0),
                                          allow_urls=vision_urls)
+            if vision_mem:
+                self.vision.use_memory(thor_vision_mem.VisionMemory(host_bytes, tower_bytes))
+                print(f"[tensorfold] Thor (sm_110): vision workspace split {tower_bytes / 2**30:.2f} GiB tower (in the "
+                      f"pool) + {host_bytes / 2**30:.2f} GiB host buffers (out of it), a request holding its host bound "
+                      f"from its decode to its encode, its arrays dropped and glibc trimmed after "
+                      f"({thor_vision_mem.ENV}=0: the earlier path)", flush=True)
             torch.cuda.empty_cache()
             print(f"[tensorfold] vision: image{' and video' if self.vision.videos else ''} input, a "
                   f"{self.vision.weight_bytes / 2**30:.2f} GiB tower with {vision_workspace() / 2**30:.2f} GiB of "
@@ -227,7 +239,7 @@ class FlashNextEngine:
                                       confidence=self.confidence, keep=KEEP, points=self.points,
                                       kv_dtype=self.kv_dtype, share=share, vision=self.vision,
                                       prefill_rows=self.prefill_rows, workspace_bytes=prompt_workspace,
-                                      pool=pooled, vision_bytes=workspace)
+                                      pool=pooled, vision_bytes=tower_bytes, vision_host=host_bytes)
             self.scheduler = Scheduler(self.multi, max_streams=streams)
         else:
             self.e = Engine(w, capacity=self.max_len, max_rows=max(8, self.depth + 1), graphs=graphs,
