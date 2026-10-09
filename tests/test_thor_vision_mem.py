@@ -397,6 +397,8 @@ def test_the_workspace_host_part_stays_out_of_the_pool_the_room_unchanged(alloca
         monkeypatch.setattr(thor_kv, "reserve", lambda size, asked=asked: asked.append(size) or size)
         monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
         monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+        # the room arithmetic alone: not a unified GPU, so no fit against this machine's memory
+        monkeypatch.setattr(importlib.import_module("tensorfold.cuda.capacity"), "unified", lambda torch: False)
         note = dec.reserve_pool()
         assert asked == [11 * GIB - host]
         rooms.append(dec.memory_gate.room)

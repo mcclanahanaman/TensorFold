@@ -165,6 +165,9 @@ def test_the_pool_is_the_live_room_past_graphs_and_snapshots(allocations, monkey
     monkeypatch.setattr(thor_kv, "reserve", lambda size: asked.append(size) or size - size % (2 << 20))
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    # not a unified GPU: the room arithmetic alone, no fit against this machine's memory (on a CUDA machine the fake
+    # triton fixture breaks torch's lazy init, and a fit would measure the real host)
+    monkeypatch.setattr(importlib.import_module("tensorfold.cuda.capacity"), "unified", lambda torch: False)
     note = dec.reserve_pool()
     snap = dec._snapshot_bytes()
     assert asked == [11 * GIB] and dec.pool_bytes == 11 * GIB
