@@ -48,16 +48,22 @@ def _same_rounds(a, b) -> None:
 
 @pytest.mark.parametrize("cap", [None, 2])
 @pytest.mark.parametrize("kv_dtype", ["bf16", "int8"])
-def test_graphed_rounds_keep_the_eager_rounds_bits(cap, kv_dtype):
+def test_graphed_rounds_keep_the_eager_rounds_bits(cap, kv_dtype, monkeypatch):
     """Dense streams ending at different rounds, greedy and sampled: graph replays (all kept, or two then eager) give
-    the eager rounds' logits, bit for bit, every round."""
+    the eager rounds' logits, bit for bit, every round (MS-GRAPH ``all``: concurrent verification forwards too)."""
 
     w = _model()
     samplings = [None, Sampling(seed=1234, top_k=20, top_p=0.95), None, Sampling(seed=7, top_k=20, top_p=0.95)]
     counts = [40, 24, 33, 12]
-    off_out, off_rounds, _ = _decode(w, PROMPTS, counts, samplings, graphs=False, capacity=1024, kv_dtype=kv_dtype)
-    on_out, on_rounds, g = _decode(w, PROMPTS, counts, samplings, graphs=True, capacity=1024, cap=cap,
-                                   kv_dtype=kv_dtype)
+    monkeypatch.setenv(thor_graphs.MULTI_ENV, "all")
+    thor_graphs.multi_on.cache_clear()
+    try:
+        off_out, off_rounds, _ = _decode(w, PROMPTS, counts, samplings, graphs=False, capacity=1024,
+                                         kv_dtype=kv_dtype)
+        on_out, on_rounds, g = _decode(w, PROMPTS, counts, samplings, graphs=True, capacity=1024, cap=cap,
+                                       kv_dtype=kv_dtype)
+    finally:
+        thor_graphs.multi_on.cache_clear()
     assert on_out == off_out
     _same_rounds(on_rounds, off_rounds)
     assert not g.failed
