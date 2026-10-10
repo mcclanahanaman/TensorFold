@@ -1,4 +1,4 @@
-"""Flash Next's cold prefill on CUDA, split by kernel class (FR-OPS-17 K-PROF): wall time, CUDA events and CUPTI.
+"""Flash Next's cold prefill on CUDA, split by kernel class: wall time, CUDA events and CUPTI.
 
     python tools/thor/prefill_profile.py MODEL_DIR OUT_DIR [--tokens 8192,32768,131072] [--parallel 4]
         [--kv-dtype int8] [--modes plain,events,profile] [--profile-every 8] [--gemm-bench] [--save-gdn PATH]

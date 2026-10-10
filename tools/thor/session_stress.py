@@ -1,4 +1,4 @@
-"""N concurrent agent sessions with dynamic turn lengths against a TensorFold server's /v1/capacity (FR-OPS-17).
+"""N concurrent agent sessions with dynamic turn lengths against a TensorFold server's /v1/capacity.
 
 Usage: python tools/thor/session_stress.py URL OUT.json [--sessions 8] [--turns 6] [--plan release|tiny]
        [--extra 0] [--extra-turns 3] [--require-refusal] [--seed 20261007] [--max-tokens 64] [--window 262144]

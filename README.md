@@ -1,3 +1,6 @@
+This repository is a fork of [TensorFold](https://github.com/ashhart/TensorFold) with Jetson AGX Thor (sm_110) support on the frozen Python engine.
+What the fork adds, its kill switches and how it was checked are in [docs/THOR-FORK.md](docs/THOR-FORK.md).
+
 # TensorFold
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.

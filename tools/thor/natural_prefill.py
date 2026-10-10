@@ -1,4 +1,4 @@
-"""Natural-text prefill on a running TensorFold server, warm and with the n-gram table cold (FR-OPS-17 gate KPI).
+"""Natural-text prefill on a running TensorFold server, warm and with the n-gram table cold.
 
     python tools/thor/natural_prefill.py BASE_URL --model qwen3.8-flash-next --tokens 32768 --out FILE
         [--drop-table SNAPSHOT_DIR] [--snapshot SNAPSHOT_DIR] [--repeat N] [--seed S]

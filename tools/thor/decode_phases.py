@@ -1,4 +1,4 @@
-"""A concurrent decode round's phases on Jetson Thor, timed in process (FR-OPS-17; THOR-DEC-1).
+"""A concurrent decode round's phases on Jetson Thor, timed in process (THOR-DEC-1).
 
     python tools/thor/decode_phases.py OUT.json --model MODEL [--label L] [--users 1,4] [--types prose,code]
         [--groups 2] [--new 400] [--nsys u1:20:40,u4:20:40] [--sparkdash tools/thor/_ext/decode0/sparkdash_port.py]

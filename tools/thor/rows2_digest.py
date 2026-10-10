@@ -1,4 +1,4 @@
-"""ROWS-2 per-request digest (FR-OPS-17): host memory, n-gram table residency, faults and server counters
+"""ROWS-2 per-request digest: host memory, n-gram table residency, faults and server counters
 before and after each request.
 
 Usage:
@@ -238,7 +238,7 @@ def markdown(digests, metrics) -> str:
 
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="ROWS-2 per-request digest (FR-OPS-17)")
+    ap = argparse.ArgumentParser(description="ROWS-2 per-request digest")
     ap.add_argument("out_dir", type=Path, help="folder holding marks_/mw_/diag_<tag>.jsonl")
     ap.add_argument("--tags", required=True, help="comma-separated tags to digest")
     ap.add_argument("--json", type=Path, default=None, help="write the JSON digest here")

@@ -1,4 +1,4 @@
-"""THOR-DEC-1 memory digest of a run's out folder (FR-OPS-17).
+"""THOR-DEC-1 memory digest of a run's out folder.
 
 Per server tag, the digest reports the memory gate's room, the server's footprint from MemAvailable
 and the driver's free memory at each probe phase, grow and eviction counts by segment between
@@ -166,7 +166,7 @@ def markdown(d: dict) -> str:
 
 def main(argv=None) -> int:
     """CLI entry point; returns 0."""
-    ap = argparse.ArgumentParser(description="THOR-DEC-1 memory digest of a run's out folder (FR-OPS-17).")
+    ap = argparse.ArgumentParser(description="THOR-DEC-1 memory digest of a run's out folder.")
     ap.add_argument("out_dir", type=Path, help="run out folder with probe.jsonl and diag_<tag>.jsonl")
     ap.add_argument("--tags", required=True, help="comma-separated server tags")
     ap.add_argument("--base-config", default="off", help="base config name for the same-round diff")

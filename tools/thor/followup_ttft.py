@@ -1,4 +1,4 @@
-"""Agentic follow-ups on one running TensorFold server (FR-OPS-17): for each --lengths target, a chat that opens with
+"""Agentic follow-ups on one running TensorFold server: for each --lengths target, a chat that opens with
 one long user message (prefill_ttft.py's synthetic text), then --turns follow-up turns, each adding the assistant's
 reply as the server sent it and a short new user message (a tool result of --tool-tokens synthetic tokens); each turn's
 TTFT, prompt tokens, cached tokens (where the server resumed), filled tokens (prompt - cached) and reply hash; every

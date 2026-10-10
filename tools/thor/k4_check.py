@@ -4,7 +4,7 @@ on thor_gdn's chunked chain (``thor``).
     python tools/thor/k4_check.py MODEL_DIR OUT_DIR [--events 8192,32768,131072]
 
 The engine is built as served (int8 KV, --parallel 4: the Thor experts, stage-ahead and thor_dense with its default
-weights, bf16 copies since HD-2026-10-01-07; TENSORFOLD_THOR_DENSE_WEIGHTS=dequant gives r11's recipe) and thor_gdn is
+weights, bf16 copies by default; TENSORFOLD_THOR_DENSE_WEIGHTS=dequant dequantizes at each call) and thor_gdn is
 switched per mode with ``thor_gdn.set_active``; nothing is kept between prompts (each fills from row 0). Per mode: kprof
 events at each ``--events`` length (the GPU timeline by kernel class: the DeltaNet prompt class, gdn.chain/front/back,
 and the rest), then plain wall time for synthetic 8k, 32k and 128k and natural-text 32k warm and with the n-gram table's

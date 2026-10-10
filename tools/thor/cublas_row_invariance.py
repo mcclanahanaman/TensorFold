@@ -1,4 +1,4 @@
-"""Is a cuBLAS / cuBLASLt bf16 GEMM (fp32 sums) row-invariant at Flash Next's dense prompt shapes? (FR-OPS-17 K-PROF)
+"""Is a cuBLAS / cuBLASLt bf16 GEMM (fp32 sums) row-invariant at Flash Next's dense prompt shapes?
 
     python tools/thor/cublas_row_invariance.py OUT.json
 

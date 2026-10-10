@@ -1,4 +1,4 @@
-"""thor_nvme (FR-OPS-17, HD-2026-10-07-04): NVFP4 n-gram rows read from disk through the native row cache equal the
+"""thor_nvme: NVFP4 n-gram rows read from disk through the native row cache equal the
 memory-mapped NVFP4Table's bit for bit: raw bytes, pair-table gathers and per-call dequant, with and without the cache,
 AIO and pread threads, O_DIRECT where the file system allows it, duplicates, evictions and concurrent callers."""
 
@@ -179,7 +179,7 @@ def test_policy_only_table():
     assert thor_nvme.NVMeTable.policy(4096).info()["probation"] == thor_nvme.PROBATION
 
 
-# Phase 2 (HD-2026-10-07-04): the repacked row file, arrival reads, the cache snapshot.
+# Design decision: the repacked row file, arrival reads, the cache snapshot.
 
 def _packed(checkpoint, tmp_path):
     from pathlib import Path

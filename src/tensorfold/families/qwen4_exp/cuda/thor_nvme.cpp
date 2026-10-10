@@ -1,4 +1,4 @@
-// Flash Next's PLE n-gram rows read from NVMe through a small row cache: Jetson Thor (sm_110), FR-OPS-17 (HD-2026-10-07-04).
+// Flash Next's PLE n-gram rows read from NVMe through a small row cache: Jetson Thor (sm_110).
 // A C ABI for ctypes (thor_nvme.py); no Python per read. Rows are the checkpoint's bytes as stored (NVFP4: the code bytes of
 // a row, then its e4m3 block-scale bytes); reads are O_DIRECT, whole pages (4 KiB by default), from Linux AIO submitted by
 // the calling thread (decode-sized waves: no thread hand-off) and up to ``helpers`` more threads for prompt-sized bursts, or
@@ -8,7 +8,7 @@
 // when its way is needed again, a row used meanwhile moves to a main way (CLOCK over the main ways) and an unused one
 // leaves, so a one-pass scan of new rows never displaces rows used twice. ``probation`` 0: CLOCK over all ways, a new
 // row entering with ``init`` uses.
-// Phase 2 (HD-2026-10-07-04): a shard with a negative scale offset is a repacked row file (one record of code bytes, then
+// Design decision: a shard with a negative scale offset is a repacked row file (one record of code bytes, then
 // scale bytes, a row: ONE read a row, two pages when a record straddles one). Arrival reads (``tfnr_prefetch``): a prompt's
 // first rows read ahead of its stage by low-priority threads that yield to every foreground gather, inserted as "ahead"
 // rows (kAhead) whose first use counts as their insertion, so the cache policy sees what it would without them; the stage

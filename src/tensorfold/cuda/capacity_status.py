@@ -1,5 +1,5 @@
 """The CUDA server's /v1/capacity: live admission state a client or router can read before sending, so it can back off
-before the server would have to refuse (par-1-fix, FR-OPS-17; Brendan 2026-10-05, admission control).
+before the server would have to refuse.
 
 GET reports the state; POST with a request body (a chat completion's or a completion's, as it would be sent) previews
 that one request: the prompt tokens it renders to, the kept prefix it would resume now, and whether it would be admitted

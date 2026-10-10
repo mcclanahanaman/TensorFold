@@ -1,4 +1,4 @@
-"""Host memory sampler beside a running TensorFold server on Jetson Thor (FR-OPS-17, ROWS-2): one JSON line a sample.
+"""Host memory sampler beside a running TensorFold server on Jetson Thor (ROWS-2): one JSON line a sample.
 
     python tools/thor/memwatch.py PID OUT.jsonl [--snapshot DIR] [--every 1.0] [--residency-every 1]
 

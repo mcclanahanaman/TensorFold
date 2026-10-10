@@ -1,4 +1,4 @@
-"""Thor's serving memory for concurrent Flash Next (FR-OPS-17 par-1-fix): kept conversations go least recently used
+"""Thor's serving memory for concurrent Flash Next: kept conversations go least recently used
 first and are counted by cause, a request past the whole room is refused as too long instead of waiting forever, the
 capacity preview says what a request would get before it is sent, and the Thor KV pool's room arithmetic. CPU only."""
 

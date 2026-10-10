@@ -1,13 +1,13 @@
 """K2 A/B on Jetson Thor (THOR-K2): one engine, the same prompts on TensorFold's prompt GEMMs, thor_dense with bf16
 copies, and thor_dense dequantizing at each call.
 
-    python tools/thor/k2_check.py MODEL_DIR OUT_DIR          (copies are thor_dense's default: HD-2026-10-01-07)
+    python tools/thor/k2_check.py MODEL_DIR OUT_DIR          (copies are thor_dense's default)
 
 The engine is built as served (int8 KV, --parallel 4) with the copies made at load. Phase 1: per prompt, ``stock``
 (``thor_dense.set_active(False)``) then ``copy``; phase 2 (the copies dropped): ``dequant``, and ``stock`` again on the
 32k prompt. Each mode: kprof events at 32k (class times), plain wall time for synthetic 8k/32k/128k and natural-text
 32k warm and with the n-gram table's pages dropped, and the head logits' hash (copy and dequant must agree). Writes
-k2_check.json and ledger_metrics.json (prefill_* of ``copy``, the default since HD-2026-10-01-07).
+k2_check.json and ledger_metrics.json (prefill_* of ``copy``, the default).
 """
 
 from __future__ import annotations

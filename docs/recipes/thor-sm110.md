@@ -8,55 +8,58 @@ hyper-connection fusion and the n-gram table's host-side gather are TensorFold's
 code produces it (the contract every CUDA family keeps: drafted output equals serial output, a resumed prompt equals
 that prompt served fresh).
 
-## Release recipe (FR-OPS-17 par-1-fix) — PENDING-FREEZE
+## Release recipe
 
 `qwen3.8-flash-next` on one Thor, its full native window, eight seats, vision on. The block below is the recipe the
-release gates run; the commit is filled in when the release build is frozen and approved.
+release gates run.
 
 ```
-ENGINE_COMMIT=PENDING-FREEZE        # thor/par-1-fix
+ENGINE_COMMIT=the branch's release tag thor-release-2026-10-10
 CHECKPOINT=local-inference-lab/Qwen3.8-Flash-Next-NVFP4@7c4f1bc1a2d6847e0cbc01ac6b823f00251de8dd
 
 TENSORFOLD_PREFILL_ROWS=4096
 TENSORFOLD_MEMORY_RESERVE_GIB=2.5
-TENSORFOLD_THOR_DENSE_WEIGHTS=dequant
+TENSORFOLD_THOR_KV_POOL=1
+TENSORFOLD_THOR_DENSE_WEIGHTS=copy
+TENSORFOLD_THOR_NGRAM_NVME=1
+TENSORFOLD_THOR_NGRAM_FILE=/hf/derived/ngram-7c4f1bc1/ngram.rows
+TENSORFOLD_THOR_NGRAM_SNAPSHOT=/cache/ngram-snap/ngram-7c4f1bc1.snap
+TENSORFOLD_THOR_NGRAM_SNAPSHOT_S=0
 TENSORFOLD_VISION_WORKSPACE_MIB=1024
 TENSORFOLD_ADMISSION_WAIT_S=30
+NUMPY_MADVISE_HUGEPAGE=0
+GLIBC_TUNABLES=glibc.malloc.mmap_threshold=524288
+MIMALLOC_PURGE_DELAY=0
+MIMALLOC_ABANDONED_PAGE_PURGE=1
 
 python -m tensorfold.cli serve "$CHECKPOINT_DIR" --backend cuda --kv-dtype int8 \
   --parallel 8 --context 262144 --vision --vision-max-images 50 --vision-image-tokens 16384
 ```
 
-Every other setting is its default; the Thor switches below are on by default on sm_110.
+Every other setting is its default; the Thor switches below are on by default on sm_110. The n-gram row file is built once from the checkpoint with tools/thor/ngram_repack.py; /hf and /cache are the container mounts of the Hugging Face cache and a writable cache directory.
 
 ## Memory, as built
 
-Thor's GPU allocates from the host's 128 GB. The serving memory is planned once at load, in this order:
+Thor's GPU allocates from the host's 128 GB. The n-gram tables stay on NVMe and are read through a locked row cache, so
+that memory is free for the KV cache. The pool reserves the host's free memory less the host reserve (2.5 GiB,
+`TENSORFOLD_MEMORY_RESERVE_GIB`), the on-demand graphs' budget (1 GiB) and the vision allowance kept out of the pool
+(0.94 GiB, that is max(the workspace's host part, 960 MiB)). The caches' room subtracts only the 0.62 GiB GPU part of
+the 1 GiB vision workspace. At startup the pool is refit after the application's init so the host's idle free memory
+lands on its design point: the reserve plus the graph budget plus the vision allowance, about 4.44 GiB. Swap that went
+to disk counts as used.
 
-1. **The n-gram tables are locked** (`mlock`, `thor_kv.lock_tables`): 26.82 GiB of NVFP4 n-gram rows for this
-   checkpoint. Locked pages leave `MemAvailable` (measured 43.72 -> 16.60 GiB) and no allocation can take them, so
-   every lookup stays a memory read however the caches grow. The container's `ulimit -l` must allow it.
-2. **The n-gram rows are decoded through a pair table** (`host_table.NVFP4Table.use_pairs`): a 256 x 256 table of
-   the two values each (scale byte, code byte) pair decodes to, built by the same dequantization the per-call path
-   runs, so a row's bits are identical by construction (all 65,536 pairs at five table scales in
-   `tests/test_ngram_nvfp4_pairs.py`; 200,000 real rows, 32,000,000 values, identical on Thor). One lookup per byte
-   replaces the per-call dequantization's row-sized temporaries, whose 4 KiB-page faults had slowed 8k prompts.
-3. **Dense weights stay at their checkpoint size** (`TENSORFOLD_THOR_DENSE_WEIGHTS=dequant`): a prompt GEMM on an
-   MXFP8 weight (attention, DeltaNet, shared expert) dequantizes that one weight into an 82 MiB staging buffer before
-   its bf16 cuBLAS call, with the same bits as a bf16 copy. Bf16 copies (`copy`) would take 5.5 GiB, which the locked
-   tables and eight full-window seats leave no room for. Decode's lane kernels read the MXFP8 weights directly in
-   either mode.
-4. **One cache pool** (`thor_kv.reserve`, after the warm-ups): `MemAvailable` less the host reserve
-   (`TENSORFOLD_MEMORY_RESERVE_GIB=2.5`) and the on-demand decode graphs' budget (1 GiB) is allocated once
-   (7.92 GiB measured) and freed into torch's caching allocator. Every cache grow then splits that block instead of
-   asking the driver for pages, so serving never waits on the kernel's reclaim or compaction.
-5. **The room**: the pool less eight kept snapshots (about 110 MB each) and the image tower's workspace
-   (`TENSORFOLD_VISION_WORKSPACE_MIB=1024`): **6.06 GiB** of KV cache. At this checkpoint's int8 KV, about 18.3 KB
-   per token, a full 262,144-token window takes 4.47 GiB.
+The startup log states the plan:
 
-The startup log states the plan, e.g. `every stream's caches from one 7.92 GiB pool reserved at load: 6.06 GiB for
-caches past 8 kept snapshots and 1.00 GiB of image tower workspace (262151 tokens, 1.36 full 262151-token
-windows); 1.00 GiB left for on-demand graphs and 2.50 GiB for the host`.
+```
+[tensorfold] Thor (sm_110): vision workspace split 0.62 GiB tower (in the pool) + 0.38 GiB host buffers (out of it; the pool leaves 0.94 GiB out for serving vision), a request holding its host bound from its decode to its encode, its arrays dropped and glibc trimmed after (TENSORFOLD_THOR_VISION_MEM=0: the earlier path)
+[tensorfold] Thor (sm_110): every stream's caches from one 26.96 GiB pool reserved at load: 25.47 GiB for caches past 8 kept snapshots and 0.62 GiB of image tower workspace (262151 tokens, 5.70 full 262151-token windows); 1.00 GiB left for on-demand graphs, 0.94 GiB for vision requests' host buffers (THOR-VISION-MEM) and 2.50 GiB for the host (TENSORFOLD_MEMORY_RESERVE_GIB); idle free memory 4.49 GiB, +55 MiB from its design point 4.44 GiB after 2 reading(s) (pools 27.75, 26.96 GiB, 1064 MiB in swap on disk counted as used; TENSORFOLD_THOR_KV_POOL_FIT=0 sizes once) (TENSORFOLD_THOR_KV_POOL=0: the earlier path)
+[tensorfold] Thor (sm_110): the pool refit after the server's init: every stream's caches from one 26.87 GiB pool: 25.38 GiB for caches (262151 tokens); idle free memory 4.46 GiB, +27 MiB from its design point 4.44 GiB after 2 reading(s) (pools 26.96, 26.87 GiB, 1062 MiB in swap on disk counted as used; TENSORFOLD_THOR_KV_POOL_FIT=0 sizes once) (TENSORFOLD_THOR_KV_POOL=0: the earlier path)
+[tensorfold] serving qwen3.8-flash-next at http://127.0.0.1:8010/v1 on CUDA (sampling: temperature 1.0, top_k 20, top_p 0.95; drafts: on; prompts: bf16 activations; context: 262144; loaded in 245.8s)
+```
+
+Measured on the release build: KV room 25.3 GiB (about 1.49M tokens, 5 full 262,144-token windows), idle free memory
+on the design point. Under the vision MATCH set, with the gate's client included, `MemAvailable` never went under
+2.5 GiB (lowest 2.9 GiB).
 
 ## Admission and capacity
 
@@ -77,22 +80,15 @@ next turn will run cold.
 
 ## Measured capacity
 
-PENDING-FREEZE: measured on the pre-freeze build (dev runs, not gated); the gated release runs restate them.
-
-- **Room:** 6.06 GiB of KV cache = **one request of the full 262,144-token window, or about 355,000 tokens across
-  all live and kept conversations** (1.36 full windows). More seats share the same room.
-- **Eight dynamic sessions** (`tools/thor/session_stress.py`, 8 sessions x 6 turns, prompts growing to 224,732
-  tokens, stress-dev1): every turn completed with no error, killed stream or timeout; 34 of 40 follow-ups resumed
-  their cached prefix and the other 6 were announced cold by the preview before they ran; up to **4 kept
-  conversations of 32k+ tokens, 1 of 64k+**, were held at once.
-- **One long conversation:** an 80k-token prompt-reuse chain resumes 100% of its prefix on every follow-up when it
-  has the room to itself (kvpool-dev2).
+On the release build the KV room is 25.3 GiB (about 1.49M tokens, 5 full 262,144-token windows). Idle free memory
+lands on the design point (about 4.44 GiB). Under the vision MATCH set, with the gate's client included,
+`MemAvailable` never went under 2.5 GiB (lowest 2.9 GiB). Gated run numbers beyond that live in the recipe repository.
 
 ## Thor switches
 
 | Switch | Default on sm_110 | Off / other value |
 | --- | --- | --- |
-| `TENSORFOLD_THOR_KV_POOL` | the tables locked and one cache pool | `0`: caches grow from the driver, the wide-piece pool guard, the tables' pages evictable |
+| `TENSORFOLD_THOR_KV_POOL` | one cache pool (NVMe tables stay on disk; their row cache is locked) | `0`: caches grow from the driver, the wide-piece pool guard, in-memory tables' pages evictable |
 | `TENSORFOLD_THOR_NGRAM_PAIRS` | NVFP4 n-gram rows through the pair table | `0`: per-call dequantization |
 | `TENSORFOLD_THOR_DENSE_WEIGHTS` | `copy` (bf16 copies of MXFP8 weights) | `dequant`: no copies (this recipe) |
 | `TENSORFOLD_THOR_DECODE_GRAPH` | decode rounds replay CUDA graphs | `0`: every round eager |
@@ -109,5 +105,5 @@ PENDING-FREEZE: measured on the pre-freeze build (dev runs, not gated); the gate
 - **Admission control.** `NoRoom` is a `CapacityError` (HTTP 503, `Retry-After`, `reason`), `admit()` promises a
   stream's worst case before it touches a slot, the bounded wait refuses rather than queues forever, and
   `/v1/capacity` reports the state a client or router needs to back off first.
-- **Memory plan.** The locked tables and the one pool above replace the earlier path, where a cache grow sized
+- **Memory plan.** The pool above replaces the earlier path, where a cache grow sized
   against `MemAvailable` took the mapped tables' pages (a 1.4 GiB grow took 70 s and left 9% of the tables on disk).

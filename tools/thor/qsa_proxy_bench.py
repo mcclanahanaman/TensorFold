@@ -1,4 +1,4 @@
-"""QSA tensor-core proxies on Jetson Thor, per layer and 2048-row prompt pass (FR-OPS-17 K-PROF):
+"""QSA tensor-core proxies on Jetson Thor, per layer and 2048-row prompt pass:
 
     python tools/thor/qsa_proxy_bench.py OUT.json
 

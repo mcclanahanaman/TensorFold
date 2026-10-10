@@ -1,4 +1,4 @@
-"""A decode round's host time by call, split by whether a forward runs on the GPU (FR-OPS-17; DEC-2).
+"""A decode round's host time by call, split by whether a forward runs on the GPU (DEC-2).
 
 ``decode_phases.py --host-split`` installs this in place of its phase timer. ``install`` wraps the round's host calls
 (``multi.py`` and what it calls: staging, the round tables, graphs, sampling, accept/commit, MTP drafting); the

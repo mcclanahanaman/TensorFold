@@ -1,4 +1,4 @@
-"""Repeated decode requests on one running TensorFold server (FR-OPS-17, THOR-K3): the same greedy requests several
+"""Repeated decode requests on one running TensorFold server (THOR-K3): the same greedy requests several
 times, one stream and then several at once, so rounds that replay recorded CUDA graphs can be told from the first
 requests' rounds (which record them). Every request is kept; wall-clock request times let a server log's timestamped
 events be matched to requests.

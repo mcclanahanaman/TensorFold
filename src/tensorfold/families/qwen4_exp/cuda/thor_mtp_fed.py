@@ -1,4 +1,4 @@
-"""Flash Next's device-fed MTP draft chain on Jetson Thor (sm_110) (DPUSH-6, FR-OPS-17).
+"""Flash Next's device-fed MTP draft chain on Jetson Thor (sm_110) (DPUSH-6).
 
 A round's draft chain is host-bound: each MTP step waited for the host to read the step before it (picks, stop rule),
 stage the next window (tokens and positions) and launch the next graph. Here each step's input token comes from the

@@ -585,7 +585,7 @@ class MultiDecoder:
         self.filling.append(s)
 
     def _ahead(self, s: Stream) -> list:
-        """Thor NVMe n-gram tables (HD-2026-10-07-04 Phase 2): start reading the rows of the prompt's first
+        """Thor NVMe n-gram tables: start reading the rows of the prompt's first
         ``arrival_rows`` uncached tokens at admission, so the reads overlap it; the pass's stage waits (``_arrivals``).
         A hint only: the stage's gather reads whatever is still missing, so the rows are the same either way."""
 

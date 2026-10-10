@@ -1,4 +1,4 @@
-"""In-process check of wider prompt pieces on Jetson Thor (FR-OPS-17 ROWS-1): the same prompts through the served
+"""In-process check of wider prompt pieces on Jetson Thor: the same prompts through the served
 concurrent decoder at each piece size; head logits bit for bit, prompt tok/s and the allocator's peak.
 
     python tools/thor/rows_check.py MODEL OUT.json [--rows 2048,4096,8192,16384] [--tokens 32768,131072]

@@ -1,4 +1,4 @@
-"""Flash Next's decode host path on Jetson Thor (sm_110) (DEC-2, FR-OPS-17).
+"""Flash Next's decode host path on Jetson Thor (sm_110) (DEC-2).
 
 On by default on sm_110; ``TENSORFOLD_THOR_DEC2_HOST=0`` keeps the earlier path (the kill switch). Each piece has its own
 switch (all on by default) so an A/B can attribute it:

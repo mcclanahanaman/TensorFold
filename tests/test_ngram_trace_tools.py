@@ -1,4 +1,4 @@
-"""tools/thor/ngram_trace.py (FR-OPS-17, HD-2026-10-07-04 Phase 0): traffic -> exact PLE n-gram row ids -> cache-policy
+"""tools/thor/ngram_trace.py: traffic -> exact PLE n-gram row ids -> cache-policy
 replay. The contract the tool is written to (GLM card tk-ngram-trace); runs on any OS (the policy is injected here)."""
 
 from __future__ import annotations

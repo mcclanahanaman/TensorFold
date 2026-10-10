@@ -1,4 +1,4 @@
-"""Stage-ahead A/B on Jetson Thor (FR-OPS-17): one engine, the same prompts with TENSORFOLD_THOR_STAGE_AHEAD=1 and =0.
+"""Stage-ahead A/B on Jetson Thor: one engine, the same prompts with TENSORFOLD_THOR_STAGE_AHEAD=1 and =0.
 
     python tools/thor/stage_ahead_check.py MODEL_DIR OUT_DIR
 

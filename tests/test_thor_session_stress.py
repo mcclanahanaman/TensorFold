@@ -1,4 +1,4 @@
-"""tools/thor/session_stress.py against a stub server (FR-OPS-17 par-1-fix, the 8-session dynamic stress).
+"""tools/thor/session_stress.py against a stub server (the 8-session dynamic stress).
 
 The stub speaks the three routes the harness uses: GET /v1/capacity (state), POST /v1/capacity (a preview of one
 request: its prompt tokens, the tokens it would resume from a kept prefix, and whether it is admissible now) and a

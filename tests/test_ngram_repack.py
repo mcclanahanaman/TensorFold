@@ -1,4 +1,4 @@
-"""tools/thor/ngram_repack.py (FR-OPS-17, HD-2026-10-07-04 Phase 2): the NVFP4 n-gram rows repacked into one raw file of
+"""tools/thor/ngram_repack.py: the NVFP4 n-gram rows repacked into one raw file of
 fixed records (a row's code bytes, then its block-scale bytes; natural row order; no header, no padding) plus a JSON
 manifest, and a verifier that compares every record with the checkpoint. The contract the tool is written to (GLM card
 tk-ngram-repack); numpy + stdlib only, so it runs on any OS. Row order and byte offsets are NVMeTable's (thor_nvme.py):

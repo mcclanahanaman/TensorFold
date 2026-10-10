@@ -184,8 +184,8 @@ def thor_layers(w) -> list:
 def prerecord_thor(w, b, layers: list) -> tuple[int, int]:
     """Jetson Thor (sm_110): a decode buffer set's routed-expert CUDA graphs, one for every (layer, rows) its calls can
     make, recorded now, at load: ``thor.run`` records a key on its first eager call, which on a request cost a capture
-    per layer in the first round of each new window width (a fresh server's first 8-stream waves ran 5-13% slower,
-    FR-OPS-17 dvar-first1). The calls are ``forward.moe_block``'s own (the buffer set's rows, router, plan and slots),
+    per layer in the first round of each new window width (a fresh server's first 8-stream waves ran 5-13% slower).
+    The calls are ``forward.moe_block``'s own (the buffer set's rows, router, plan and slots),
     on zeroed rows, for every width from 1 to the scratch's rows. Returns (graphs recorded, device bytes they took).
     ``TENSORFOLD_THOR_FI_MOE_PRERECORD=0`` leaves them to first use."""
 

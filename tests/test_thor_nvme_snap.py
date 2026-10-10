@@ -1,4 +1,4 @@
-"""The contract of thor_nvme_snap (FR-OPS-17, HD-2026-10-07-04 Phase 2): the warm-start snapshot of the Thor NVMe row
+"""The contract of thor_nvme_snap: the warm-start snapshot of the Thor NVMe row
 cache. A file: MAGIC, a little-endian uint32 header length, the UTF-8 JSON header, then the payload; written atomically;
 loaded only when every check passes (versioned by the row file's manifest sha256, the "key"); a corrupt file is renamed
 ``<path>.bad`` and never raises. Pure Python: a fake table stands in for NVMeTable (snapshot/restore/stats)."""

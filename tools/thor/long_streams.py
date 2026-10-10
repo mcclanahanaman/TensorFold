@@ -1,4 +1,4 @@
-"""Concurrent long-prompt streams on one running TensorFold server (FR-OPS-17, THOR-DEC-1 full-window stress): every
+"""Concurrent long-prompt streams on one running TensorFold server (THOR-DEC-1 full-window stress): every
 --lengths entry is one chat whose single user message is prefill_ttft.text(length, seed + i), all sent at once, greedy,
 end tokens ignored, so the streams' caches grow together toward the window.
 

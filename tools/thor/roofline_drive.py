@@ -1,4 +1,4 @@
-"""Flash Next on Jetson Thor as served, marked for Nsight Systems and Nsight Compute (FR-OPS-17 roofline-audit).
+"""Flash Next on Jetson Thor as served, marked for Nsight Systems and Nsight Compute.
 
     python tools/thor/roofline_drive.py prefill OUT --model MODEL [--tokens 8192,32768] [--warm 8192]
         [--capture all|N:P,...] [--inventory]

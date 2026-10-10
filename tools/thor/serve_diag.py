@@ -1,4 +1,4 @@
-"""Serve TensorFold with ROWS-2 diagnostics (FR-OPS-17): the same server, plus a JSON-lines record of its memory gate,
+"""Serve TensorFold with ROWS-2 diagnostics: the same server, plus a JSON-lines record of its memory gate,
 kept prompts, prompt passes, n-gram gathers and allocator calls. The wrappers only count and time: no computed value,
 buffer or schedule changes.
 

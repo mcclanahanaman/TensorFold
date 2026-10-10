@@ -1,5 +1,5 @@
-"""Jetson Thor (sm_110): a decode buffer set's routed-expert graphs recorded at load (``nvfp4_moe.prerecord_thor``;
-FR-OPS-17 par-1-fix). Every (layer, window width) the set's calls can make goes through ``forward.moe_block``'s own
+"""Jetson Thor (sm_110): a decode buffer set's routed-expert graphs recorded at load (``nvfp4_moe.prerecord_thor``).
+Every (layer, window width) the set's calls can make goes through ``forward.moe_block``'s own
 call (its rows, router, plan and slots) before any request, so no request pays a capture; a set without graphs, or
 the switch off, records nothing. CPU fakes: the call pattern and the accounting, not the device work."""
 

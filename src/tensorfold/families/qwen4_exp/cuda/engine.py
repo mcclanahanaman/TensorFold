@@ -222,7 +222,7 @@ class FlashNextEngine:
         nvme_tables = bool(tables) and all(getattr(t, "nvme", False) for t in tables.values())
         if self.concurrent and nvme_tables and thor_kv.available():
             # Thor KV pool over NVMe tables: the row cache was allocated and locked with the tables, before the pool
-            # measures its room (HD-2026-10-07-04)
+            # measures its room
             pooled = True
             print(f"[tensorfold] Thor (sm_110): {'; '.join(t.note() for t in tables.values())}", flush=True)
         elif self.concurrent and prefetch and not ple_on_ssd and tables and thor_kv.available():

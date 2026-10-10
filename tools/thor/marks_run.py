@@ -1,4 +1,4 @@
-"""Run a Thor client tool with request marks (FR-OPS-17, ROWS-2): the wall-clock start and end of every request it sends.
+"""Run a Thor client tool with request marks (ROWS-2): the wall-clock start and end of every request it sends.
 
     python tools/thor/marks_run.py MARKS.jsonl TOOL.py FUNCTION [the tool's arguments ...]
 

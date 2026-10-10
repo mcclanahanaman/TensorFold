@@ -1,4 +1,4 @@
-"""tools/thor/ngram_trace.py (FR-OPS-17, HD-2026-10-07-04 Phase 0): turn chat/agent traffic into the exact Flash
+"""tools/thor/ngram_trace.py: turn chat/agent traffic into the exact Flash
 Next PLE n-gram row ids (TensorFold's own hash) and replay them through a row-cache policy for hit rates.
 
 Commands (python tools/thor/ngram_trace.py <cmd>):
@@ -293,7 +293,7 @@ def cmd_simulate(args):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='PLE n-gram trace extraction and cache-policy replay (FR-OPS-17)')
+    parser = argparse.ArgumentParser(description='PLE n-gram trace extraction and cache-policy replay')
     sub = parser.add_subparsers(dest='cmd', required=True)
     extract = sub.add_parser('extract', help='traffic -> PLE n-gram row ids on disk')
     extract.add_argument('--source', choices=['dsh', 'jsonl'], required=True)

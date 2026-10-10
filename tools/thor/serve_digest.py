@@ -1,4 +1,4 @@
-"""Startup memory digest of a TensorFold Flash Next server log (FR-OPS-17).
+"""Startup memory digest of a TensorFold Flash Next server log.
 
     python tools/thor/serve_digest.py LOG [--json OUT]
 

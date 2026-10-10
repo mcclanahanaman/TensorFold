@@ -1,6 +1,6 @@
-"""Flash Next's PLE n-gram rows read from NVMe on Jetson Thor (sm_110) through a small row cache (FR-OPS-17).
+"""Flash Next's PLE n-gram rows read from NVMe on Jetson Thor (sm_110) through a small row cache.
 
-HD-2026-10-07-04: the n-gram tables (26.8 GiB as NVFP4) stay on NVMe, neither locked in RAM nor in the page cache, so
+Design decision: the n-gram tables (26.8 GiB as NVFP4) stay on NVMe, neither locked in RAM nor in the page cache, so
 that memory goes to the KV cache with the bf16 dense copies kept. ``NVMeTable`` keeps ``NVFP4Table``'s ``gather``
 contract (row ids -> bf16 bits through the same pair table), so DEC-2, the prompt read-ahead and every consumer are
 unchanged. Its rows come from ``thor_nvme.cpp`` (no Python per read): O_DIRECT reads of whole pages, Linux AIO from the
@@ -12,7 +12,7 @@ the pair table ``NVFP4Table.use_pairs`` builds, so the rows equal the memory-map
 Switches (read at load):
 - ``TENSORFOLD_THOR_NGRAM_NVME``: ``1`` reads the tables from NVMe on sm_110; ``0`` or unset keeps the locked-table path
   (the kill switch). ``--ple-on-ssd`` with an NVFP4 checkpoint on sm_110 turns it on unless this is ``0``.
-- ``TENSORFOLD_THOR_NGRAM_CACHE_GIB``: the row cache (default 0.53; HD-2026-10-07-04 allows 0.35-1.4 by measurement).
+- ``TENSORFOLD_THOR_NGRAM_CACHE_GIB``: the row cache (default 0.53; 0.35-1.4 is allowed by measurement).
 - ``TENSORFOLD_THOR_NGRAM_IO``: ``aio`` (default) or ``threads``; ``TENSORFOLD_THOR_NGRAM_DEPTH`` reads in flight a
   reader (64), ``TENSORFOLD_THOR_NGRAM_HELPERS`` extra reader threads for prompt-sized bursts (3),
   ``TENSORFOLD_THOR_NGRAM_PAGE`` bytes a read (4096), ``TENSORFOLD_THOR_NGRAM_PROBATION`` probation ways of 16 (4; 0:

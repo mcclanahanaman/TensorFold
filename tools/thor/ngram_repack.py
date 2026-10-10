@@ -1,4 +1,4 @@
-"""tools/thor/ngram_repack.py (FR-OPS-17, HD-2026-10-07-04 Phase 2): repacks the NVFP4 n-gram table into one
+"""tools/thor/ngram_repack.py: repacks the NVFP4 n-gram table into one
 raw file of fixed records (each row's U8 code bytes, then its F8_E4M3 block-scale bytes; natural row order; no
 header, no padding) plus a JSON manifest, and verifies that file record-by-record against the checkpoint.
 
@@ -255,7 +255,7 @@ def _cmd_verify(args) -> int:
 
 
 def main(argv=None) -> int:
-    p = argparse.ArgumentParser(description='repack and verify the NVFP4 n-gram table rows (FR-OPS-17)')
+    p = argparse.ArgumentParser(description='repack and verify the NVFP4 n-gram table rows')
     sub = p.add_subparsers(dest='cmd', required=True)
     b = sub.add_parser('build', help='repack the n-gram table into OUT and write OUT.json')
     b.add_argument('model_dir')

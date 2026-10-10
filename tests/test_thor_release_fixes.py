@@ -1,4 +1,4 @@
-"""The Thor release re-gate fixes of admission and /v1/capacity (FR-OPS-17, 2026-10-08): deterministic, no GPU.
+"""The Thor release re-gate fixes of admission and /v1/capacity (2026-10-08): deterministic, no GPU.
 
 The cross-family review of the release's memory, admission and capacity code (VERDICT: FAIL) found: B1, the warm-up
 request's admission reservation is never released; S1, GET /v1/capacity counts the Thor pool's reserve as free room

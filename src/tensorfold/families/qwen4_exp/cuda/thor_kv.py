@@ -5,7 +5,7 @@ streams' caches grow from the driver, the wide-piece pool guard, the tables' pag
 
 Thor's GPU allocates from the host's memory. The mapped n-gram tables (26.8 GiB for the NVFP4 checkpoint) are page
 cache, so ``MemAvailable`` counts them as free: a cache grow sized against it took their pages, and once the driver's
-freed pages ran out the grow waited on the kernel's reclaim and compaction (FR-OPS-17 memd-census1: a 1.4 GiB grow took
+freed pages ran out the grow waited on the kernel's reclaim and compaction (a 1.4 GiB grow took
 70 s and left 9% of the tables on disk; the prompt after it ran at 476 tok/s, a ~2.6k tok/s prompt with them resident).
 This path budgets the tables instead:
 
@@ -17,7 +17,7 @@ This path budgets the tables instead:
    compaction while serving. The memory gate's room is that pool less the kept snapshots' share, so admission and the
    kept-prompt policy work against memory that is really there.
 3. **The idle on its design point** (``fit``): ``MemAvailable`` foretells the pool's cost only roughly (the page cache,
-   the driver's freed-page pool and the kernel's watermarks move with a 28 GiB allocation; FR-OPS-17 vmem-a2: the idle
+   the driver's freed-page pool and the kernel's watermarks move with a 28 GiB allocation; the idle
    came out 1.05 GiB under the reserve on one start, and 1.6 GiB over it on another whose reservation swapped the
    startup's heap out). After the reservation the host's free memory is read again and the pool re-reserved by the
    miss, so every start idles at, never under, the reserve plus the on-demand graphs' budget plus the vision host

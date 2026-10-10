@@ -1,4 +1,4 @@
-"""The CUDA scheduler's bounded admission wait (``TENSORFOLD_ADMISSION_WAIT_S``; par-1-fix, FR-OPS-17) and its HTTP
+"""The CUDA scheduler's bounded admission wait (``TENSORFOLD_ADMISSION_WAIT_S``) and its HTTP
 receipts: a request that has waited that long for a seat or for cache room is refused with NoRoom ("slots" or
 "memory", with a retry hint), which the chat route answers as HTTP 503 + Retry-After + reason before any stream opens;
 a request that does not accept a refusal, or any request without the setting, waits its turn as before. CPU fakes."""

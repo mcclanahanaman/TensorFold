@@ -1,4 +1,4 @@
-"""Serving A/B on Jetson Thor (FR-OPS-17): one client pass over one running TensorFold server. Every server gets the
+"""Serving A/B on Jetson Thor: one client pass over one running TensorFold server. Every server gets the
 same requests in the same order, so fresh servers of different builds (stock TensorFold, the Thor stack with its
 switches off or on) compare on the same prompts in one session.
 

@@ -1,4 +1,4 @@
-"""Admission control and GET /v1/capacity (par-1-fix, FR-OPS-17; Brendan 2026-10-05 steer): deterministic, no GPU.
+"""Admission control and GET /v1/capacity: deterministic, no GPU.
 
 NoRoom is now a CapacityError (HTTP 503 everywhere that already checks isinstance(exc, CapacityError), with no
 new code at those call sites); MemoryGate gains a reservation ledger so admission can refuse a new request before

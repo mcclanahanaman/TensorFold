@@ -315,7 +315,7 @@ class NVFP4Table(BF16Table):
         byte, temporaries of at most ``PAIR_ROWS`` rows a piece. ``dequant`` builds the table, so a row's bits are the
         same (pinned by tests/test_ngram_nvfp4_pairs.py). Thor (sm_110) turns it on at load: ``dequant`` over a whole
         call's rows made about ten row-sized temporaries, fresh pages each call, and with the KV pool holding the GPU's
-        share the host's 4 KiB faults on them slowed prompts (FR-OPS-17 kvpool-dev3)."""
+        share the host's 4 KiB faults on them slowed prompts."""
 
         if self.pairs is None:
             byte = np.arange(256, dtype=np.uint8)

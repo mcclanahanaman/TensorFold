@@ -1,7 +1,7 @@
 """The Thor NVMe n-gram row cache's warm-start snapshot: one file written atomically, reloaded only when every check
-passes, a damaged file renamed ``<path>.bad`` (FR-OPS-17).
+passes, a damaged file renamed ``<path>.bad``.
 
-HD-2026-10-07-04 Phase 2: the row cache's bytes (``NVMeTable.snapshot``: the geometry and the 90-byte rows) are saved
+Design decision: the row cache's bytes (``NVMeTable.snapshot``: the geometry and the 90-byte rows) are saved
 next to the row file so the next start can skip the cold NVMe warm-up. The header carries the row file's manifest
 sha256 as the ``key``: a snapshot taken against another checkpoint must never be restored. ``save`` writes to a
 temporary file in the same directory, fsyncs it and ``os.replace``s it onto the path, so a crash leaves either the old
