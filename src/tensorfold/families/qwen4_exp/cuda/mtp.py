@@ -12,14 +12,24 @@ from .state import Buffers, State
 from .weights import Weights
 
 
+class MtpRoomError(ValueError):
+    """An MTP step past one stream's caches, raised before the step changes anything: ``state`` is that stream's
+    State, so the multi-stream decoder fails its request alone and drafts for the others."""
+
+    def __init__(self, state: State, message: str = "MTP context past the cache capacity") -> None:
+        super().__init__(message)
+        self.state = state
+
+
 def mtp_stage(w: Weights, b: Buffers, windows: Sequence[tuple[State, Sequence[int], torch.Tensor]]) -> list:
-    """Host work before an MTP step (next tokens, input streams); returns each stream's segment."""
+    """Host work before an MTP step (next tokens, input streams); returns each stream's segment. A window past its
+    stream's caches raises ``MtpRoomError`` before any window is staged."""
 
     segs: list = []
     for st, next_tokens, _ in windows:
         a0 = segs[-1][2] if segs else 0
         if st.mtp_len + len(next_tokens) > st.capacity:
-            raise ValueError("MTP context past the cache capacity")
+            raise MtpRoomError(st)
         segs.append((st, a0, a0 + len(next_tokens)))
     n = segs[-1][2]
     b.staged.synchronize()

@@ -22,7 +22,7 @@ from tensorfold.engine.grammar import GrammarError
 from .decode import PREFILL_ROWS, WARM_TAIL, Engine, draft, entry_end, prefill_begin
 from . import attn_multi, gdn_multi, image_rows, prefixes
 from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapshot, stage
-from .mtp import mtp_compute, mtp_stage
+from .mtp import MtpRoomError, mtp_compute, mtp_stage
 from .prompt_plan import keeps_pool, pass_limit
 from .state import ENDS, Buffers, State
 from . import thor_dec2, thor_graphs, thor_mtp_fed
@@ -899,7 +899,12 @@ class MultiDecoder:
 
     def _draft_all(self, streams: list, nexts: dict | None = None) -> None:
         """Every drafting stream absorbs its kept rows and chains drafts, all streams in one step a depth; ``nexts``:
-        each stream's next window's first token (Thor DEC-2 gathers the window's n-gram rows while the steps run)."""
+        each stream's next window's first token (Thor DEC-2 gathers the window's n-gram rows while the steps run).
+
+        A stream's chain ends where its MTP rows would pass its caches (rcfix-1: a prompt that joins a round from its
+        pass has the caches admission sized, prompt + depth + 2 rows, not ``_make_room``'s, while its chain can take up
+        to prompt + 2 x depth): the drafts a chain that stays inside them takes are unchanged. A stream whose MTP step
+        still finds no room fails alone (``MtpRoomError``), and every other stream's chain runs again from its start."""
 
         for s, _, _ in streams:
             s.drafts = []
@@ -907,11 +912,34 @@ class MultiDecoder:
         todo = [(s, a0, keep) for s, a0, keep in streams if room[s.sid] > 0 and self.mbuf is not None]
         if not todo:
             return
-        for s, _, _ in todo:
+        for s, _, keep in todo:
             st = s.st
             if st.mtp_drafted:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
+            # the absorb ends at mtp_len + keep rows and each later step adds one: the last at mtp_len + keep + room - 1
+            room[s.sid] = min(room[s.sid], st.capacity - st.mtp_len - len(keep) + 1)
+        while todo:
+            base = [s.st.mtp_len for s, _, _ in todo]
+            try:
+                return self._draft_chain(todo, room, nexts)
+            except MtpRoomError as exc:                  # (a step raises before it stages: nothing ran for it)
+                bad = [s for s, _, _ in todo if s.st is exc.state]
+                if not bad:
+                    raise
+                for (s, _, _), n in zip(todo, base):
+                    s.drafts = []
+                    s.st.set_mtp_len(n)
+                    s.st.mtp_drafted = 0
+                for s in bad:                            # this request ends with the error, the others draft again
+                    s.error = exc
+                    self._drop_kept(s.st)
+                todo = [t for t in todo if t[0].st is not exc.state]
+
+    def _draft_chain(self, todo: list, room: dict, nexts: dict | None) -> None:
+        """The draft chain for ``todo``, every stream's ``room`` inside its caches: the device-fed one (Thor, greedy
+        streams) or the host-fed one."""
+
         fed = getattr(self, "fed", "0")                  # (a decoder built without __init__: the host-fed chain)
         if fed != "0" and all(s.sampling is None or s.sampling.temperature <= 0 for s, _, _ in todo) \
                 and all(s.st.mtp_len + len(keep) + room[s.sid] <= s.st.capacity for s, _, keep in todo):
@@ -1028,7 +1056,7 @@ class MultiDecoder:
         segs = []
         for i, (s, _, _) in enumerate(cands):
             if s.st.mtp_len + 1 > s.st.capacity:
-                raise ValueError("MTP context past the cache capacity")
+                raise MtpRoomError(s.st)
             segs.append((s.st, i, i + 1))
         src, rows = [i for _, i, _ in cands], [r for _, _, r in cands]
         if src == rows == list(range(n)):
