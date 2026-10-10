@@ -25,7 +25,7 @@ from .forward import Cut, commit, compute, compute_mixed, converges, cut_snapsho
 from .mtp import mtp_compute, mtp_stage
 from .prompt_plan import keeps_pool, pass_limit
 from .state import ENDS, Buffers, State
-from . import thor_dec2, thor_graphs
+from . import thor_dec2, thor_graphs, thor_mtp_fed
 from ..cuda import CONFIDENCE, DEPTH
 
 FIRST, STEP = 256, 8192          # rows an idle slot keeps; rows a stream's caches grow by at a time
@@ -112,6 +112,22 @@ class MultiDecoder:
             "verify": any(layer.ple is not None for layer in w.layers),
             "mtp": w.mtp is not None and w.mtp.layer.ple is not None}) if thor_graphs.available() else None
         thor_graphs.spinning()                           # Thor: host waits spin (TENSORFOLD_THOR_DECODE_SPIN=0: off)
+        # Thor DPUSH-6 (thor_mtp_fed): the device-fed draft chain (TENSORFOLD_THOR_MTP_FED=0: the host-fed chain)
+        self.fed = thor_mtp_fed.mode() if self.mbuf is not None and depth > 1 else "0"
+        self.fed_check = None
+        if self.fed != "0":
+            dev = self.mbuf.ids.device
+            self.picks_key = ("fed",)                    # its MTP graphs' picks: thor_mtp_fed.picks, no host copy
+            self.fed_got = torch.zeros((slots, 3), dtype=torch.float32, device=dev)     # a step's picks rows
+            self.fed_tok = torch.zeros((slots,), dtype=torch.int32, device=dev)         # their draft ids
+            self.fed_map = None if w.draft_ids is None else w.draft_ids.to(device=dev, dtype=torch.int32).contiguous()
+            self.fed_ar = torch.arange(slots, dtype=torch.int32, device=dev)
+            self.fed_host = torch.zeros((2 * slots,), dtype=torch.int32, pin_memory=True)   # gather rows
+            self.fed_dev = torch.zeros((2 * slots,), dtype=torch.int32, device=dev)
+            self.fed_staged = torch.cuda.Event()
+            self.fed_pins = [torch.zeros((slots, 3), dtype=torch.float32, pin_memory=True) for _ in range(2)]
+            self.fed_ev = [torch.cuda.Event(), torch.cuda.Event()]
+            self.fed_check = thor_mtp_fed.Check() if self.fed == "check" else None
         self.held: dict[int, list[int]] = {}             # stream id -> last round's kept rows, folded in next round
         # slots start small and grow with their stream's context, up to the window, while the gate has room
         self.free = [State(w, min(capacity, FIRST), depth + 1, kv_dtype, limit=capacity) for _ in range(slots)]
@@ -157,6 +173,8 @@ class MultiDecoder:
         capture take the decode path's first-use memory, which eager decoding also takes at its first requests)."""
 
         self._pin(1)
+        if getattr(self, "fed", "0") != "0":
+            return self.graphs.prerecord(self, mtp_fn=lambda segs: self._pick_fed(mtp_compute(self.w, segs, self.mbuf)))
         return self.graphs.prerecord(self, mtp_fn=lambda segs: self._pick_dev(mtp_compute(self.w, segs, self.mbuf), 1))
 
     def _busy(self) -> set[int]:
@@ -894,6 +912,19 @@ class MultiDecoder:
             if st.mtp_drafted:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
+        fed = getattr(self, "fed", "0")                  # (a decoder built without __init__: the host-fed chain)
+        if fed != "0" and all(s.sampling is None or s.sampling.temperature <= 0 for s, _, _ in todo) \
+                and all(s.st.mtp_len + len(keep) + room[s.sid] <= s.st.capacity for s, _, keep in todo):
+            if self.fed_check is not None:
+                return self._draft_check(todo, room, nexts)
+            return self._draft_fed(todo, room, nexts, fed != "sync")
+        self._draft_host(todo, room, nexts)
+
+    def _draft_host(self, todo: list, room: dict, nexts: dict | None, record: dict | None = None) -> None:
+        """The host-fed chain (ae716c1's): each step launched after the host read the step before it; Thor
+        ``TENSORFOLD_THOR_MTP_FED=0``, a round with a sampled stream, or a cache near its capacity. ``record``:
+        ``thor_mtp_fed.chain``'s."""
+
         windows = [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo]
         segs = mtp_stage(self.w, self.mbuf, windows)
         # Thor graphs: each MTP step's graph also holds its picks' reductions and their copy to pinned host memory
@@ -909,6 +940,8 @@ class MultiDecoder:
             picks = self._picks(logits, [s.st.pos + 1 + j for s, _ in active], [s.sampling for s, _ in active], k)
             nxt, took = [], []
             for (s, row), (d, p) in zip(active, picks):
+                if record is not None:
+                    record.setdefault(s.sid, []).append((d, p))
                 low = self.confidence > 0 and p < self.confidence
                 if low and j > 0:
                     continue
@@ -928,6 +961,113 @@ class MultiDecoder:
                 s.st.set_mtp_len(s.st.mtp_len + 1)
                 s.st.mtp_drafted += 1
             active = [(s, a0) for (s, _, _), (_, a0, _) in zip(nxt, segs)]
+
+    def _draft_fed(self, todo: list, room: dict, nexts: dict | None, spec: bool, record: dict | None = None) -> None:
+        """Thor DPUSH-6 (``thor_mtp_fed``): the device-fed chain, greedy streams; ``spec``: each step launched for the
+        streams with room before the host reads the step before it."""
+
+        w = self.w
+        segs = mtp_stage(w, self.mbuf, [(s.st, keep, self.buf.streams[a0:a0 + len(keep)]) for s, a0, keep in todo])
+        self._fed_step(segs, 0)
+        ahead = bool(nexts) and thor_dec2.ahead_on(w)
+        if ahead:                                        # Thor DEC-2: while the step runs, the next windows' first rows
+            thor_dec2.ple_ahead(w, [(s.st, nexts[s.sid]) for s, _, _ in todo if s.sid in nexts], start=True)
+        for (s, _, keep), (st, a0, a1) in zip(todo, segs):
+            st.set_mtp_len(st.mtp_len + len(keep))
+        live = [(s, i, a1 - 1) for i, ((s, _, _), (_, _, a1)) in enumerate(zip(todo, segs))]
+        after = (lambda took: thor_dec2.ple_ahead(w, [(s.st, d) for s, d in took], start=False)) if ahead else None
+        thor_mtp_fed.chain(live, room, self.depth, self.confidence, self._fed_launch, self._fed_read, self._fed_revert,
+                           spec, after=after, record=record)
+
+    def _draft_check(self, todo: list, room: dict, nexts: dict | None) -> None:
+        """``TENSORFOLD_THOR_MTP_FED=check``: the speculative, ``sync`` and host-fed chains on the same inputs (each
+        from the same lengths); the host-fed one is kept."""
+
+        base = [(s.st.mtp_len, s.st.mtp_drafted) for s, _, _ in todo]
+        runs, lens = {}, {}
+        for how in ("spec", "sync", "host"):
+            for (s, _, _), (n, d) in zip(todo, base):
+                s.drafts = []
+                s.st.set_mtp_len(n)
+                s.st.mtp_drafted = d
+            rec: dict = {}
+            if how == "host":
+                self._draft_host(todo, room, nexts, record=rec)
+            else:
+                self._draft_fed(todo, room, None, how == "spec", record=rec)
+            runs[how] = {s.sid: (list(s.drafts), rec.get(s.sid, [])) for s, _, _ in todo}
+            lens[how] = {s.sid: (s.st.mtp_len, s.st.mtp_drafted) for s, _, _ in todo}
+        self.fed_check.add(runs, lens)
+
+    def _fed_step(self, segs: list, par: int) -> None:
+        """An MTP step whose picks kernel writes each row's draft id (``fed_tok``, the next step's ids) and picks
+        (``fed_got``), then queues the picks to ``fed_pins[par]`` (``fed_ev[par]``: copied)."""
+
+        mb = self.mbuf
+        step = mb.attn_step = attn_multi.Step(self.w, segs, mtp=True)
+        try:
+            if self.graphs is not None:
+                self.graphs.run("mtp", segs, mb, lambda: self._pick_fed(mtp_compute(self.w, segs, mb)), step=step,
+                                extra=self.picks_key)
+            else:
+                self._pick_fed(mtp_compute(self.w, segs, mb))
+        finally:
+            mb.attn_step = None
+        n = len(segs)
+        self.fed_pins[par][:n].copy_(self.fed_got[:n], non_blocking=True)
+        self.fed_ev[par].record()
+
+    def _pick_fed(self, logits: torch.Tensor) -> torch.Tensor:
+        return thor_mtp_fed.picks(logits, self.fed_got, self.fed_tok, self.fed_map)
+
+    def _fed_launch(self, cands: list, par: int) -> list:
+        """An MTP step for ``cands`` [(stream, picks row, streams row)] of the step before it, staged on the device
+        (that step's draft ids and output streams), launched into ``par``; the streams' MTP lengths bumped."""
+
+        mb, n = self.mbuf, len(cands)
+        segs = []
+        for i, (s, _, _) in enumerate(cands):
+            if s.st.mtp_len + 1 > s.st.capacity:
+                raise ValueError("MTP context past the cache capacity")
+            segs.append((s.st, i, i + 1))
+        src, rows = [i for _, i, _ in cands], [r for _, _, r in cands]
+        if src == rows == list(range(n)):
+            si = ri = self.fed_ar[:n]
+        else:
+            self.fed_staged.synchronize()                # the last staging's copy has read the pinned rows
+            h = self.fed_host.numpy()
+            h[:n], h[n:2 * n] = src, rows
+            self.fed_dev[:2 * n].copy_(self.fed_host[:2 * n], non_blocking=True)
+            self.fed_staged.record()
+            si, ri = self.fed_dev[:n], self.fed_dev[n:2 * n]
+        torch.index_select(self.fed_tok, 0, si, out=mb.ids[:n])
+        torch.index_select(mb.streams, 0, ri, out=mb.mtp_in[:n])
+        mb.last[:n].copy_(self.fed_ar[:n])
+        self._fed_step(segs, par)
+        for s, _, _ in cands:
+            s.st.set_mtp_len(s.st.mtp_len + 1)
+            s.st.mtp_drafted += 1
+        return [s for s, _, _ in cands]
+
+    def _fed_read(self, par: int, rows: int) -> list[tuple[int, float]]:
+        """A launched step's picks: its draft and probability at temperature 1 a row (``_picks``' greedy math)."""
+
+        ev = self.fed_ev[par]
+        if thor_graphs.spinning() == "poll":
+            while not ev.query():
+                pass
+        else:
+            ev.synchronize()
+        out = []
+        for top, col, lse in self.fed_pins[par][:rows].numpy().tolist():
+            c = int(col)
+            out.append((int(self.draft_host[c]) if self.draft_host is not None else c, float(np.exp(top - lse))))
+        return out
+
+    @staticmethod
+    def _fed_revert(s) -> None:
+        s.st.set_mtp_len(s.st.mtp_len - 1)
+        s.st.mtp_drafted -= 1
 
     def _mtp(self, segs: list, k: int | None = None) -> torch.Tensor:
         """An MTP step over every drafting stream, its attention one launch a kernel for all of them; with ``k`` (Thor
